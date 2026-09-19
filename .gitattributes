@@ -4,3 +4,6 @@
 # Preserve the upstream crate's CRLF and Markdown whitespace.
 vendor/crossterm/** linguist-vendored whitespace=cr-at-eol,-blank-at-eof
 vendor/crossterm/**/*.md whitespace=cr-at-eol,-blank-at-eol,-blank-at-eof
+# Retain the exact upstream WGSL notice, including its first-line space.
+crates/tree-sitter-wgsl/upstream/LICENSE.md whitespace=-blank-at-eol
+docs/licenses/tree-sitter-wgsl.txt whitespace=-blank-at-eol

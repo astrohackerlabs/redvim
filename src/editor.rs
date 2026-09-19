@@ -6658,6 +6658,12 @@ impl Editor {
                 ("zig", 4),
                 ("swift", 4),
                 ("sql", 4),
+                ("hcl", 2),
+                ("objc", 4),
+                ("proto", 2),
+                ("dockerfile", 2),
+                ("gn", 2),
+                ("wgsl", 2),
                 ("xml", 2),
             ]
             .map(|(file_type, shift_width)| {
@@ -6668,6 +6674,8 @@ impl Editor {
             }),
         );
         indentation.insert("make".into(), Indentation::new(8, 8, false));
+        indentation.insert("caddyfile".into(), Indentation::new(4, 4, false));
+        indentation.insert("applescript".into(), Indentation::new(4, 4, false));
         for (language, definition) in &config.languages {
             if let Some(width) = definition.indent_width {
                 let settings = Indentation::new(width, width, true);
@@ -34507,6 +34515,14 @@ builtin = "rust"
             ("example.zig", 4, "//"),
             ("example.swift", 4, "//"),
             ("example.sql", 4, "--"),
+            ("example.m", 4, "//"),
+            ("example.proto", 2, "//"),
+            ("Dockerfile", 2, "#"),
+            ("BUILD.gn", 2, "#"),
+            ("example.wgsl", 2, "//"),
+            ("Caddyfile", 4, "#"),
+            ("example.applescript", 4, "--"),
+            ("example.tf", 2, "#"),
             ("example.svg", 2, "<!--"),
             ("Makefile", 8, "#"),
         ] {
@@ -34580,6 +34596,479 @@ builtin = "rust"
             .current_buffer()
             .contents()
             .starts_with("-- custom SELECT"));
+    }
+
+    #[tokio::test]
+    async fn hcl_manual_syntax_overrides_and_undo_refresh_colors() {
+        let mut editor = rust_test_editor(100, 120, 22);
+        editor.buffer_manager[0] =
+            Buffer::new(Some("notes.txt".into()), "value = \"café\"\n".into());
+        editor
+            .current_buffer_mut()
+            .set_syntax_selection(SyntaxSelection::Language("hcl".into()));
+        assert_eq!(editor.current_language_id().as_deref(), Some("hcl"));
+        let shape = |spans: Vec<HighlightSpan>| {
+            spans
+                .into_iter()
+                .map(|s| (s.start, s.end, s.style))
+                .collect::<Vec<_>>()
+        };
+        let before = shape(editor.viewport_highlight_spans(0, 0, 10).unwrap());
+        assert!(!before.is_empty());
+        for action in [
+            Action::EnterMode(Mode::Insert),
+            Action::InsertCharAtCursorPos('/'),
+            Action::InsertCharAtCursorPos('/'),
+            Action::EnterMode(Mode::Normal),
+        ] {
+            editor.test_execute_production_action(action).await.unwrap();
+        }
+        assert_ne!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "value = \"café\"\n");
+        assert_eq!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[languages.hcl]\nindent_width = 6\ncomment = '# custom %s'\n",
+        )
+        .unwrap();
+        editor.set_language_reload_source(path, Vec::new());
+        editor.reload_languages().await.unwrap();
+        assert_eq!(editor.indentation().shift_width, 6);
+        assert!(editor.toggle_comment_lines(0, 0));
+        assert!(editor
+            .current_buffer()
+            .contents()
+            .starts_with("# custom value ="));
+    }
+
+    #[tokio::test]
+    async fn objc_manual_syntax_overrides_and_undo_refresh_colors() {
+        let mut editor = rust_test_editor(100, 120, 22);
+        let source = "NSString *value = @\"café\";\n";
+        editor.buffer_manager[0] = Buffer::new(Some("notes.h".into()), source.into());
+        editor
+            .current_buffer_mut()
+            .set_syntax_selection(SyntaxSelection::Language("objc".into()));
+        assert_eq!(editor.current_language_id().as_deref(), Some("objc"));
+        let shape = |spans: Vec<HighlightSpan>| {
+            spans
+                .into_iter()
+                .map(|s| (s.start, s.end, s.style))
+                .collect::<Vec<_>>()
+        };
+        let before = shape(editor.viewport_highlight_spans(0, 0, 10).unwrap());
+        assert!(!before.is_empty());
+        for action in [
+            Action::EnterMode(Mode::Insert),
+            Action::InsertCharAtCursorPos('/'),
+            Action::InsertCharAtCursorPos('/'),
+            Action::EnterMode(Mode::Normal),
+        ] {
+            editor.test_execute_production_action(action).await.unwrap();
+        }
+        assert_ne!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), source);
+        assert_eq!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[languages.objc]\nindent_width = 2\ncomment = '// custom %s'\n",
+        )
+        .unwrap();
+        editor.set_language_reload_source(path, Vec::new());
+        editor.reload_languages().await.unwrap();
+        assert_eq!(editor.indentation().shift_width, 2);
+        assert!(editor.toggle_comment_lines(0, 0));
+        assert!(editor
+            .current_buffer()
+            .contents()
+            .starts_with("// custom NSString"));
+    }
+
+    #[tokio::test]
+    async fn proto_manual_syntax_overrides_and_undo_refresh_colors() {
+        let mut editor = rust_test_editor(100, 120, 22);
+        let source = "syntax = \"proto3\"; // café\n";
+        editor.buffer_manager[0] = Buffer::new(Some("notes.txt".into()), source.into());
+        editor
+            .current_buffer_mut()
+            .set_syntax_selection(SyntaxSelection::Language("proto".into()));
+        assert_eq!(editor.current_language_id().as_deref(), Some("proto"));
+        let shape = |spans: Vec<HighlightSpan>| {
+            spans
+                .into_iter()
+                .map(|s| (s.start, s.end, s.style))
+                .collect::<Vec<_>>()
+        };
+        let before = shape(editor.viewport_highlight_spans(0, 0, 10).unwrap());
+        assert!(!before.is_empty());
+        for action in [
+            Action::EnterMode(Mode::Insert),
+            Action::InsertCharAtCursorPos('/'),
+            Action::InsertCharAtCursorPos('/'),
+            Action::EnterMode(Mode::Normal),
+        ] {
+            editor.test_execute_production_action(action).await.unwrap();
+        }
+        assert_ne!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), source);
+        assert_eq!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[languages.proto]\nindent_width = 6\ncomment = '// custom %s'\n",
+        )
+        .unwrap();
+        editor.set_language_reload_source(path, Vec::new());
+        editor.reload_languages().await.unwrap();
+        assert_eq!(editor.indentation().shift_width, 6);
+        assert!(editor.toggle_comment_lines(0, 0));
+        assert!(editor
+            .current_buffer()
+            .contents()
+            .starts_with("// custom syntax"));
+    }
+
+    #[tokio::test]
+    async fn dockerfile_manual_syntax_overrides_and_undo_refresh_colors() {
+        let mut editor = rust_test_editor(100, 120, 22);
+        let source = "FROM alpine # café\n";
+        editor.buffer_manager[0] = Buffer::new(Some("notes.txt".into()), source.into());
+        editor
+            .current_buffer_mut()
+            .set_syntax_selection(SyntaxSelection::Language("dockerfile".into()));
+        assert_eq!(editor.current_language_id().as_deref(), Some("dockerfile"));
+        let shape = |spans: Vec<HighlightSpan>| {
+            spans
+                .into_iter()
+                .map(|s| (s.start, s.end, s.style))
+                .collect::<Vec<_>>()
+        };
+        let before = shape(editor.viewport_highlight_spans(0, 0, 10).unwrap());
+        assert!(!before.is_empty());
+        for action in [
+            Action::EnterMode(Mode::Insert),
+            Action::InsertCharAtCursorPos('#'),
+            Action::InsertCharAtCursorPos('#'),
+            Action::EnterMode(Mode::Normal),
+        ] {
+            editor.test_execute_production_action(action).await.unwrap();
+        }
+        assert_ne!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), source);
+        assert_eq!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[languages.dockerfile]\nindent_width = 6\ncomment = '# custom %s'\n",
+        )
+        .unwrap();
+        editor.set_language_reload_source(path, Vec::new());
+        editor.reload_languages().await.unwrap();
+        assert_eq!(editor.indentation().shift_width, 6);
+        assert!(editor.toggle_comment_lines(0, 0));
+        assert!(editor
+            .current_buffer()
+            .contents()
+            .starts_with("# custom FROM"));
+    }
+
+    #[tokio::test]
+    async fn applescript_manual_syntax_overrides_and_undo_refresh_colors() {
+        let mut editor = rust_test_editor(100, 120, 22);
+        let source = "set message to \"café\"\n";
+        editor.buffer_manager[0] = Buffer::new(Some("notes.txt".into()), source.into());
+        editor
+            .current_buffer_mut()
+            .set_syntax_selection(SyntaxSelection::Language("applescript".into()));
+        assert_eq!(editor.current_language_id().as_deref(), Some("applescript"));
+        assert_eq!(editor.indentation().shift_width, 4);
+        assert!(!editor.indentation().expand_tab);
+        for action in [
+            Action::EnterMode(Mode::Insert),
+            Action::InsertTab,
+            Action::EnterMode(Mode::Normal),
+        ] {
+            editor.test_execute_production_action(action).await.unwrap();
+        }
+        assert!(editor.current_buffer().contents().starts_with('\t'));
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), source);
+        let shape = |spans: Vec<HighlightSpan>| {
+            spans
+                .into_iter()
+                .map(|s| (s.start, s.end, s.style))
+                .collect::<Vec<_>>()
+        };
+        let before = shape(editor.viewport_highlight_spans(0, 0, 10).unwrap());
+        assert!(!before.is_empty());
+        for action in [
+            Action::EnterMode(Mode::Insert),
+            Action::InsertCharAtCursorPos('-'),
+            Action::InsertCharAtCursorPos('-'),
+            Action::EnterMode(Mode::Normal),
+        ] {
+            editor.test_execute_production_action(action).await.unwrap();
+        }
+        assert_ne!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), source);
+        assert_eq!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[languages.applescript]\nindent_width = 6\ncomment = '-- custom %s'\n",
+        )
+        .unwrap();
+        editor.set_language_reload_source(path, Vec::new());
+        editor.reload_languages().await.unwrap();
+        assert_eq!(editor.indentation().shift_width, 6);
+        assert!(editor.indentation().expand_tab);
+        assert!(editor.toggle_comment_lines(0, 0));
+        assert!(editor
+            .current_buffer()
+            .contents()
+            .starts_with("-- custom set message"));
+    }
+
+    #[tokio::test]
+    async fn caddyfile_manual_syntax_overrides_and_undo_refresh_colors() {
+        let mut editor = rust_test_editor(100, 120, 22);
+        let source = "example.test {\n    respond \"café\" 200\n}\n";
+        editor.buffer_manager[0] = Buffer::new(Some("notes.txt".into()), source.into());
+        editor
+            .current_buffer_mut()
+            .set_syntax_selection(SyntaxSelection::Language("caddyfile".into()));
+        assert_eq!(editor.current_language_id().as_deref(), Some("caddyfile"));
+        assert_eq!(editor.indentation().shift_width, 4);
+        assert!(!editor.indentation().expand_tab);
+        for action in [
+            Action::EnterMode(Mode::Insert),
+            Action::InsertTab,
+            Action::EnterMode(Mode::Normal),
+        ] {
+            editor.test_execute_production_action(action).await.unwrap();
+        }
+        assert!(editor.current_buffer().contents().starts_with('\t'));
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), source);
+        let shape = |spans: Vec<HighlightSpan>| {
+            spans
+                .into_iter()
+                .map(|s| (s.start, s.end, s.style))
+                .collect::<Vec<_>>()
+        };
+        let before = shape(editor.viewport_highlight_spans(0, 0, 10).unwrap());
+        assert!(!before.is_empty());
+        for action in [
+            Action::EnterMode(Mode::Insert),
+            Action::InsertCharAtCursorPos('#'),
+            Action::InsertCharAtCursorPos('#'),
+            Action::EnterMode(Mode::Normal),
+        ] {
+            editor.test_execute_production_action(action).await.unwrap();
+        }
+        assert_ne!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), source);
+        assert_eq!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[languages.caddyfile]\nindent_width = 6\ncomment = '# custom %s'\n",
+        )
+        .unwrap();
+        editor.set_language_reload_source(path, Vec::new());
+        editor.reload_languages().await.unwrap();
+        assert_eq!(editor.indentation().shift_width, 6);
+        assert!(editor.indentation().expand_tab);
+        assert!(editor.toggle_comment_lines(0, 0));
+        assert!(editor
+            .current_buffer()
+            .contents()
+            .starts_with("# custom example.test"));
+    }
+
+    #[tokio::test]
+    async fn wgsl_manual_syntax_overrides_and_undo_refresh_colors() {
+        let mut editor = rust_test_editor(100, 120, 22);
+        let source = "const enabled = true; // café\n";
+        editor.buffer_manager[0] = Buffer::new(Some("notes.txt".into()), source.into());
+        editor
+            .current_buffer_mut()
+            .set_syntax_selection(SyntaxSelection::Language("wgsl".into()));
+        assert_eq!(editor.current_language_id().as_deref(), Some("wgsl"));
+        let shape = |spans: Vec<HighlightSpan>| {
+            spans
+                .into_iter()
+                .map(|s| (s.start, s.end, s.style))
+                .collect::<Vec<_>>()
+        };
+        let before = shape(editor.viewport_highlight_spans(0, 0, 10).unwrap());
+        assert!(!before.is_empty());
+        for action in [
+            Action::EnterMode(Mode::Insert),
+            Action::InsertCharAtCursorPos('/'),
+            Action::InsertCharAtCursorPos('/'),
+            Action::EnterMode(Mode::Normal),
+        ] {
+            editor.test_execute_production_action(action).await.unwrap();
+        }
+        assert_ne!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), source);
+        assert_eq!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[languages.wgsl]\nindent_width = 6\ncomment = '// custom %s'\n",
+        )
+        .unwrap();
+        editor.set_language_reload_source(path, Vec::new());
+        editor.reload_languages().await.unwrap();
+        assert_eq!(editor.indentation().shift_width, 6);
+        assert!(editor.toggle_comment_lines(0, 0));
+        assert!(editor
+            .current_buffer()
+            .contents()
+            .starts_with("// custom const enabled"));
+    }
+
+    #[tokio::test]
+    async fn gn_manual_syntax_overrides_and_undo_refresh_colors() {
+        let mut editor = rust_test_editor(100, 120, 22);
+        let source = "enabled = true # café\n";
+        editor.buffer_manager[0] = Buffer::new(Some("notes.txt".into()), source.into());
+        editor
+            .current_buffer_mut()
+            .set_syntax_selection(SyntaxSelection::Language("gn".into()));
+        assert_eq!(editor.current_language_id().as_deref(), Some("gn"));
+        let shape = |spans: Vec<HighlightSpan>| {
+            spans
+                .into_iter()
+                .map(|s| (s.start, s.end, s.style))
+                .collect::<Vec<_>>()
+        };
+        let before = shape(editor.viewport_highlight_spans(0, 0, 10).unwrap());
+        assert!(!before.is_empty());
+        for action in [
+            Action::EnterMode(Mode::Insert),
+            Action::InsertCharAtCursorPos('#'),
+            Action::InsertCharAtCursorPos('#'),
+            Action::EnterMode(Mode::Normal),
+        ] {
+            editor.test_execute_production_action(action).await.unwrap();
+        }
+        assert_ne!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), source);
+        assert_eq!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[languages.gn]\nindent_width = 6\ncomment = '# custom %s'\n",
+        )
+        .unwrap();
+        editor.set_language_reload_source(path, Vec::new());
+        editor.reload_languages().await.unwrap();
+        assert_eq!(editor.indentation().shift_width, 6);
+        assert!(editor.toggle_comment_lines(0, 0));
+        assert!(editor
+            .current_buffer()
+            .contents()
+            .starts_with("# custom enabled"));
     }
 
     #[test]

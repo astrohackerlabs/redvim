@@ -1,0 +1,37 @@
+# café Caddyfile; tls {not a placeholder}
+{
+    skip_install_trust
+    email operator@example.test
+    auto_https disable_redirects
+}
+(shared) {
+    header X-Shared "enabled"
+}
+example.test, www.example.test {
+    import shared
+    tls internal
+    @api path /api/*
+    reverse_proxy @api 127.0.0.1:8080 [::1]:8081 backend.example.test:8082 {
+        lb_try_duration 5s
+    }
+    handle_path /static/* {
+        root * /srv/www
+        file_server
+    }
+    route {
+        header X-URI {uri}
+        header X-Env {$CADDY_ENV:development}
+        header X-Quoted "café \"quoted\" {uri}"
+        header X-Raw `raw {uri} # literal`
+        respond <<END
+        first café body
+        END_suffix remains body
+        EN partial prefix
+        END 200
+        respond <<NEXT
+        another body
+        NEXT
+        header X-After "still colored"
+    }
+    respond /health "healthy" 200
+}

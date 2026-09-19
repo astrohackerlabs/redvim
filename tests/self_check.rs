@@ -59,7 +59,25 @@ fn assert_self_check_report(output: Output) {
     let lines = stdout.lines().collect::<Vec<_>>();
     assert_eq!(lines.last(), Some(&"redvim self-check ok"), "{stdout}");
     for language in [
-        "nu", "c", "cpp", "python", "html", "css", "ruby", "zig", "swift", "xml", "make", "sql",
+        "nu",
+        "c",
+        "cpp",
+        "python",
+        "html",
+        "css",
+        "ruby",
+        "zig",
+        "swift",
+        "xml",
+        "make",
+        "sql",
+        "hcl",
+        "objc",
+        "proto",
+        "dockerfile",
+        "gn",
+        "wgsl",
+        "caddyfile",
     ] {
         assert!(
             lines.contains(&format!("language {language}: bundled highlighting ok").as_str()),

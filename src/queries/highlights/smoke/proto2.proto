@@ -1,0 +1,11 @@
+syntax = "proto2";
+package legacy;
+message Record {
+  required string label = 1 [default = "café\nworld"];
+  optional double ratio = 2 [default = 3.14];
+  optional bool enabled = 3 [default = false];
+  repeated int32 values = 4;
+  optional group Details = 5 { optional string note = 6; }
+  extensions 100 to max;
+}
+extend Record { optional string extra = 100; }

@@ -5281,7 +5281,9 @@ fn command_tab_completes_syntax_names_and_aliases() {
         ("syntax rus", "syntax rust"),
         ("syn ym", "syn yaml"),
         ("ft rs", "ft rust"),
-        ("syntax ", "syntax auto"),
+        ("syntax ", "syntax applescript"),
+        ("syntax au", "syntax auto"),
+        ("syntax ap", "syntax applescript"),
     ] {
         let mut harness = EditorHarness::with_content("");
         harness.set_commandline(Mode::Command, command);

@@ -1,0 +1,31 @@
+# café import foreach are comments
+import("//build/config.gni")
+declare_args() {
+  enabled = true
+  level = 42
+}
+template("component") {
+  source_set(target_name) {
+    sources = [ "main.cc", "other.cc" ]
+    deps += [ "//base" ]
+    deps -= [ "//unused" ]
+    output = "$root_out_dir/${invoker.name}.o"
+    if (enabled && !is_debug || level >= 2) {
+      flags = invoker.flags
+    } else if (level != 0) {
+      flags = []
+    } else {
+      enabled = false
+    }
+    foreach(item, sources) {
+      print(item)
+    }
+    selected = sources[0]
+    delta = -1 + 2 - 3
+    compare = level < 9 && level <= 8 && level > 1 && level == 4
+    escaped = "quote\" dollar\$ slash\\ café"
+    bytes = "$0x41 prefix $0x42 suffix"
+    literal = "\$0x43"
+    after = "still colored"
+  }
+}

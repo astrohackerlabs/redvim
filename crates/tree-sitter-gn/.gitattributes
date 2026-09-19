@@ -1,0 +1,2 @@
+# Preserve the checksummed upstream generated JSON, including its final blank line.
+src/grammar.json whitespace=-blank-at-eof

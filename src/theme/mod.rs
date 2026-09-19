@@ -535,7 +535,10 @@ fn compatible_scopes(scope: &str) -> Vec<String> {
         "conditional" | "repeat" | "include" | "exception" => {
             push_scope_with_parents(&mut scopes, "keyword");
         }
-        "variable" => push_scope_with_parents(&mut scopes, "variable.other.readwrite"),
+        "variable" | "variable.parameter" => {
+            push_scope_with_parents(&mut scopes, "variable.other.readwrite");
+        }
+        "variable.builtin" => push_scope_with_parents(&mut scopes, "keyword"),
         _ => {}
     }
 

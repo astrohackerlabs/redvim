@@ -1,7 +1,7 @@
 # RedVim
 
 Astrohacker's modal editor, based on [Red](https://github.com/codersauce/red).
-SQL, Nushell, C, C++, Python, HTML, CSS, Ruby, Zig, Swift, XML/SVG and Makefile syntax
+AppleScript, Caddyfile, WGSL, GN, Dockerfile, Protocol Buffers, Objective-C, Terraform/HCL, SQL, Nushell, C, C++, Python, HTML, CSS, Ruby, Zig, Swift, XML/SVG and Makefile syntax
 highlighting are built in alongside Red's existing languages. No external parser, query file, or
 grammar trust command is required.
 
@@ -48,4 +48,5 @@ cargo test --locked --workspace --all-targets --all-features
 See PROVENANCE.json, docs/NUSHELL.md and docs/BUNDLED_LANGUAGES.md for source
 revisions, language mappings, limitations and attribution.
 RedVim retains Red's MIT license and upstream history. Bundled Nushell grammar
-is MIT; the Neovim highlighting queries are Apache-2.0. See docs/licenses/.
+is MIT; the Neovim highlighting queries are Apache-2.0. WGSL retains its W3C
+Software and Document License and GPU for the Web BSD notices. See docs/licenses/.

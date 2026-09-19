@@ -1,0 +1,13 @@
+[package]
+name = "tree-sitter-gn"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+description = "Pinned GN grammar with RedVim LanguageFn bindings"
+build = "build.rs"
+
+[dependencies]
+tree-sitter-language = "0.1.7"
+
+[build-dependencies]
+cc = "1"

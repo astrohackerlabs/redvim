@@ -1,0 +1,52 @@
+{
+  "name": "tree-sitter-applescript",
+  "version": "0.1.0",
+  "description": "AppleScript grammar for tree-sitter",
+  "main": "bindings/node",
+  "types": "bindings/node",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HelgeSverre/tree-sitter-applescript.git"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "tree-sitter-cli": "^0.22.0",
+    "prebuildify": "^6.0.0"
+  },
+  "scripts": {
+    "generate": "tree-sitter generate",
+    "test": "tree-sitter test",
+    "install": "node-gyp-build",
+    "prebuildify": "prebuildify --napi --strip"
+  },
+  "tree-sitter": [
+    {
+      "scope": "source.applescript",
+      "injection-regex": "applescript",
+      "file-types": [
+        "applescript",
+        "scpt"
+      ],
+      "highlights": "queries/highlights.scm"
+    }
+  ],
+  "dependencies": {
+    "node-gyp-build": "^4.8.0"
+  },
+  "peerDependencies": {
+    "tree-sitter": "^0.21.0"
+  },
+  "peerDependenciesMeta": {
+    "tree_sitter": {
+      "optional": true
+    }
+  },
+  "files": [
+    "grammar.js",
+    "binding.gyp",
+    "prebuilds/**",
+    "bindings/node/*",
+    "queries/*",
+    "src/**"
+  ]
+}

@@ -1,0 +1,16 @@
+[package]
+name = "tree-sitter-applescript"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "Pinned AppleScript native grammar with complete scanner linkage"
+build = "build.rs"
+
+[dependencies]
+tree-sitter-language = "0.1.7"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+tree-sitter = "0.25"

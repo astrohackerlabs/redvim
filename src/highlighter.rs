@@ -151,6 +151,14 @@ impl LanguageRegistry {
                         | "xml"
                         | "make"
                         | "sql"
+                        | "hcl"
+                        | "objc"
+                        | "proto"
+                        | "dockerfile"
+                        | "gn"
+                        | "wgsl"
+                        | "caddyfile"
+                        | "applescript"
                 ),
             });
         }
@@ -601,6 +609,20 @@ const MAX_CACHED_HIGHLIGHT_BYTES: usize = 64 * 1024;
 const MAX_CACHED_HIGHLIGHT_SPANS: usize = 4_096;
 
 const LANGUAGE_NAMES: &[(&str, &str)] = &[
+    ("caddyfile", "caddyfile"),
+    ("applescript", "applescript"),
+    ("caddy", "caddyfile"),
+    ("gn", "gn"),
+    ("wgsl", "wgsl"),
+    ("gni", "gn"),
+    ("dockerfile", "dockerfile"),
+    ("containerfile", "dockerfile"),
+    ("hcl", "hcl"),
+    ("objc", "objc"),
+    ("proto", "proto"),
+    ("protobuf", "proto"),
+    ("objective-c", "objc"),
+    ("terraform", "hcl"),
     ("sql", "sql"),
     ("c", "c"),
     ("cpp", "cpp"),
@@ -820,6 +842,13 @@ impl Highlighter {
         if let Some(filename) = Path::new(file).file_name().and_then(|name| name.to_str()) {
             if let Some(language) = self.registry.filenames.get(filename) {
                 return Some(language.as_str());
+            }
+            let lower = filename.to_ascii_lowercase();
+            if lower.starts_with("dockerfile.") || lower.starts_with("containerfile.") {
+                return Some("dockerfile");
+            }
+            if lower.starts_with("caddyfile.") {
+                return Some("caddyfile");
             }
         }
         let extension = file_extension(file)?;
@@ -1459,8 +1488,19 @@ impl Highlighter {
                             if capture_refines_equal_range(capture_name)
                                 || (definition.semantic_refinements
                                     && matches!(
+                                        capture_name,
+                                        "variable.builtin" | "variable.parameter"
+                                    ))
+                                || (definition.semantic_refinements
+                                    && matches!(
                                         capture_name.split('.').next(),
-                                        Some("function" | "type" | "constructor" | "constant")
+                                        Some(
+                                            "function"
+                                                | "type"
+                                                | "constructor"
+                                                | "constant"
+                                                | "keyword"
+                                        )
                                     ))
                             {
                                 refinement_colors.push(captured);
@@ -2291,6 +2331,86 @@ fn file_extension(file: &str) -> Option<String> {
 
 fn language_definitions() -> Vec<BundledLanguageDefinition> {
     vec![
+        BundledLanguageDefinition {
+            id: "applescript",
+            extensions: &["applescript"],
+            filenames: &[],
+            language: Some(|| tree_sitter_applescript::LANGUAGE.into()),
+            highlight_queries: &[include_str!("queries/highlights/applescript.scm")],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "caddyfile",
+            extensions: &["caddy", "caddyfile"],
+            filenames: &["Caddyfile", "caddyfile"],
+            language: Some(|| tree_sitter_caddyfile::LANGUAGE.into()),
+            highlight_queries: &[include_str!("queries/highlights/caddyfile.scm")],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "wgsl",
+            extensions: &["wgsl"],
+            filenames: &[],
+            language: Some(|| tree_sitter_wgsl::LANGUAGE.into()),
+            highlight_queries: &[include_str!("queries/highlights/wgsl.scm")],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "gn",
+            extensions: &["gn", "gni"],
+            filenames: &[".gn"],
+            language: Some(|| tree_sitter_gn::LANGUAGE.into()),
+            highlight_queries: &[include_str!("queries/highlights/gn.scm")],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "dockerfile",
+            extensions: &["dockerfile", "containerfile"],
+            filenames: &["Dockerfile", "dockerfile", "Containerfile", "containerfile"],
+            language: Some(|| tree_sitter_containerfile::LANGUAGE.into()),
+            highlight_queries: &[include_str!("queries/highlights/dockerfile.scm")],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "proto",
+            extensions: &["proto"],
+            filenames: &[],
+            language: Some(|| tree_sitter_proto::LANGUAGE.into()),
+            highlight_queries: &[include_str!("queries/highlights/proto.scm")],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "objc",
+            extensions: &["m"],
+            filenames: &[],
+            language: Some(|| tree_sitter_objc::LANGUAGE.into()),
+            highlight_queries: &[include_str!("queries/highlights/objc.scm")],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "hcl",
+            extensions: &["tf", "tfvars", "hcl"],
+            filenames: &[],
+            language: Some(|| tree_sitter_hcl::LANGUAGE.into()),
+            highlight_queries: &[include_str!("queries/highlights/hcl.scm")],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
         BundledLanguageDefinition {
             id: "sql",
             extensions: &["sql"],
@@ -5308,12 +5428,17 @@ mod tests {
         assert_eq!(
             highlighter.language_ids(),
             vec![
+                "applescript",
                 "bash",
                 "c",
+                "caddyfile",
                 "cpp",
                 "css",
+                "dockerfile",
                 "fish",
                 "gitcommit",
+                "gn",
+                "hcl",
                 "html",
                 "husk",
                 "javascript",
@@ -5323,7 +5448,9 @@ mod tests {
                 "make",
                 "markdown",
                 "nu",
+                "objc",
                 "powershell",
+                "proto",
                 "python",
                 "ruby",
                 "rust",
@@ -5332,6 +5459,7 @@ mod tests {
                 "toml",
                 "tsx",
                 "typescript",
+                "wgsl",
                 "xml",
                 "yaml",
                 "zig",

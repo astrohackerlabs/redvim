@@ -1,0 +1,29 @@
+RedVim WGSL attribution and modifications
+
+This software includes material copied from or derived from the official
+GPUWeb tree-sitter-wgsl grammar:
+https://github.com/gpuweb/tree-sitter-wgsl
+Revision: 52e3c620a9c316cc8c1d504dd1908eb8cebe255b
+
+Copyright (C) [2025] World Wide Web Consortium,
+(Massachusetts Institute of Technology, European Research Consortium for
+Informatics and Mathematics, Keio University, Beihang).
+All Rights Reserved.
+
+The original license statement is in tree-sitter-wgsl.txt. The full W3C
+Software and Document License is in w3c-software-document-2023.txt. The GPU
+for the Web contribution license is reproduced in gpuweb-bsd.txt.
+
+RedVim modifications, 2026, Astrohacker contributors:
+- Expose comment, comparison/shift operator and template delimiter nodes.
+- Correct comment skipping during template classification and nested-comment
+  scanning, with regression tests.
+- Adapt highlight queries to target names and tokens independently, avoiding
+  whole-declaration and whole-expression overcaptures.
+- Add Rust LanguageFn/cc bindings, CommonJS generation metadata and tests.
+- Generate the parser and headers with tree-sitter-cli 0.25.8 (ABI 15).
+
+Unmodified upstream inputs are retained in crates/tree-sitter-wgsl/upstream.
+Tree-sitter generator and generated support headers use the MIT notice in
+tree-sitter-generator.txt. Exact input and output hashes are recorded in
+docs/languages-provenance.json.

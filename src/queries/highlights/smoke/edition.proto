@@ -1,0 +1,6 @@
+edition = "2023";
+package edition_demo;
+message Modern {
+  string label = 1;
+  int32 count = 2;
+}

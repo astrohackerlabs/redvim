@@ -154,5 +154,340 @@
     "license_file": "tree-sitter-sequel.txt",
     "license_sha256": "3b3e4e4252d5d7d1c18e1257005f23242bf0580ad619204fd093c99b8c56748d",
     "license_source": "https://raw.githubusercontent.com/DerekStride/tree-sitter-sql/7b51ecda191d36b92f5a90a8d1bc3faef1c7b8b8/LICENSE"
+  },
+  {
+    "name": "tree-sitter-hcl",
+    "version": "1.1.0",
+    "crate_sha256": "5a7b2cc3d7121553b84309fab9d11b3ff3d420403eef9ae50f9fd1cd9d9cf012",
+    "repository": "https://github.com/tree-sitter-grammars/tree-sitter-hcl",
+    "revision": "009def4ae38ec30e5b40beeae26efe93484ab286",
+    "query": "runtime/queries/hcl/highlights.scm",
+    "query_repository": "https://github.com/nvim-treesitter/nvim-treesitter",
+    "query_revision": "4d9466677a5ceadef104eaa0fe08d60d91c4e9a7",
+    "upstream_query_sha256": "553290666870af8165121a20914d5d3b549f5e3ba250773f06a0f331dcf9fcff",
+    "bundled_query_sha256": "5f432295dbb92bee2a2abdf6fa7783309e96601e03823f368353f906131eea3e",
+    "license": "Apache-2.0",
+    "license_file": "tree-sitter-hcl.txt",
+    "license_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "license_source": "published crate LICENSE",
+    "query_license_file": "nvim-treesitter.txt"
+  },
+  {
+    "name": "tree-sitter-objc",
+    "version": "3.0.2",
+    "crate_sha256": "9ca8bb556423fc176f0535e79d525f783a6684d3c9da81bf9d905303c129e1d2",
+    "repository": "https://github.com/tree-sitter-grammars/tree-sitter-objc",
+    "revision": "18802acf31d0b5c1c1d50bdbc9eb0e1636cab9ed",
+    "query": "queries/highlights.scm",
+    "upstream_query_sha256": "ce7e30b5aab3d659a096812d8c227e83cd9bbb60470eb44def45bd5cb7737386",
+    "bundled_query_sha256": "57e0e10e4345ccffced95bff35567bc45dbea8320906042d793baa02a4934d1e",
+    "inherited_query": {
+      "crate": "tree-sitter-c",
+      "version": "0.24.2",
+      "path": "queries/highlights.scm",
+      "sha256": "3378d854dda695b2b282b9468247524ed4271ef74af691033d2e36883379409c"
+    },
+    "license": "MIT",
+    "license_file": "tree-sitter-objc.txt",
+    "license_sha256": "099c44248f8cf353123211318680e93465587c005a4b3730ce8cb5334de043d6",
+    "license_source": "https://raw.githubusercontent.com/tree-sitter-grammars/tree-sitter-objc/18802acf31d0b5c1c1d50bdbc9eb0e1636cab9ed/LICENSE"
+  },
+  {
+    "name": "tree-sitter-proto",
+    "version": "0.6.0",
+    "crate_sha256": "9c93b6f1ed20de442e900eb636f2176af6063953dfaa9f76bf168dd3b490a3a1",
+    "repository": "https://github.com/coder3101/tree-sitter-proto",
+    "revision": "6c878d18628ebbff3474479d2fdd6d8ba1954c3e",
+    "query": "queries/highlights.scm",
+    "upstream_query_sha256": "90d918dad99f076681aa035b6879f0c3d3dca207b8490a9ddd670200af68689d",
+    "bundled_query_sha256": "69fd4cbfda61a1c90e4e8e7aaf7ea8471e88b395ad3ac3215ac77349c620e241",
+    "license": "MIT",
+    "license_file": "tree-sitter-proto.txt",
+    "license_sha256": "1cc17f880ff4fa68079a72b98b89d42e8ce16b1bdbb1ec7b6f33465241e41003",
+    "license_source": "published crate LICENSE"
+  },
+  {
+    "name": "tree-sitter-containerfile",
+    "version": "0.9.2",
+    "crate_sha256": "f4811d55a5a2c32bb024b441c32b7417c3ec1af1a080a25fa20d321627b65a2b",
+    "repository": "https://github.com/wharflab/tree-sitter-containerfile",
+    "revision": "1df9124b22a72dde8683aab6f762ff4857acfeab",
+    "published_vcs_dirty": true,
+    "source_authority": "The checksummed published crate; its VCS metadata reports dirty, so the revision alone is not exact source reconstruction.",
+    "query": "queries/highlights.scm",
+    "upstream_query_sha256": "da1e19d2cc36e99dc7c571f44e8260d076ee57aaa03cb5627efbc6f422659cde",
+    "bundled_query_sha256": "55ab1f2296b360ac9668035504525a117298f053aa74c0626ca6b7a80f312fb8",
+    "license": "MIT",
+    "license_file": "tree-sitter-containerfile.txt",
+    "license_sha256": "cf292ce6d84e3e1b55bd8b830bf7643423aa49dde66b8cc3b57a986d2a2b6538",
+    "license_source": "published crate LICENSE (WharfLab)",
+    "upstream_license_file": "tree-sitter-containerfile-upstream.txt",
+    "upstream_license_sha256": "8d0d92d615b090961cf85b58bccf4cdd435959bf56c7ebbfeaf08cbb9518a8e0",
+    "upstream_license_source": "published crate LICENSE-MIT-CamdenCheek"
+  },
+  {
+    "name": "tree-sitter-gn",
+    "version": "1.0.0",
+    "crate_sha256": "9615e6de10d86e58c4217648979a1604ee9110763eebafd719b546b58cc2641f",
+    "repository": "https://github.com/tree-sitter-grammars/tree-sitter-gn",
+    "revision": "9ea96bbaeddb0b1c5907fa0d46fdf8f83e1c1107",
+    "local_crate": "crates/tree-sitter-gn",
+    "adaptation": "LanguageFn wrapper replaces the old Tree-sitter 0.20 Rust binding. Scanner expansion lookahead additionally recognizes 0 so existing expansion(hex) grammar parses GN byte escapes; generated parser/header/grammar files are unchanged.",
+    "native_inputs": [
+      {
+        "path": "grammar.js",
+        "upstream_sha256": "fbaf5fc27fa5cb9489842b0768d8f43d5d2f8610a497a49c814d645b2c32de02",
+        "bundled_sha256": "fbaf5fc27fa5cb9489842b0768d8f43d5d2f8610a497a49c814d645b2c32de02"
+      },
+      {
+        "path": "src/grammar.json",
+        "upstream_sha256": "f43731f3721101c497f7c50c723b698a1ad3e5fb84f66d78472bcb085029feb1",
+        "bundled_sha256": "f43731f3721101c497f7c50c723b698a1ad3e5fb84f66d78472bcb085029feb1"
+      },
+      {
+        "path": "src/node-types.json",
+        "upstream_sha256": "0153624f7f6b992fac0c383abfa634c579ee3acc7401ed4c23b5e2a171691acd",
+        "bundled_sha256": "0153624f7f6b992fac0c383abfa634c579ee3acc7401ed4c23b5e2a171691acd"
+      },
+      {
+        "path": "src/parser.c",
+        "upstream_sha256": "c70ccc15dfcaca287f05a239e17a46c79a027c9f5cfb816bc6d1ab0407f7a7fe",
+        "bundled_sha256": "c70ccc15dfcaca287f05a239e17a46c79a027c9f5cfb816bc6d1ab0407f7a7fe"
+      },
+      {
+        "path": "src/scanner.c",
+        "upstream_sha256": "5fa2247c32d9ec315144031abbb6841bb3ed2e888c5500826cb840892bedf3f7",
+        "bundled_sha256": "2e637d786d85bb381389b87b6db4514489ae6d79e9ff77ff54e02fd9bf07c7ff"
+      },
+      {
+        "path": "src/tree_sitter/parser.h",
+        "upstream_sha256": "83a7aebb8067b898fa0975e4c627148ec2407617865b42edc91537f6bf651591",
+        "bundled_sha256": "83a7aebb8067b898fa0975e4c627148ec2407617865b42edc91537f6bf651591"
+      }
+    ],
+    "query": "queries/highlights.scm",
+    "upstream_query_sha256": "8debd079fecbb5c192565accf922131e715a51e5b07879e6fbdc5b03bba9d352",
+    "bundled_query_sha256": "d96f3f56a348338a08ad2bded7bba6c03b0e40aa22efbf27fb60d334f6180cb6",
+    "license": "MIT",
+    "license_file": "tree-sitter-gn.txt",
+    "license_sha256": "099c44248f8cf353123211318680e93465587c005a4b3730ce8cb5334de043d6",
+    "license_source": "https://raw.githubusercontent.com/tree-sitter-grammars/tree-sitter-gn/9ea96bbaeddb0b1c5907fa0d46fdf8f83e1c1107/LICENSE"
+  },
+  {
+    "name": "tree-sitter-wgsl",
+    "version": "0.0.9",
+    "repository": "https://github.com/gpuweb/tree-sitter-wgsl",
+    "revision": "52e3c620a9c316cc8c1d504dd1908eb8cebe255b",
+    "local_crate": "crates/tree-sitter-wgsl",
+    "upstream_inputs": [
+      {
+        "path": "grammar.js",
+        "sha256": "0c48fad09d812cf39c448553ebf801b72b9ae2dda0e2af98515b9c90cb0828ad"
+      },
+      {
+        "path": "tree-sitter.json",
+        "sha256": "fc302b11bf783fb31da5f6c29b8f5b86197b572d5cf8aaf41558cd2ae47ad997"
+      },
+      {
+        "path": "LICENSE.md",
+        "sha256": "18d40c8ea3118033e6b4725efa522ac00bceb8ae429a1a0fa4356152bb07dc56"
+      },
+      {
+        "path": "src/scanner.c",
+        "sha256": "d9887efe2f327edd0ea5bfaed3ad7d06d28bdba3681c6c7c7d5bdeb83c1f12cb"
+      },
+      {
+        "path": "queries/highlights.scm",
+        "sha256": "f382448369805ac83cb0742d1c6668acadfeff9f650eefe0be39865ecf1dbce9"
+      }
+    ],
+    "generation": {
+      "generator": "tree-sitter 0.25.8",
+      "generator_sha256": "24c7473c7b8926e7376c511bb854f319a289f4e2bb8c3c1deb368f58f4309882",
+      "node": "v26.8.1",
+      "files": [
+        {
+          "file": "src/parser.c",
+          "sha256": "914bd6be8fdb49dd9d36e6c1eb55909b1d9440dfbfd74860eeeb805e88a11376"
+        },
+        {
+          "file": "src/grammar.json",
+          "sha256": "3691e7d745253ceb35ef462fcd706cb3b1aa32834b4277197c5a77467fa76700"
+        },
+        {
+          "file": "src/node-types.json",
+          "sha256": "07c2ebc311043d930af83440e2ff43196c6f0c206dc0fc054d83abe58556a31d"
+        },
+        {
+          "file": "src/tree_sitter/parser.h",
+          "sha256": "180b893c8734778fd32f372dfbc27bd6ad1cd2221f26150b31256ff6716320d2"
+        },
+        {
+          "file": "src/tree_sitter/alloc.h",
+          "sha256": "b29c1c9fb7cc82f58c84b376df1297d6e2737a1d655fd356db0859e3c29c2fea"
+        },
+        {
+          "file": "src/tree_sitter/array.h",
+          "sha256": "5bdf6ed1a78e3409fd443e085ca967a64c188a5d082aaf7f819bccd53a471c94"
+        }
+      ]
+    },
+    "generated_abi": 15,
+    "adapted_grammar_sha256": "37b307edd1f918d00c66c8a63a467b0ed34c408a5362d3126b2ad3a7d6769823",
+    "adapted_scanner_sha256": "dc80ece3869d867aa5a16c2004f457c3d9f04408d124e208f0a39e19fd628e8f",
+    "bundled_query_sha256": "589e6a12b193f61299313938d7026dde9ffbb709319dc4277db03ef3e27e9b06",
+    "adaptation": "Expose comment/operator/template delimiter nodes without changing external token order. Scanner skips comments during template classification and consumes nested-comment boundaries correctly. Query captures leaf names/tokens rather than entire types/declarations. LanguageFn/cc bindings compile retained generated C; local CommonJS metadata isolates generator execution.",
+    "licenses": [
+      {
+        "file": "tree-sitter-wgsl.txt",
+        "source": "https://raw.githubusercontent.com/gpuweb/tree-sitter-wgsl/52e3c620a9c316cc8c1d504dd1908eb8cebe255b/LICENSE.md",
+        "sha256": "18d40c8ea3118033e6b4725efa522ac00bceb8ae429a1a0fa4356152bb07dc56"
+      },
+      {
+        "file": "gpuweb-bsd.txt",
+        "source": "https://raw.githubusercontent.com/gpuweb/admin/463e2f34b1160e346d40ef82f31b644506e16cb2/SourceCodeLicense/LICENSE.txt",
+        "sha256": "83d286b68d185bc8d3299b655e317ed888a9b7af1fe3a518b0237ab03896a0d7"
+      },
+      {
+        "file": "tree-sitter-generator.txt",
+        "source": "https://raw.githubusercontent.com/tree-sitter/tree-sitter/v0.25.8/LICENSE",
+        "sha256": "5f9cf9fb6acb1972b35ae29119ce563bb60ec097656bc4b69b9bac2d04c7a147"
+      },
+      {
+        "file": "w3c-software-document-2023.txt",
+        "source": "https://www.w3.org/copyright/software-license-2023/",
+        "adaptation": "Full notice transcribed from HTML with paragraph/list formatting.",
+        "sha256": "09b06df43df5308b0071d33c5785c07d9df4d9b9a83e4c1728c262c9c80f6427"
+      },
+      {
+        "file": "wgsl-attribution.txt",
+        "source": "RedVim change notice retaining upstream grammar copyright.",
+        "sha256": "560778807a6c1ebbcabe7ab336d4824784cc9b8b5e563f1e822d4d53a5a65ba1"
+      }
+    ]
+  },
+  {
+    "name": "tree-sitter-caddyfile",
+    "version": "0.1.0",
+    "repository": "https://github.com/caddyserver/tree-sitter-caddyfile",
+    "revision": "4ef0479e11161ef4d1b4a89ae966eb1f5f11d764",
+    "local_crate": "crates/tree-sitter-caddyfile",
+    "native_abi": 15,
+    "native_inputs": [
+      {
+        "path": "grammar.js",
+        "upstream_sha256": "77a0f34050c846a309ebf67cad8184a10ee3f99484e695ff21355f506bde2fdd",
+        "bundled_sha256": "77a0f34050c846a309ebf67cad8184a10ee3f99484e695ff21355f506bde2fdd"
+      },
+      {
+        "path": "tree-sitter.json",
+        "upstream_sha256": "33c460aae7fa1b06c1216a896a5b1bc1d3122bedc849e7b60f28ee8e6eb8c244",
+        "bundled_sha256": "33c460aae7fa1b06c1216a896a5b1bc1d3122bedc849e7b60f28ee8e6eb8c244"
+      },
+      {
+        "path": "src/parser.c",
+        "upstream_sha256": "270e5bad49b32866567c0b6a08a1988db7ed24213fbf05d46cbf6f3239648155",
+        "bundled_sha256": "270e5bad49b32866567c0b6a08a1988db7ed24213fbf05d46cbf6f3239648155"
+      },
+      {
+        "path": "src/scanner.c",
+        "upstream_sha256": "f1beed146230178aad2f8600fb63a035ad3d2f9db51aca77c38b757be192927e",
+        "bundled_sha256": "e66607b57a04d9ac8d034c0822fc4f8c6ff398ad77cd137d895ed2efcd0b96fd"
+      },
+      {
+        "path": "src/grammar.json",
+        "upstream_sha256": "82013fc68e6fb3ade39d7ebf17646b918d56ac6a46d9c79ee5ccbea98909c96e",
+        "bundled_sha256": "82013fc68e6fb3ade39d7ebf17646b918d56ac6a46d9c79ee5ccbea98909c96e"
+      },
+      {
+        "path": "src/node-types.json",
+        "upstream_sha256": "abe4189d22694e25b2843b96c89a0e0735a3c06dc5c49456071ca7c3c13b9142",
+        "bundled_sha256": "abe4189d22694e25b2843b96c89a0e0735a3c06dc5c49456071ca7c3c13b9142"
+      },
+      {
+        "path": "src/tree_sitter/parser.h",
+        "upstream_sha256": "292226c4de39fa88f054315d9fad2aa7b3349036ce1327239fb798bb49d3afb4",
+        "bundled_sha256": "292226c4de39fa88f054315d9fad2aa7b3349036ce1327239fb798bb49d3afb4"
+      },
+      {
+        "path": "src/tree_sitter/alloc.h",
+        "upstream_sha256": "d8b491c5064d52bea18901e38f04f419e23457fafe4a3ad4c9402d4933a336b8",
+        "bundled_sha256": "d8b491c5064d52bea18901e38f04f419e23457fafe4a3ad4c9402d4933a336b8"
+      },
+      {
+        "path": "src/tree_sitter/array.h",
+        "upstream_sha256": "ab3e3d92636982cc7ff42822963da5a7366f2b7fcbf1c8926a5479e66b466b5a",
+        "bundled_sha256": "ab3e3d92636982cc7ff42822963da5a7366f2b7fcbf1c8926a5479e66b466b5a"
+      }
+    ],
+    "adaptation": "Retain generated parser unchanged. Combine heredoc end/body scanning to preserve partial-prefix lookahead; require a complete delimiter token; reset scanner state on empty deserialization. LanguageFn/cc packaging retains native sources. Query separates heredoc delimiters/body, colors ordinary arguments and path matchers, preserves escape priority and host-only opaque literal content.",
+    "upstream_query_sha256": "090f66f3afcf2f15a164c9053b74da03bc94ecc557e549f237ba3b43f84adc3f",
+    "bundled_query_sha256": "3000e135d8ad700486ecec3d9ba107f9a8a094243b97f1f383df59d2d92817af",
+    "license": "MIT",
+    "license_file": "tree-sitter-caddyfile.txt",
+    "license_source": "https://raw.githubusercontent.com/caddyserver/tree-sitter-caddyfile/4ef0479e11161ef4d1b4a89ae966eb1f5f11d764/LICENSE",
+    "license_sha256": "0f28bf29704477f340986f65b1342b841523388e3cf5fd83dd9994239b30a532"
+  },
+  {
+    "name": "tree-sitter-applescript",
+    "version": "0.0.1",
+    "repository": "https://github.com/HelgeSverre/tree-sitter-applescript",
+    "revision": "1676f5fe99eee6b6532ab6d13559323c48d26190",
+    "local_crate": "crates/tree-sitter-applescript",
+    "native_abi": 14,
+    "native_inputs": [
+      {
+        "path": "grammar.js",
+        "upstream_sha256": "0f20708d2fe75fdd48fce2c5faa7ac52ab235cdc92761a7ec37c0728755809f3",
+        "bundled_sha256": "0f20708d2fe75fdd48fce2c5faa7ac52ab235cdc92761a7ec37c0728755809f3"
+      },
+      {
+        "path": "package.json",
+        "upstream_sha256": "10357fd1b445f97164dd86d51ae5b732e7dba127326ea13af650f435ff36f5ea",
+        "bundled_sha256": "10357fd1b445f97164dd86d51ae5b732e7dba127326ea13af650f435ff36f5ea"
+      },
+      {
+        "path": "src/parser.c",
+        "upstream_sha256": "f5ad073319b5473d74fb2a4ef216dfebb7c76c64d22c76f42779bf72fb2532bf",
+        "bundled_sha256": "f5ad073319b5473d74fb2a4ef216dfebb7c76c64d22c76f42779bf72fb2532bf"
+      },
+      {
+        "path": "src/scanner.c",
+        "upstream_sha256": "2be75ea184316e3a9eecc6e1c7855b7e1b4619fef45999fe5c77f43c51eab9c6",
+        "bundled_sha256": "2be75ea184316e3a9eecc6e1c7855b7e1b4619fef45999fe5c77f43c51eab9c6"
+      },
+      {
+        "path": "src/grammar.json",
+        "upstream_sha256": "2a30ae30e7f119784f082389569329171913949a68d021bd7d2c323d0079080e",
+        "bundled_sha256": "2a30ae30e7f119784f082389569329171913949a68d021bd7d2c323d0079080e"
+      },
+      {
+        "path": "src/node-types.json",
+        "upstream_sha256": "1031e2ab3e1952e10ec312c951b359ba46498c5c633cd9a49f6477ca6c28c482",
+        "bundled_sha256": "1031e2ab3e1952e10ec312c951b359ba46498c5c633cd9a49f6477ca6c28c482"
+      },
+      {
+        "path": "src/tree_sitter/parser.h",
+        "upstream_sha256": "a3eb18ef034b3f4255b965a26caa276f9cfe13a79573b402f1a12dc5018052aa",
+        "bundled_sha256": "a3eb18ef034b3f4255b965a26caa276f9cfe13a79573b402f1a12dc5018052aa"
+      },
+      {
+        "path": "src/tree_sitter/alloc.h",
+        "upstream_sha256": "253b44a7b4313a7afd0c505c2fc6e7ce4b8e78955ebf4be3ea000532ec060673",
+        "bundled_sha256": "253b44a7b4313a7afd0c505c2fc6e7ce4b8e78955ebf4be3ea000532ec060673"
+      },
+      {
+        "path": "src/tree_sitter/array.h",
+        "upstream_sha256": "4ff743903dc46f5db6aa54f31c6b4d160a8a9779e5b2ab1ee59ae7ebcd850ea1",
+        "bundled_sha256": "4ff743903dc46f5db6aa54f31c6b4d160a8a9779e5b2ab1ee59ae7ebcd850ea1"
+      }
+    ],
+    "adaptation": "Retain generated parser and scanner unchanged. LanguageFn/cc wrapper compiles both, unlike the upstream Rust build which omits the scanner. Adapt Helix captures to RedVim scopes/semantic precedence; specialize handler-name command nodes, bare handler parameters and error parameters. Plain .applescript only; exclude compiled .scpt/.scptd. Indented to handlers can parse error-free but are not recognized as handler definitions; upstream dictionary/one-line-command limits remain.",
+    "upstream_query_sha256": "99f280a86305da51f1c8607d042d7183809984235e26cd28d843d632cd91a4c2",
+    "bundled_query_sha256": "f7dc525b0760d28ac8f315b740849ef3c395db1ef8ff47e431a90a21957cf4e4",
+    "license": "MIT",
+    "license_file": "tree-sitter-applescript.txt",
+    "license_source": "https://raw.githubusercontent.com/HelgeSverre/tree-sitter-applescript/1676f5fe99eee6b6532ab6d13559323c48d26190/LICENSE",
+    "license_sha256": "a65a537295910b776a8b2edb2e7410c3b0e975ca6388994e032c4d1842b4952d"
   }
 ]
