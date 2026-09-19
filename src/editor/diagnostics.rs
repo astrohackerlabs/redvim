@@ -391,6 +391,45 @@ mod tests {
     }
 
     #[test]
+    fn namespaced_diagnostic_cache_child() {
+        if std::env::var_os("REDVIM_TEST_DIAGNOSTICS_CHILD").is_none() {
+            return;
+        }
+        let (_workspace, file, uri) = diagnostic_workspace("x\n");
+        let cache = crate::config::Config::path("cache/lsp-diagnostics");
+        let finding = diagnostic("namespaced cache probe");
+        let mut first = cached_editor(&file, "x\n", &cache);
+        push(&mut first, &uri, vec![finding.clone()]);
+        first.persist_diagnostic_cache(true);
+        let restarted = cached_editor(&file, "x\n", &cache);
+        assert_eq!(restarted.diagnostics[&uri], vec![finding]);
+        assert!(std::fs::read_dir(cache).unwrap().next().is_some());
+    }
+
+    #[test]
+    fn diagnostic_cache_uses_namespaced_config_root() {
+        let root = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["namespaced_diagnostic_cache_child", "--nocapture"])
+            .env("REDVIM_TEST_DIAGNOSTICS_CHILD", "1")
+            .env("XDG_CONFIG_HOME", root.path())
+            .env("HOME", root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(root
+            .path()
+            .join("astrohacker/redvim/cache/lsp-diagnostics")
+            .is_dir());
+        assert!(!root.path().join("redvim").exists());
+    }
+
+    #[test]
     fn cached_diagnostics_reject_changed_document_contents() {
         let (root, file, uri) = diagnostic_workspace("before\n");
         let cache = root.path().join("cache");

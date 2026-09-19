@@ -52,6 +52,13 @@ pub struct Logger {
 }
 
 impl Logger {
+    /// Open the default sink without panicking or logging recursively on failure.
+    pub fn try_default() -> Option<Self> {
+        let root = crate::config::Config::try_config_dir()?;
+        std::fs::create_dir_all(&root).ok()?;
+        Self::try_new(root.join("redvim.log")).ok()
+    }
+
     pub fn try_new(file: impl AsRef<Path>) -> std::io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)

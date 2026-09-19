@@ -82,11 +82,11 @@ const displayCol = await red.getCursorDisplayColumn(); // 8
 
 ## Installation
 
-Add to your `~/.config/red/config.toml`:
+Add to your `~/.config/astrohacker/redvim/config.toml`:
 
 ```toml
 [plugins]
-unicode_demo = "~/.config/red/plugins/unicode_demo.hk"
+unicode_demo = "~/.config/astrohacker/redvim/plugins/unicode_demo.hk"
 ```
 
 Then reload Red or run the `:reload-plugins` command.

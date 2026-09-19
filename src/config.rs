@@ -1632,26 +1632,32 @@ pub fn rust_analyzer_initialization_options() -> Value {
 }
 
 impl Config {
-    /// Returns Red's platform configuration directory.
+    /// Returns RedVim's namespaced configuration directory.
     ///
-    /// `XDG_CONFIG_HOME` takes precedence; otherwise Red uses
-    /// `$HOME/.config/redvim`.
+    /// `XDG_CONFIG_HOME` takes precedence; otherwise RedVim uses
+    /// `$HOME/.config/astrohacker/redvim`.
     pub fn config_dir() -> PathBuf {
+        Self::try_config_dir().expect("home directory must be available to locate RedVim config")
+    }
+
+    /// Best-effort lookup for logging before normal startup configuration.
+    pub(crate) fn try_config_dir() -> Option<PathBuf> {
         if let Some(config_home) =
             std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty())
         {
-            return PathBuf::from(config_home).join("redvim");
+            return Some(
+                PathBuf::from(config_home)
+                    .join("astrohacker")
+                    .join("redvim"),
+            );
         }
 
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .or_else(|| {
-                #[allow(deprecated)]
-                std::env::home_dir()
-            })
-            .expect("home directory must be available to locate red config");
+        let home = std::env::var_os("HOME").map(PathBuf::from).or_else(|| {
+            #[allow(deprecated)]
+            std::env::home_dir()
+        })?;
 
-        home.join(".config").join("redvim")
+        Some(home.join(".config").join("astrohacker").join("redvim"))
     }
 
     /// Resolves a configuration-relative path.
@@ -4827,7 +4833,7 @@ max_buffer_words = 20
         );
         let permissions = config.plugin_permissions.get("project_search").unwrap();
         assert_eq!(permissions.process, vec!["rg".to_string()]);
-        assert_eq!(config.log_file.as_deref(), Some("red.log"));
+        assert_eq!(config.log_file.as_deref(), Some("redvim.log"));
     }
 
     #[test]

@@ -15,7 +15,16 @@ brew install redvim
 redvim example.nu
 ```
 
-Configuration lives in `$XDG_CONFIG_HOME/redvim`, or `~/.config/redvim`.
+Configuration lives in `$XDG_CONFIG_HOME/astrohacker/redvim`, or `~/.config/astrohacker/redvim`.
+
+The main file is `config.toml`. Themes, plugins, preferences, trust records,
+session state, caches and `redvim.log` share that root. Existing `~/.config/redvim`
+and `~/.config/red` directories are not imported automatically. To reuse an old
+configuration, close the editor and copy `config.toml` to the new directory
+without overwriting an existing file. Custom themes and plugins can be copied
+selectively; leave sockets, PID files, recovery state and caches behind.
+Re-trust external native grammars with `redvim language trust /full/path/to/parser.so`.
+Bundled Nushell highlighting needs no trust command.
 Existing Red configuration is independent. `REDVIM_RUNTIME` is an optional
 development override. Normal installations use embedded runtime assets.
 Language servers and optional agent integrations require their own setup;

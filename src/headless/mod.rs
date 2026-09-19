@@ -567,7 +567,12 @@ pub fn bind_session(directory: &Path, name: &str) -> anyhow::Result<BoundSession
     if std::fs::symlink_metadata(&paths.pid).is_ok() {
         std::fs::remove_file(&paths.pid)?;
     }
-    let listener = UnixListener::bind(&paths.socket)?;
+    let listener = UnixListener::bind(&paths.socket).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to bind session socket {}: {error}",
+            paths.socket.display()
+        )
+    })?;
     std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))?;
     let token = uuid::Uuid::new_v4().to_string();
     write_private_file(&paths.token, token.as_bytes())?;

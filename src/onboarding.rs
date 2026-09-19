@@ -1,6 +1,6 @@
 //! First-run onboarding.
 //!
-//! When `~/.config/red/config.toml` is missing, [`run`] welcomes the user on
+//! When `~/.config/astrohacker/redvim/config.toml` is missing, [`run`] welcomes the user on
 //! the plain terminal and offers to create a starter config. Defaults, themes,
 //! and plugins are embedded in the binary so a fresh install can bootstrap
 //! itself with no external files.
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn render_welcome_mentions_red_and_paths_and_prompt() {
-        let dir = Path::new("/home/example/.config/red");
+        let dir = Path::new("/home/example/.config/astrohacker/redvim");
         let banner = render_welcome(dir, false);
 
         assert!(banner.to_lowercase().contains("red"));
@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn render_welcome_omits_ansi_when_color_disabled() {
-        let dir = Path::new("/home/example/.config/red");
+        let dir = Path::new("/home/example/.config/astrohacker/redvim");
         let banner = render_welcome(dir, false);
         assert!(
             !banner.contains('\x1b'),
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn render_welcome_includes_ansi_when_color_enabled() {
-        let dir = Path::new("/home/example/.config/red");
+        let dir = Path::new("/home/example/.config/astrohacker/redvim");
         let banner = render_welcome(dir, true);
         assert!(
             banner.contains('\x1b'),

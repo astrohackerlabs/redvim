@@ -65,8 +65,8 @@ fn agent_check_does_not_initialize_unrelated_runtime_resources() {
     let directory = tempfile::tempdir().unwrap();
     let codex = fake_codex(directory.path(), "0.144.5");
     let config = tempfile::tempdir().unwrap();
-    let config_dir = config.path().join("redvim");
-    fs::create_dir(&config_dir).unwrap();
+    let config_dir = config.path().join("astrohacker/redvim");
+    fs::create_dir_all(&config_dir).unwrap();
     fs::write(
         config_dir.join("config.toml"),
         format!(

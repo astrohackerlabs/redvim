@@ -4,7 +4,7 @@ use std::{fs, process::Command};
 fn redvim_identity_and_configuration_are_independent_of_red() {
     let root = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join("red")).unwrap();
-    fs::create_dir(root.path().join("redvim")).unwrap();
+    fs::create_dir_all(root.path().join("astrohacker/redvim")).unwrap();
     let old = root.path().join("red/config.toml");
     fs::write(&old, "this is deliberately invalid TOML").unwrap();
     for (args, expected) in [

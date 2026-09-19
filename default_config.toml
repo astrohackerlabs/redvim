@@ -3,12 +3,12 @@
 # The configuration file is a TOML file. The configuration file is read from
 # the following locations:
 #
-# 1. $XDG_CONFIG_HOME/red/config.toml
-# 2. $HOME/.config/red/config.toml
+# 1. $XDG_CONFIG_HOME/astrohacker/redvim/config.toml
+# 2. $HOME/.config/astrohacker/redvim/config.toml
 # 
 
 # Name of the VSCode theme to use. The theme file should be present in the
-# themes directory: $XDG_CONFIG_HOME/red/themes or $HOME/.config/red/themes
+# themes directory: $XDG_CONFIG_HOME/astrohacker/redvim/themes or $HOME/.config/astrohacker/redvim/themes
 theme = "red.json"
 
 # The number of lines to scroll when using the mouse wheel
@@ -54,7 +54,7 @@ fetch_release_notes = true
 # Path to the log file. Relative paths are resolved from Red's config
 # directory. If the log file is not present, Red will create it; if it is
 # present, Red will append to it.
-log_file = "red.log"
+log_file = "redvim.log"
 
 # Built-in plugins are enabled through the [plugins] table below. Add plugin
 # names here to disable defaults without copying or editing bundled plugin files.
@@ -241,8 +241,8 @@ waiting = "steady_underscore"
 # # Native libraries require `red language trust buildspec` first:
 # # path = "~/.local/share/nvim/site/parser/buildspec.so"
 # # symbol = "tree_sitter_buildspec"
-# # highlights = ["~/.config/red/queries/buildspec/highlights.scm"]
-# # textobjects = ["~/.config/red/queries/buildspec/textobjects.scm"]
+# # highlights = ["~/.config/astrohacker/redvim/queries/buildspec/highlights.scm"]
+# # textobjects = ["~/.config/astrohacker/redvim/queries/buildspec/textobjects.scm"]
 #
 # [languages.buildspec.lsp]
 # command = "build-language-server"
