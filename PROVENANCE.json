@@ -1,20 +1,20 @@
 {
-  "version": "0.7.0",
+  "version": "0.7.1",
   "fork": {
     "name": "red",
     "checkout": "forks/red",
     "base": "9e0952767d35d5b8dddd3fa3bb90087938692c52",
-    "branch": "issue-26091823140848-exp5-homebrew-release",
-    "expected_head": "ca6698a5163dfc3b1246eb8cc5ed61bba5b1e2ab",
-    "expected_tree": "2fd1fc74c4334e4e6e6dfd000e8d97533e1890a1",
+    "branch": "issue-26091823140848-exp6-auto-patch-release",
+    "expected_head": "48da8fd8beb0d5a1980d1cd8c6a544094a6abef7",
+    "expected_tree": "c6002204f189ed77b7d6e63c941a4fafe03b4893",
     "patch_directories": [
       "patches/red/patches/issue-26091823140848"
     ],
-    "patch_count": 4,
-    "archive_sha256": "a6d4d9df0aa43233428c29682b9617d5705f7c579db0cd32fd02e323cffe7b7c",
+    "patch_count": 6,
+    "archive_sha256": "e9062cd0dd5831d4242e4a52ed720c4620bd4298cbb16c17971a762af81a819f",
     "allowed_untracked": []
   },
-  "monorepo_commit": "9405f7d3150701c0777784b817287ca9f8989df7",
+  "monorepo_commit": "f7e8ba78546edb8234968eea7887251d610297b8",
   "grammar_revision": "bb3f533e5792260291945e1f329e1f0a779def6e",
   "query_revision": "4d9466677a5ceadef104eaa0fe08d60d91c4e9a7",
   "deployment_target": "26.0"

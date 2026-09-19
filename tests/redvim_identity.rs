@@ -8,7 +8,10 @@ fn redvim_identity_and_configuration_are_independent_of_red() {
     let old = root.path().join("red/config.toml");
     fs::write(&old, "this is deliberately invalid TOML").unwrap();
     for (args, expected) in [
-        (vec!["--version"], "redvim 0.7.0"),
+        (
+            vec!["--version"],
+            concat!("redvim ", env!("CARGO_PKG_VERSION")),
+        ),
         (vec!["--help"], "Usage: redvim"),
         (vec!["--check-config"], "config ok"),
         (vec!["--self-check"], "language nu: bundled highlighting ok"),
