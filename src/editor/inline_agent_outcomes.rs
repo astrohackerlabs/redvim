@@ -16,7 +16,7 @@ pub(super) struct StagedHandoff {
 }
 
 pub(super) fn handoff_marker(request: &str) -> String {
-    format!("Red inline history reference: {request}")
+    format!("RedVim inline history reference: {request}")
 }
 
 fn bounded_text(text: &str, limit: usize) -> String {

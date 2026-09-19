@@ -89,7 +89,7 @@ pub fn run(config: &Config) -> AgentCheckReport {
             minimum_version: MINIMUM_CODEX_VERSION.to_string(),
             authentication: "not checked while `disable_ai = true`".to_string(),
             production_ready: false,
-            messages: vec!["Red will not launch Codex.".to_string()],
+            messages: vec!["RedVim will not launch Codex.".to_string()],
         };
     }
 

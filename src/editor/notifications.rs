@@ -115,7 +115,7 @@ fn record_details(record: &Notification, now: Instant) -> String {
         if record.occurrences == 1 { "" } else { "s" },
         crate::notification::detail_text(body),
         if record.content.truncated {
-            "\n\n[Message truncated by Red]"
+            "\n\n[Message truncated by RedVim]"
         } else {
             ""
         }

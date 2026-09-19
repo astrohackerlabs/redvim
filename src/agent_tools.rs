@@ -507,7 +507,7 @@ pub fn editor_tool_schemas(schema_key: &str) -> Vec<Value> {
         ),
         (
             "apply_edits",
-            "Atomically apply up to 128 non-overlapping, half-open UTF-16 text edits through Red and save the file, creating missing parent directories.",
+            "Atomically apply up to 128 non-overlapping, half-open UTF-16 text edits through RedVim and save the file, creating missing parent directories.",
             json!({
                 "type": "object",
                 "properties": {

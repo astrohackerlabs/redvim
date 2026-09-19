@@ -75,9 +75,12 @@ fn forwarded_husk_arguments_from(
     let mut arguments = arguments.into_iter();
     let _program = arguments.next()?;
     (arguments.next().as_deref() == Some(OsStr::new("husk"))).then(|| {
-        std::iter::once(OsString::from("red husk"))
-            .chain(arguments)
-            .collect()
+        std::iter::once(OsString::from(format!(
+            "{} husk",
+            red::identity::EXECUTABLE
+        )))
+        .chain(arguments)
+        .collect()
     })
 }
 
@@ -554,7 +557,7 @@ fn start_detached_owner(args: &Args, session: &str) -> anyhow::Result<u32> {
 
         anyhow::ensure!(
             !red::headless::session_is_active(&Config::path("run"), session)?,
-            "detach session `{session}` is already running; use `red --attach {session}`"
+            "detach session `{session}` is already running; use `redvim --attach {session}`"
         );
         let mut command = Command::new(std::env::current_exe()?);
         command
@@ -1037,8 +1040,8 @@ fn format_error(error: &anyhow::Error) -> String {
     }
 }
 
-fn load_theme(theme_name: &str) -> anyhow::Result<Theme> {
-    let Some(theme_asset) = assets::resolve_theme(theme_name, &Config::config_dir()) else {
+fn load_theme(theme_name: &str, config_dir: &Path) -> anyhow::Result<Theme> {
+    let Some(theme_asset) = assets::resolve_theme(theme_name, config_dir) else {
         anyhow::bail!("Theme file {} not found", theme_name);
     };
 
@@ -1046,6 +1049,26 @@ fn load_theme(theme_name: &str) -> anyhow::Result<Theme> {
         parse_vscode_theme(&path.to_string_lossy())
     } else {
         parse_vscode_theme_contents(&theme_asset.read_to_string()?)
+    }
+}
+
+fn load_configured_theme(loaded: &mut LoadedConfig, config_dir: &Path) -> anyhow::Result<Theme> {
+    match load_theme(&loaded.config.theme, config_dir) {
+        Ok(theme) => Ok(theme),
+        Err(error) => {
+            loaded.add_runtime_diagnostic(
+                "CFG302",
+                ConfigDiagnosticSeverity::Error,
+                &["theme".to_string()],
+                format!("configured theme could not be loaded: {error}"),
+                "used the embedded default theme",
+            );
+            loaded.config.theme = assets::DEFAULT_THEME_FILENAME.to_string();
+            let contents = assets::bundled_theme(assets::DEFAULT_THEME_FILENAME)
+                .ok_or_else(|| anyhow::anyhow!("embedded default theme is missing"))?;
+            parse_vscode_theme_contents(contents)
+                .map_err(|error| anyhow::anyhow!("embedded default theme is invalid: {error}"))
+        }
     }
 }
 
@@ -1087,23 +1110,7 @@ fn finalize_runtime_config(
         );
     }
 
-    let theme = match load_theme(&loaded.config.theme) {
-        Ok(theme) => theme,
-        Err(error) => {
-            loaded.add_runtime_diagnostic(
-                "CFG302",
-                ConfigDiagnosticSeverity::Error,
-                &["theme".to_string()],
-                format!("configured theme could not be loaded: {error}"),
-                "used the embedded default theme",
-            );
-            loaded.config.theme = "red.json".to_string();
-            let contents = assets::bundled_theme("red.json")
-                .ok_or_else(|| anyhow::anyhow!("embedded default theme is missing"))?;
-            parse_vscode_theme_contents(contents)
-                .map_err(|error| anyhow::anyhow!("embedded default theme is invalid: {error}"))?
-        }
-    };
+    let theme = load_configured_theme(&mut loaded, &config_dir)?;
 
     let logger = match loaded.config.log_file.clone() {
         Some(configured_path) => {
@@ -1383,7 +1390,7 @@ mod tests {
                 ["red", "husk", "check", "script.hk"].map(OsString::from)
             ),
             Some(
-                ["red husk", "check", "script.hk"]
+                ["redvim husk", "check", "script.hk"]
                     .map(OsString::from)
                     .to_vec()
             )
@@ -1392,6 +1399,50 @@ mod tests {
             forwarded_husk_arguments_from(["red", "file.txt"].map(OsString::from)),
             None
         );
+    }
+
+    #[test]
+    fn austin_night_recovery_bypasses_malformed_shadow_and_preserves_user_theme() {
+        let dir = tempfile::tempdir().unwrap();
+        let themes = dir.path().join("themes");
+        std::fs::create_dir(&themes).unwrap();
+        let shadow = themes.join(assets::DEFAULT_THEME_FILENAME);
+        std::fs::write(&shadow, "{ invalid").unwrap();
+        let custom = themes.join("custom.json");
+        let custom_bytes = assets::bundled_theme("tokyo-night.json").unwrap();
+        std::fs::write(&custom, custom_bytes).unwrap();
+        for name in [
+            "missing-theme.json",
+            assets::DEFAULT_THEME_FILENAME,
+            "custom.json",
+        ] {
+            let mut loaded = Config::load_user_toml(
+                &format!("theme = {name:?}"),
+                &dir.path().join("config.toml"),
+                &[],
+            )
+            .unwrap();
+            let theme = load_configured_theme(&mut loaded, dir.path()).unwrap();
+            if name == "custom.json" {
+                assert_eq!(theme.name, "Tokyo Night");
+                assert!(loaded.diagnostics.is_empty());
+                assert_eq!(loaded.config.theme, name);
+            } else {
+                assert_eq!(theme.name, "Austin Night");
+                assert_eq!(
+                    theme.style.bg,
+                    Some(red::color::Color::Rgb {
+                        r: 17,
+                        g: 18,
+                        b: 25
+                    })
+                );
+                assert_eq!(loaded.config.theme, assets::DEFAULT_THEME_FILENAME);
+                assert!(loaded.diagnostics.iter().any(|d| d.code == "CFG302"));
+            }
+        }
+        assert_eq!(std::fs::read_to_string(shadow).unwrap(), "{ invalid");
+        assert_eq!(std::fs::read_to_string(custom).unwrap(), custom_bytes);
     }
 
     #[test]
@@ -1406,7 +1457,7 @@ mod tests {
 
         let (loaded, _, logger) = finalize_runtime_config(loaded).unwrap();
 
-        assert_eq!(loaded.config.theme, "red.json");
+        assert_eq!(loaded.config.theme, crate::assets::DEFAULT_THEME_FILENAME);
         assert!(loaded.config.log_file.is_none());
         assert!(logger.is_none());
         assert!(loaded

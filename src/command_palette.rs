@@ -492,7 +492,7 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
         ),
         builtin(
             "editor.welcome",
-            "Welcome to Red",
+            crate::identity::WELCOME,
             "Editor",
             "Open the first-run welcome, guided tour, and release highlights",
             Some(":welcome"),
@@ -501,11 +501,17 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
         ),
         builtin(
             "editor.tutorial",
-            "Take the guided Red tour",
+            crate::identity::TOUR,
             "Editor",
             "Practice editing, navigation, Git, and reviewable agent changes",
             Some(":tutorial"),
-            &["tour", "walkthrough", "learn red", "onboarding"],
+            &[
+                "tour",
+                "walkthrough",
+                "learn redvim",
+                "learn red",
+                "onboarding",
+            ],
             Action::StartTutorial(crate::tutorial::TutorialTrack::Guided),
         ),
         builtin(
@@ -519,7 +525,7 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
         ),
         builtin(
             "editor.whats_new",
-            "What’s new in Red",
+            crate::identity::WHATS_NEW,
             "Editor",
             "Read highlights and release notes for the installed version",
             Some(":whats-new"),
@@ -528,7 +534,7 @@ fn builtin_commands() -> Vec<BuiltinCommand> {
         ),
         builtin(
             "editor.learn",
-            "Learn Red",
+            crate::identity::LEARN,
             "Editor",
             "Choose a learning track and practice safely",
             Some(":learn"),
@@ -1455,10 +1461,10 @@ fn action_label(action: &Action) -> String {
         Action::OpenInlineActivity | Action::OpenInlineHistory => {
             "Inline assist history".to_string()
         }
-        Action::OpenWelcome => "Welcome to Red".to_string(),
-        Action::StartTutorial(_) => "Take the guided Red tour".to_string(),
+        Action::OpenWelcome => crate::identity::WELCOME.to_string(),
+        Action::StartTutorial(_) => crate::identity::TOUR.to_string(),
         Action::ConfigDiagnostics => "Configuration diagnostics".to_string(),
-        Action::OpenWhatsNew => "What’s new in Red".to_string(),
+        Action::OpenWhatsNew => crate::identity::WHATS_NEW.to_string(),
         Action::OpenDiagnosticsPicker => "Diagnostics".to_string(),
         Action::OpenErrorDiagnosticsPicker => "Errors".to_string(),
         Action::OpenStatuslineManager => "Configure status line".to_string(),
@@ -1847,6 +1853,16 @@ mod tests {
             .find(|entry| entry.id == "editor.tutorial")
             .unwrap();
         assert_eq!(tutorial.colon.as_deref(), Some(":tutorial"));
+        assert_eq!(welcome.title, crate::identity::WELCOME);
+        assert_eq!(tutorial.title, crate::identity::TOUR);
+        let items = picker_items(&entries);
+        let tutorial = items
+            .iter()
+            .find(|item| item.id == "editor.tutorial")
+            .unwrap();
+        for query in ["learn redvim", "learn red"] {
+            assert!(filter_score(tutorial, query).is_some());
+        }
     }
 
     #[test]

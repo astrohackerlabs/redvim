@@ -6,6 +6,8 @@
 //! comments through the VS Code adapter but produces the same internal model as bundled
 //! native themes.
 
+#[cfg(test)]
+mod austin_night;
 mod surface;
 mod vscode;
 pub(crate) use surface::{DiffPalette, SurfaceCardColors, SurfaceCardPalette, SurfacePalette};

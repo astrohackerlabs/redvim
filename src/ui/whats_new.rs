@@ -355,7 +355,7 @@ impl WhatsNewPanel {
     fn draw_hero(&self, buffer: &mut RenderBuffer) {
         let palette = splash::palette(&self.theme);
         let layout = self.layout();
-        let brand = "red";
+        let brand = crate::identity::EXECUTABLE;
         let brand_width = display_width(brand) + 2;
         let x = self.dialog.x + 1 + self.dialog.width.saturating_sub(brand_width) / 2;
         let y = self.dialog.y + layout.brand_row;
@@ -371,12 +371,17 @@ impl WhatsNewPanel {
             bold: true,
             ..self.theme.ui_style.dialog_title.clone()
         };
-        self.centered_text(buffer, layout.title_row, "What’s new in Red", &title_style);
+        self.centered_text(
+            buffer,
+            layout.title_row,
+            crate::identity::WHATS_NEW,
+            &title_style,
+        );
         if let Some(tagline_row) = layout.tagline_row {
             self.centered_text(
                 buffer,
                 tagline_row,
-                "the editor that respects your muscle memory",
+                "the editor that respects your time",
                 palette.style(Role::Muted),
             );
         }
@@ -687,8 +692,8 @@ mod tests {
 
         let text = rendered_text(&buffer);
         assert!(text.contains("RELEASE NOTES"));
-        assert!(text.contains("What’s new in Red"));
-        assert!(text.contains("the editor that respects your muscle memory"));
+        assert!(text.contains(crate::identity::WHATS_NEW));
+        assert!(text.contains("the editor that respects your time"));
         assert!(text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
         assert!(text.contains("●"));
         assert!(text.contains("Highlights"));

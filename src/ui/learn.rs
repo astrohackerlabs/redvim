@@ -343,7 +343,7 @@ impl Component for LearnHub {
             frame.x + 3,
             frame.y + 1,
             frame.width.saturating_sub(6),
-            "red ●   │   Learn",
+            "redvim ●   │   Learn",
             &palette.primary,
         );
         if frame.height >= 18 {
@@ -450,7 +450,7 @@ impl Component for LearnHub {
         true
     }
     fn shortcut_context(&self) -> &str {
-        "Learn Red"
+        crate::identity::LEARN
     }
     fn surface_actions(&self) -> Vec<UiAction> {
         self.actions()
@@ -593,7 +593,7 @@ pub(crate) fn draw_learn_coach(
             2,
             0,
             buffer.width.saturating_sub(4),
-            "red ●   Learn / Essentials   ·   Practice buffer",
+            "redvim ●   Learn / Essentials   ·   Practice buffer",
             &palette.primary,
         );
         if layout.top > 1 {
@@ -936,7 +936,7 @@ mod tests {
         let mut buffer = RenderBuffer::new(120, 32, &hub.theme.style);
         hub.draw(&mut buffer).unwrap();
         let help = buffer.shortcut_help_regions.last().unwrap();
-        assert_eq!(help.context, "Learn Red");
+        assert_eq!(help.context, crate::identity::LEARN);
         assert_eq!(help.rect.y, hub.layout().footer_y);
         assert!(help.actions.iter().any(|action| action.id == "open"));
         assert_eq!(
@@ -1022,7 +1022,7 @@ mod tests {
             .position(|row| row.contains("Start the first lesson"))
             .unwrap();
         assert!(action_y < layout.footer_y - 2);
-        assert!(rows.iter().any(|row| row.contains("Make Red yours")));
+        assert!(rows.iter().any(|row| row.contains("Make RedVim yours")));
     }
 
     #[test]

@@ -3285,7 +3285,7 @@ async fn shell_command_bounds_output_and_repairs_invalid_utf8() {
     let details = record.content.details.as_deref().unwrap();
 
     assert!(details.len() <= 64 * 1024);
-    assert!(details.contains("[Earlier output truncated by Red]"));
+    assert!(details.contains("[Earlier output truncated by RedVim]"));
     assert!(details.ends_with("TAIL�"), "{}", details.len());
 }
 
@@ -3659,7 +3659,7 @@ async fn shell_filter_retains_complete_raw_output_while_bounding_message_history
         .ends_with("\u{1b}[31mRAW\u{1b}[0m"));
     let details = record.content.details.as_deref().unwrap();
     assert!(details.len() < 64 * 1024);
-    assert!(details.contains("[Earlier output truncated by Red]"));
+    assert!(details.contains("[Earlier output truncated by RedVim]"));
     assert!(!details.contains("\u{1b}"));
 }
 

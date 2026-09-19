@@ -653,7 +653,7 @@ impl Editor {
             context.push_str(&parent.agent_context());
         }
         Some(format!(
-            "Continue this inline-assist discussion in the project. Carry out the latest user request below, using the earlier answers as context. Read current files through Red before editing; the discussion may describe older source.\n\n{}\n\nLocation: {}:{}–{}\n\nLatest user request:\n{}\n{}",
+            "Continue this inline-assist discussion in the project. Carry out the latest user request below, using the earlier answers as context. Read current files through RedVim before editing; the discussion may describe older source.\n\n{}\n\nLocation: {}:{}–{}\n\nLatest user request:\n{}\n{}",
             super::inline_agent_outcomes::handoff_marker(&latest.request_id),
             latest.location.file,
             range.start.line + 1,

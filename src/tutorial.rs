@@ -12,7 +12,7 @@ use crate::{buffer::BufferId, editor::Action, editor::Mode, window::WindowManage
 pub const CURRICULUM_VERSION: u16 = 1;
 
 /// Initial contents of the unnamed, never-saved practice buffer.
-pub const PRACTICE_CONTENTS: &str = r#"// Welcome to Red. This practice buffer never touches your project.
+pub const PRACTICE_CONTENTS: &str = r#"// Welcome to RedVim. This practice buffer never touches your project.
 
 fn total_price(prices: &[u32]) -> u32 {
     prices.iter().sum()
@@ -100,9 +100,9 @@ impl TutorialLesson {
             Self::Discovery => "Discover every command",
             Self::Navigation => "Find files and search projects",
             Self::Completion => "Code intelligence, immediately",
-            Self::Git => "Git without leaving Red",
+            Self::Git => "Git without leaving RedVim",
             Self::Agent => "An agent that knows your editor",
-            Self::Themes => "Make Red yours",
+            Self::Themes => "Make RedVim yours",
         }
     }
 
@@ -178,7 +178,9 @@ impl TutorialLesson {
             Self::Navigation => "Fuzzy previews and project search keep your hands on the keys.",
             Self::Completion => "Open buffers supply suggestions even without a language server.",
             Self::Git => "Real Git changes always remain under your control.",
-            Self::Agent => "Agent writes save through Red; inline edits stay unsaved and undoable.",
+            Self::Agent => {
+                "Agent writes save through RedVim; inline edits stay unsaved and undoable."
+            }
             Self::Themes => "Bundled themes and plugins work without a config file.",
         }
     }

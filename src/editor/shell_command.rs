@@ -138,7 +138,7 @@ impl ShellJob {
     fn content(&self, summary: String) -> MessageContent {
         let mut details = format!("$ {}\n\n", self.command);
         if self.truncated {
-            details.push_str("[Earlier output truncated by Red]\n");
+            details.push_str("[Earlier output truncated by RedVim]\n");
         }
         details.push_str(&String::from_utf8_lossy(&self.output));
         MessageContent::new(summary).with_details(details)

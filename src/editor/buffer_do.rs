@@ -48,7 +48,7 @@ impl Editor {
             };
             if practice_buffer_id == Some(target) {
                 first_error.get_or_insert_with(|| {
-                    "the Red tutorial practice buffer cannot be saved".to_string()
+                    "the RedVim tutorial practice buffer cannot be saved".to_string()
                 });
                 continue;
             }

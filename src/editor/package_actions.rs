@@ -510,7 +510,7 @@ impl Editor {
                     }
                 }
                 if *restart_plugins {
-                    message.push_str(" Restart Red to refresh plugin code.");
+                    message.push_str(" Restart RedVim to refresh plugin code.");
                 }
                 self.set_legacy_message(Some(message.clone()));
                 let manager = plugin::package::PluginPackageManager::new(Config::config_dir());

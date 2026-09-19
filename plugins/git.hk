@@ -2174,7 +2174,7 @@ fn run_detail_action(event: GitWorkspaceEvent) {
         red::execute("OpenDynamicPicker", "Discard selected changes", 490, [
             PickerItem { id: "cancel", label: "Cancel", kind: "Cancel" },
             PickerItem { id: "proceed", label: "Proceed", kind: "Destructive" },
-        ], PickerOptions { status: red::string(line.data.path, "") + " · this cannot be undone by Red" });
+        ], PickerOptions { status: red::string(line.data.path, "") + " · this cannot be undone by RedVim" });
     } else if normalized == "s" {
         apply_hunk("stage", selected);
     } else {
@@ -3957,13 +3957,14 @@ fn finish_commit_scratch(submit: bool, text: String) {
 }
 
 fn commit_context_marker() -> String {
-    return "# --- Red commit context (not part of the commit message) ---";
+    return "# --- RedVim commit context (not part of the commit message) ---";
 }
 
 fn commit_message(text: String) -> String {
     let message_lines = [];
     for line in red::split(text, "\n") {
-        if line == commit_context_marker() {
+        // Keep old scratch buffers safe after upgrading the product branding.
+        if line == commit_context_marker() || line == "# --- Red commit context (not part of the commit message) ---" {
             break;
         }
         message_lines = red::push(message_lines, line);
@@ -4237,7 +4238,7 @@ fn hunk_cursor_loaded(cursor: GitCursorPosition) {
         red::execute("OpenPicker", "Reset hunk", [
             PickerItem { id: "cancel", label: "Cancel", kind: "Cancel" },
             PickerItem { id: "proceed", label: "Proceed", kind: "Destructive" },
-        ], PickerOptions { status: "This cannot be undone by Red." }, PickerHandlers {
+        ], PickerOptions { status: "This cannot be undone by RedVim." }, PickerHandlers {
             selected: reset_confirmed,
         });
     } else {

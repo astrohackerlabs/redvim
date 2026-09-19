@@ -189,7 +189,7 @@ impl WelcomePanel {
             WelcomeCard::ReleaseHighlights => "What’s new",
         };
         let lines: [&str; 2] = match card {
-            WelcomeCard::GuidedTour => ["Learn Red by using it.", "Editing · Git · safe agents"],
+            WelcomeCard::GuidedTour => ["Learn RedVim by using it.", "Editing · Git · safe agents"],
             WelcomeCard::ReleaseHighlights => [
                 "Discover release highlights.",
                 "Immediate and offline-ready",
@@ -312,7 +312,7 @@ impl WelcomePanel {
             bold: true,
             ..self.theme.ui_style.dialog_title.clone()
         };
-        self.center(buffer, 0, "What’s new in Red", &title);
+        self.center(buffer, 0, crate::identity::WHATS_NEW, &title);
         self.center(
             buffer,
             1,
@@ -372,7 +372,7 @@ impl WelcomePanel {
 
 impl Component for WelcomePanel {
     fn shortcut_context(&self) -> &str {
-        "Welcome to Red"
+        crate::identity::WELCOME
     }
 
     fn draw(&self, buffer: &mut RenderBuffer) -> anyhow::Result<()> {
@@ -729,7 +729,7 @@ fn embedded_release_notes(version: &str) -> String {
         }
     }
     format!(
-        "## Included with Red {version}\n\n- Familiar modal editing\n- Fast file and project search\n- Reviewable agent proposals\n- Built-in Git and language tools"
+        "## Included with RedVim {version}\n\n- Familiar modal editing\n- Fast file and project search\n- Reviewable agent proposals\n- Built-in Git and language tools"
     )
 }
 
@@ -771,7 +771,7 @@ mod tests {
     fn embedded_notes_are_for_the_installed_version_only() {
         let notes = embedded_release_notes(env!("CARGO_PKG_VERSION"));
 
-        assert!(notes.contains("### Features") || notes.contains("Included with Red"));
+        assert!(notes.contains("### Features") || notes.contains("Included with RedVim"));
         assert!(!notes.contains("## [0.4.0]"));
     }
 

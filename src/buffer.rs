@@ -683,7 +683,7 @@ impl Buffer {
         else {
             anyhow::ensure!(
                 disk_contents.is_none(),
-                "Refusing to overwrite existing file {:?}; it was not opened or saved by Red",
+                "Refusing to overwrite existing file {:?}; it was not opened or saved by RedVim",
                 path.display().to_string()
             );
             return Ok(());
@@ -697,7 +697,7 @@ impl Buffer {
 
         anyhow::ensure!(
             unchanged,
-            "File changed on disk since Red last read or saved it: {:?}; use :diffdisk to compare, :e! to reload, :w <file> to save elsewhere, or :w! to overwrite",
+            "File changed on disk since RedVim last read or saved it: {:?}; use :diffdisk to compare, :e! to reload, :w <file> to save elsewhere, or :w! to overwrite",
             path.display().to_string()
         );
         Ok(())

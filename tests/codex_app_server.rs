@@ -668,7 +668,7 @@ async fn direct_app_server_reports_live_startup_failure_and_stderr_availability(
     );
     assert!(error.contains("status: 23"), "{error}");
     assert!(
-        error.contains("diagnostic details to the Red log"),
+        error.contains("diagnostic details to the RedVim log"),
         "{error}"
     );
 }

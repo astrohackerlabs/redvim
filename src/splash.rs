@@ -12,7 +12,7 @@ use crate::unicode_utils::display_width;
 pub const FULL_MIN_WIDTH: usize = 60;
 pub const FULL_MIN_HEIGHT: usize = 20;
 /// Content cells required for the compact wordmark-only variant.
-pub const COMPACT_MIN_WIDTH: usize = 26;
+pub const COMPACT_MIN_WIDTH: usize = MARK_WIDTH + 5;
 pub const COMPACT_MIN_HEIGHT: usize = 7;
 
 /// Visual role of a splash span; each maps to one theme-derived style.
@@ -69,14 +69,14 @@ fn span(text: impl Into<String>, role: Role) -> Span {
     }
 }
 
-/// The wordmark rows without the trailing dot; 18 cells wide, 21 with it.
+/// Lowercase redvim; 41 cells wide, 44 with the trailing dot.
 const MARK_ROWS: [&str; 4] = [
-    "                 ╷",
-    "╭──╮   ╭──╮   ╭──┤",
-    "│      ├──╯   │  │",
-    "╵      ╰──╴   ╰──╯",
+    "                 ╷            •",
+    "╭──╮   ╭──╮   ╭──┤   ╲    ╱   ╷   ╭──┬──╮",
+    "│      ├──╯   │  │    ╲  ╱    │   │  │  │",
+    "╵      ╰──╴   ╰──╯     ╲╱     ╵   ╵  ╵  ╵",
 ];
-const MARK_WIDTH: usize = 21;
+const MARK_WIDTH: usize = 44;
 
 const HINTS: [(&str, &str, &str); 6] = [
     ("press", "Space ?", "to discover every command"),
@@ -103,6 +103,11 @@ fn mark_lines(width: usize) -> Vec<Line> {
             spans.push(span("  ", Role::Mark));
             spans.push(span("●", Role::Dot));
         }
+        // The renderer centers the widest line of the block. Reserve the
+        // complete layout width even when compact copy is shorter than the
+        // mark, so it does not center our left padding a second time.
+        let used = spans.iter().map(|span| display_width(&span.text)).sum();
+        spans.push(span(" ".repeat(width.saturating_sub(used)), Role::Mark));
         lines.push(Line::new(spans));
     }
     lines
@@ -112,13 +117,17 @@ fn full_block(version: &str) -> Vec<Line> {
     let width = FULL_MIN_WIDTH;
     let mut lines = mark_lines(width);
     lines.push(Line::blank());
-    lines.push(centered(&format!("red v{version}"), Role::Muted, width));
     lines.push(centered(
-        "the editor that respects your muscle memory",
+        &format!("{} v{version}", crate::identity::EXECUTABLE),
         Role::Muted,
         width,
     ));
-    lines.push(centered("github.com/codersauce/red", Role::Muted, width));
+    lines.push(centered(
+        "the editor that respects your time",
+        Role::Muted,
+        width,
+    ));
+    lines.push(centered(crate::identity::REPOSITORY, Role::Muted, width));
     lines.push(Line::blank());
     lines.push(Line::new(vec![span("─".repeat(width), Role::Rule)]));
     for (verb, key, description) in HINTS {
@@ -143,7 +152,11 @@ fn compact_block(version: &str) -> Vec<Line> {
     let width = COMPACT_MIN_WIDTH;
     let mut lines = mark_lines(width);
     lines.push(Line::blank());
-    lines.push(centered(&format!("red v{version}"), Role::Muted, width));
+    lines.push(centered(
+        &format!("{} v{version}", crate::identity::EXECUTABLE),
+        Role::Muted,
+        width,
+    ));
     lines.push(Line::new(vec![
         span("press ", Role::Muted),
         span("Space ?", Role::Key),
@@ -280,7 +293,7 @@ mod tests {
         assert_eq!(lines.len(), FULL_MIN_HEIGHT);
         assert!(lines.iter().all(|line| line.width() <= FULL_MIN_WIDTH));
         let text = block_text(&lines);
-        assert!(text.contains("red v0.1.1"));
+        assert!(text.contains("redvim v0.1.1"));
         assert!(text.contains(":AgentHistory<Enter>"));
         assert!(text.contains("everything your fingers expect"));
     }
@@ -347,6 +360,51 @@ mod tests {
     }
 
     #[test]
+    fn complete_wordmark_is_centered_in_both_layouts() {
+        assert_eq!(display_width(MARK_ROWS.last().unwrap()) + 3, MARK_WIDTH);
+        assert!(MARK_ROWS
+            .iter()
+            .all(|row| display_width(row) <= MARK_WIDTH - 3));
+        assert_eq!(COMPACT_MIN_WIDTH, 26.max(MARK_WIDTH + 5));
+        for width in [FULL_MIN_WIDTH, COMPACT_MIN_WIDTH] {
+            let lines = mark_lines(width);
+            assert_eq!(lines.len(), 4);
+            let left = (width - MARK_WIDTH) / 2;
+            let right = width - MARK_WIDTH - left;
+            assert!(right.abs_diff(left) <= 1);
+            for (index, line) in lines.iter().enumerate() {
+                assert_eq!(line.width(), width);
+                assert!(line
+                    .spans
+                    .iter()
+                    .all(|span| matches!(span.role, Role::Mark | Role::Dot)));
+                let dots: Vec<_> = line
+                    .spans
+                    .iter()
+                    .filter(|span| span.role == Role::Dot)
+                    .collect();
+                assert_eq!(dots.len(), usize::from(index == 3));
+            }
+            let last = lines.last().unwrap();
+            assert_eq!(display_width(&last.spans[0].text), left + MARK_WIDTH - 3);
+            assert_eq!(last.spans[1].text, "  ");
+            assert_eq!(last.spans[2].text, "●");
+            assert_eq!(display_width(&last.spans[3].text), right);
+        }
+    }
+
+    #[test]
+    fn exact_compact_bounds_and_wide_short_viewport_fit() {
+        for (width, height) in [(COMPACT_MIN_WIDTH, COMPACT_MIN_HEIGHT), (120, 7)] {
+            let lines = block(width, height, env!("CARGO_PKG_VERSION")).unwrap();
+            assert_eq!(lines.len(), COMPACT_MIN_HEIGHT);
+            assert_eq!(lines.iter().map(Line::width).max(), Some(COMPACT_MIN_WIDTH));
+            assert!(lines.iter().all(|line| line.width() <= width));
+        }
+        assert!(block(120, COMPACT_MIN_HEIGHT - 1, "0.7.5").is_none());
+    }
+
+    #[test]
     fn palette_falls_back_to_brand_red_without_theme_colors() {
         let palette = palette(&Theme::default());
         assert_eq!(palette.style(Role::Dot).fg, Some(FALLBACK_RED));
@@ -372,6 +430,7 @@ mod tests {
         theme.colors.insert("descriptionForeground".into(), muted);
         let palette = palette(&theme);
         assert_eq!(palette.style(Role::Key).fg, Some(red));
+        assert_eq!(palette.style(Role::Dot).fg, Some(red));
         assert_eq!(palette.style(Role::Muted).fg, Some(muted));
     }
 }

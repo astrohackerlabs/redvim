@@ -250,13 +250,13 @@ impl GrammarTrustStore {
         match trust.grammars.get(&key) {
             Some(approved_digest) => anyhow::ensure!(
                 approved_digest == &digest,
-                "native grammar {} changed since its approval; run `red language trust {}` to approve its current contents",
+                "native grammar {} changed since its approval; run `redvim language trust {}` to approve its current contents",
                 canonical.display(),
                 canonical.display()
             ),
             None if explicitly_trusted => self.record_approval(&canonical, &digest)?,
             None => anyhow::bail!(
-                "native grammar {} is not approved; run `red language trust {}` or set grammar.trusted = true explicitly",
+                "native grammar {} is not approved; run `redvim language trust {}` or set grammar.trusted = true explicitly",
                 canonical.display(),
                 canonical.display()
             ),
@@ -460,13 +460,21 @@ builtin = "rust"
         fs::write(&grammar, b"original grammar").unwrap();
         let trust = GrammarTrustStore::new(directory.path().join("config"));
 
-        assert!(trust.approved_grammar_path(&grammar, false).is_err());
+        let error = trust.approved_grammar_path(&grammar, false).unwrap_err();
+        assert!(error.to_string().contains(&format!(
+            "redvim language trust {}",
+            grammar.canonicalize().unwrap().display()
+        )));
         trust.trust_path(&grammar).unwrap();
         let staged = trust.approved_grammar_path(&grammar, false).unwrap();
         assert_eq!(fs::read(staged).unwrap(), b"original grammar");
 
         fs::write(&grammar, b"replaced grammar").unwrap();
-        assert!(trust.approved_grammar_path(&grammar, false).is_err());
+        let error = trust.approved_grammar_path(&grammar, false).unwrap_err();
+        assert!(error.to_string().contains(&format!(
+            "redvim language trust {}",
+            grammar.canonicalize().unwrap().display()
+        )));
     }
 
     #[test]

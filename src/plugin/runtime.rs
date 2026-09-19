@@ -5938,6 +5938,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_commit_message_strips_current_and_legacy_context_without_git() {
+        // Compile the real pure helpers, without activating the Git plugin or
+        // invoking Git. This exercises Husk string handling as shipped.
+        let plugin = include_str!("../../plugins/git.hk");
+        let helpers = &plugin[plugin.find("fn commit_context_marker()").unwrap()
+            ..plugin.find("fn commit_editor_text(").unwrap()];
+        let source = format!("{helpers}\npub fn activate() {{}}\npub fn probe(text: String) -> String {{ return commit_message(text); }}");
+        let mut runtime = Runtime::new();
+        runtime.load_plugin("branding", &source).await.unwrap();
+        let mut inner = runtime.inner.lock().unwrap();
+        let RuntimeInner { plugins, host, .. } = &mut *inner;
+        let vm = plugins.get_mut("branding").unwrap();
+        for brand in ["RedVim", "Red"] {
+            let text = format!("subject café\n\nbody\n\n# --- {brand} commit context (not part of the commit message) ---\n# secret context\n");
+            let result = vm
+                .call_export("branding", "probe", vec![Value::String(text)], host)
+                .unwrap();
+            assert_eq!(result.to_json(), serde_json::json!("subject café\n\nbody"));
+        }
+        let ordinary = "subject\n\n# user-authored body";
+        let result = vm
+            .call_export(
+                "branding",
+                "probe",
+                vec![Value::String(ordinary.into())],
+                host,
+            )
+            .unwrap();
+        assert_eq!(result.to_json(), serde_json::json!(ordinary));
+    }
+
+    #[tokio::test]
     async fn executes_husk_command_through_host() {
         drain_requests();
 
@@ -10211,7 +10243,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["Retry the saved prompt", "Open Red logs"]
+            ["Retry the saved prompt", "Open RedVim logs"]
         );
 
         runtime
@@ -10410,7 +10442,7 @@ mod tests {
         ));
         let (_, items) = recv_agent_picker("Retry Codex");
         assert_eq!(items[0].label, "Retry Codex startup");
-        assert_eq!(items[1].label, "Open Red logs");
+        assert_eq!(items[1].label, "Open RedVim logs");
     }
 
     #[tokio::test]
@@ -15103,7 +15135,7 @@ mod tests {
                 assert_eq!(submit.as_deref(), Some("GitSubmitMessage"));
                 assert_eq!(cancel.as_deref(), Some("GitCancelMessage"));
                 assert!(text.starts_with("feat(git): describe staged files\n\n#"));
-                assert!(text.contains("# --- Red commit context"));
+                assert!(text.contains("# --- RedVim commit context"));
                 assert!(text.contains("# Changes to be committed:"));
                 assert!(text.contains("staged.txt"));
                 assert!(text.contains("# Staged diff:"));

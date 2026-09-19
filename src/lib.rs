@@ -34,6 +34,7 @@ pub mod editor;
 pub mod formatter;
 pub mod headless;
 pub mod highlighter;
+pub mod identity;
 mod indent;
 pub mod inline_assist;
 pub mod inline_context;

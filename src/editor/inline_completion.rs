@@ -438,7 +438,7 @@ impl Editor {
         self.current_dialog = Some(Box::new(Confirmation::new_actions(
             self,
             "Enable GitHub Copilot?",
-            "Eligible source files may be sent to GitHub for inline suggestions. Red will remember that Copilot is enabled.",
+            "Eligible source files may be sent to GitHub for inline suggestions. RedVim will remember that Copilot is enabled.",
             "Enable and sign in",
             "Cancel",
             Action::CopilotEnableAndSignIn,

@@ -91,7 +91,7 @@ pub(crate) const TRACKS: [Track; 6] = [
     },
     Track {
         id: "custom",
-        title: "Make Red yours",
+        title: "Make RedVim yours",
         category: "Setup + workflow",
         duration: "~7 min",
         description: "Tune the parts you use every day, one decision at a time.",

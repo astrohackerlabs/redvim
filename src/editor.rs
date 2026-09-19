@@ -719,7 +719,7 @@ fn native_grammar_consent_message(
         .collect::<Vec<_>>()
         .join("\n");
     Ok(format!(
-        "Native Tree-sitter grammars execute inside Red.\n\nPackage: {} v{}\nSource: {} @ {}\n\nVerified SHA-256:\n{}\n\nApproval is limited to these exact catalog-verified bytes.",
+        "Native Tree-sitter grammars execute inside RedVim.\n\nPackage: {} v{}\nSource: {} @ {}\n\nVerified SHA-256:\n{}\n\nApproval is limited to these exact catalog-verified bytes.",
         package.name,
         package.version,
         package.repository,
@@ -760,7 +760,7 @@ fn installed_grammar_consent_message(
         .collect::<Vec<_>>()
         .join("\n");
     Ok(format!(
-        "Native Tree-sitter grammars execute inside Red.\n\nPackage: {} v{}\n{}\n\nCurrent SHA-256:\n{}\n\nApproval is limited to these exact installed bytes. If they change before approval, Red will stop.",
+        "Native Tree-sitter grammars execute inside RedVim.\n\nPackage: {} v{}\n{}\n\nCurrent SHA-256:\n{}\n\nApproval is limited to these exact installed bytes. If they change before approval, RedVim will stop.",
         package.name, package.version, source, digests
     ))
 }
@@ -1498,7 +1498,7 @@ fn bounded_agent_failure_message(message: &str) -> String {
         .chars()
         .take(MAX_AGENT_FAILURE_MESSAGE_CHARS)
         .collect::<String>();
-    bounded.push_str("… (full details are in the Red log)");
+    bounded.push_str("… (full details are in the RedVim log)");
     bounded
 }
 
@@ -1552,7 +1552,7 @@ fn bounded_commit_context(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_string();
     }
-    let marker = "\n[truncated by Red]\n";
+    let marker = "\n[truncated by RedVim]\n";
     let mut end = max_bytes.saturating_sub(marker.len()).min(text.len());
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
@@ -5590,7 +5590,7 @@ impl Editor {
         self.layout_cache.borrow_mut().clear();
         self.force_full_redraw = true;
         if completed {
-            self.last_error = Some("Red tour complete — your project was never modified".into());
+            self.last_error = Some("RedVim tour complete — your project was never modified".into());
         }
         self.render(buffer)
     }
@@ -20243,7 +20243,8 @@ impl Editor {
             .as_ref()
             .is_some_and(|tutorial| tutorial.practice_buffer_id == self.current_buffer().id())
         {
-            self.last_error = Some("the Red tutorial practice buffer cannot be saved".to_string());
+            self.last_error =
+                Some("the RedVim tutorial practice buffer cannot be saved".to_string());
             self.render(buffer)?;
             return Ok(false);
         }
@@ -22944,7 +22945,7 @@ impl Editor {
                 if self
                     .current_dialog
                     .as_ref()
-                    .is_some_and(|dialog| dialog.shortcut_context() == "Welcome to Red")
+                    .is_some_and(|dialog| dialog.shortcut_context() == crate::identity::WELCOME)
                 {
                     self.finish_welcome();
                 }
@@ -25650,7 +25651,7 @@ impl Editor {
                             .unwrap_or(false)
                 })
             })
-            .ok_or_else(|| anyhow::anyhow!("document is not open in Red: {path}"))
+            .ok_or_else(|| anyhow::anyhow!("document is not open in RedVim: {path}"))
     }
 
     fn plugin_document_snapshot(
@@ -32916,7 +32917,7 @@ mod test {
 
         assert!(prompt.contains("Facts must come exclusively from staged_changes"));
         assert!(prompt.contains("feat(core): prior style"));
-        assert!(prompt.matches("[truncated by Red]").count() >= 2);
+        assert!(prompt.matches("[truncated by RedVim]").count() >= 2);
         assert!(prompt.len() < 230 * 1024);
     }
 
@@ -36236,7 +36237,7 @@ builtin = "rust"
             .map(|row| render_row(&buffer, row))
             .collect::<Vec<_>>()
             .join("\n");
-        let version_label = format!("red v{}", env!("CARGO_PKG_VERSION"));
+        let version_label = format!("redvim v{}", env!("CARGO_PKG_VERSION"));
         assert_eq!(rendered.matches(version_label.as_str()).count(), 1);
         assert!(render_row(&buffer, buffer.height - 2).contains("NORMAL"));
         assert!(!editor.force_full_redraw);
@@ -38098,7 +38099,7 @@ builtin = "rust"
     fn splash_renders_on_pristine_startup() {
         let mut editor = splash_test_editor(100, 30, Config::default());
         let dump = rendered_dump(&mut editor, 100, 30);
-        assert!(dump.contains("red v"));
+        assert!(dump.contains("redvim v"));
         assert!(dump.contains("╭──╮   ╭──╮   ╭──┤"));
         assert!(dump.contains(":AgentHistory<Enter>"));
         assert!(dump.contains("everything your fingers expect"));
@@ -38107,15 +38108,15 @@ builtin = "rust"
     #[test]
     fn splash_dismisses_on_edit_and_never_returns() {
         let mut editor = splash_test_editor(100, 30, Config::default());
-        assert!(rendered_dump(&mut editor, 100, 30).contains("red v"));
+        assert!(rendered_dump(&mut editor, 100, 30).contains("redvim v"));
 
         editor.buffer_manager[0].insert_str(0, 0, "x");
-        assert!(!rendered_dump(&mut editor, 100, 30).contains("red v"));
+        assert!(!rendered_dump(&mut editor, 100, 30).contains("redvim v"));
         assert!(editor.splash_dismissed);
 
         // Returning to a pristine-looking buffer must not resurrect it.
         editor.buffer_manager[0] = Buffer::new(None, String::new());
-        assert!(!rendered_dump(&mut editor, 100, 30).contains("red v"));
+        assert!(!rendered_dump(&mut editor, 100, 30).contains("redvim v"));
     }
 
     #[test]
@@ -38125,25 +38126,31 @@ builtin = "rust"
             ..Config::default()
         };
         let mut editor = splash_test_editor(100, 30, disabled);
-        assert!(!rendered_dump(&mut editor, 100, 30).contains("red v"));
+        assert!(!rendered_dump(&mut editor, 100, 30).contains("redvim v"));
 
         let with_files = Config {
             startup_file_count: 1,
             ..Config::default()
         };
         let mut editor = splash_test_editor(100, 30, with_files);
-        assert!(!rendered_dump(&mut editor, 100, 30).contains("red v"));
+        assert!(!rendered_dump(&mut editor, 100, 30).contains("redvim v"));
     }
 
     #[test]
     fn splash_degrades_to_compact_then_nothing() {
-        let mut editor = splash_test_editor(50, 30, Config::default());
-        let dump = rendered_dump(&mut editor, 50, 30);
+        // Terminal width includes the gutter; the longer mark needs 49
+        // content columns for the compact card.
+        let mut editor = splash_test_editor(60, 30, Config::default());
+        let dump = rendered_dump(&mut editor, 60, 30);
         assert!(dump.contains("for commands"));
         assert!(!dump.contains(":AgentHistory"));
+        assert!(dump.contains("╲╱     ╵   ╵  ╵  ╵  ●"));
+
+        let mut editor = splash_test_editor(50, 30, Config::default());
+        assert!(!rendered_dump(&mut editor, 50, 30).contains("redvim v"));
 
         let mut editor = splash_test_editor(24, 6, Config::default());
-        assert!(!rendered_dump(&mut editor, 24, 6).contains("red v"));
+        assert!(!rendered_dump(&mut editor, 24, 6).contains("redvim v"));
     }
 
     fn test_config_diagnostic() -> ConfigDiagnostic {

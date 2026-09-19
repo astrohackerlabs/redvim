@@ -25,7 +25,7 @@ impl Editor {
                 .is_some_and(|dialog| dialog.composer_handle().is_some())
         {
             self.set_legacy_message(Some(
-                "finish the current proposal, composer, or workspace before opening Learn Red"
+                "finish the current proposal, composer, or workspace before opening Learn RedVim"
                     .into(),
             ));
             return;

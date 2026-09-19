@@ -1,21 +1,22 @@
 {
-  "version": "0.7.5",
+  "version": "0.7.6",
   "fork": {
     "name": "red",
     "checkout": "forks/red",
     "base": "9e0952767d35d5b8dddd3fa3bb90087938692c52",
-    "branch": "issue-26091914238740-exp9-release",
-    "expected_head": "a3f7fe0ff7d24d8d53606626d5e25c4f9bb4feb9",
-    "expected_tree": "0c3c79fa39b4ec848f69b9228c988696c97e17fa",
+    "branch": "issue-26091918020609-exp3-austin-night",
+    "expected_head": "cec6396e25da9dfab57a32db5513cf27bad35238",
+    "expected_tree": "a253189248f524d8dfced57b0747ea07dd22fe94",
     "patch_directories": [
       "patches/red/patches/issue-26091823140848",
-      "patches/red/patches/issue-26091914238740"
+      "patches/red/patches/issue-26091914238740",
+      "patches/red/patches/issue-26091918020609"
     ],
-    "patch_count": 24,
-    "archive_sha256": "12f676cd7479aaef987b8fed1e1b69e2ef910dcab31fe73cf2733e5e61441aa1",
+    "patch_count": 30,
+    "archive_sha256": "6d1f80cc2511c34168e7f29275fec9cf96ead95527ed282cf58a514a7de55e82",
     "allowed_untracked": []
   },
-  "monorepo_commit": "63535aab36a2440a641ca1f2879118e9a35d4182",
+  "monorepo_commit": "0cb1bbea0c1e3729c7965e32ef2545f9138e8360",
   "grammar_revision": "bb3f533e5792260291945e1f329e1f0a779def6e",
   "query_revision": "4d9466677a5ceadef104eaa0fe08d60d91c4e9a7",
   "deployment_target": "26.0"

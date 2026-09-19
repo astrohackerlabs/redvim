@@ -103,7 +103,7 @@ pub enum NotificationSource {
 impl NotificationSource {
     pub fn label(&self) -> &str {
         match self {
-            Self::Editor => "Red",
+            Self::Editor => crate::identity::NAME,
             Self::Plugin { name, .. } | Self::LanguageServer { name, .. } => name,
         }
     }

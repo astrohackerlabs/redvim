@@ -42,7 +42,7 @@ pub fn run(config_dir: &Path) -> anyhow::Result<Outcome> {
             "  {}",
             paint(GREEN, "✓ Created your starter config.", use_color)
         );
-        println!("  {}", paint(DIM, "Launching red…", use_color));
+        println!("  {}", paint(DIM, "Launching RedVim…", use_color));
         println!();
         Ok(Outcome::Initialized)
     } else {
@@ -52,7 +52,7 @@ pub fn run(config_dir: &Path) -> anyhow::Result<Outcome> {
             "  {}",
             paint(
                 DIM,
-                "Launching red with embedded defaults. Run `red` again to create the template.",
+                "Launching RedVim with embedded defaults. Run `redvim` again to create the template.",
                 use_color,
             )
         );
@@ -107,12 +107,12 @@ fn render_welcome(config_dir: &Path, use_color: bool) -> String {
     out.push('\n');
     out.push_str(&format!(
         "  {bar} {}\n",
-        paint(BOLD, "Welcome to red", use_color)
+        paint(BOLD, crate::identity::WELCOME, use_color)
     ));
     out.push_str(&format!("  {bar}\n"));
     out.push_str(&format!("  {bar} No configuration file was found.\n"));
     out.push_str(&format!(
-        "  {bar} red can launch now and optionally create a starter config:\n"
+        "  {bar} RedVim can launch now and optionally create a starter config:\n"
     ));
     out.push_str(&format!("  {bar}\n"));
     out.push_str(&format!(
@@ -249,7 +249,7 @@ mod tests {
         let dir = Path::new("/home/example/.config/astrohacker/redvim");
         let banner = render_welcome(dir, false);
 
-        assert!(banner.to_lowercase().contains("red"));
+        assert!(banner.contains(crate::identity::WELCOME));
         assert!(banner.contains("config.toml"));
         assert!(banner.contains("[Y/n]"));
     }

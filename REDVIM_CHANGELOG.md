@@ -1,5 +1,11 @@
 # RedVim changelog
 
+## [0.7.6]
+
+### Maintenance
+
+- Publish the pinned RedVim source as version 0.7.6, retaining bundled Nushell support.
+
 ## [0.7.5]
 
 ### Maintenance

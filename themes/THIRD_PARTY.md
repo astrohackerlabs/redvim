@@ -4,6 +4,13 @@ This folder includes VS Code color-theme JSON files imported from
 Marketplace extension packages. Included themes are flattened so Red can
 load them directly without following extension-local `include` paths.
 
+## Astrohacker Adaptations
+
+`austin-night.json` (Austin Night) is Astrohacker's adaptation of Enkia's
+`tokyo-night.json`. The original MIT copyright and permission notice is retained
+in `licenses/enkia-tokyo-night.txt`. Palette provenance and the adaptation's
+role assignments are documented in `AUSTIN_NIGHT.md`.
+
 ## Imported Packages
 
 | Package | License | Source | Notice |

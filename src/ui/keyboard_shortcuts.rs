@@ -405,9 +405,9 @@ impl KeyboardShortcuts {
             buffer,
             2,
             if self.all_selected {
-                " This context   [All Red keys]"
+                " This context   [All RedVim keys]"
             } else {
-                "[This context]   All Red keys"
+                "[This context]   All RedVim keys"
             },
             &palette.accent,
         );

@@ -18,6 +18,7 @@ use include_dir::{include_dir, Dir};
 
 /// Complete configuration defaults embedded in the Red binary.
 pub const DEFAULT_CONFIG: &str = include_str!("../default_config.toml");
+pub const DEFAULT_THEME_FILENAME: &str = "austin-night.json";
 
 static THEMES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/themes");
 static PLUGINS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/plugins");
@@ -369,7 +370,7 @@ pub fn format_runtime_files(config_dir: &Path) -> anyhow::Result<String> {
 
     out.push_str("Resolution order: user config, $REDVIM_RUNTIME, embedded.\n");
     out.push_str(
-        "Use `red --eject plugins/<file>` or `red --eject themes/<file>` to copy an asset into your config directory.\n",
+        "Use `redvim --eject plugins/<file>` or `redvim --eject themes/<file>` to copy an asset into your config directory.\n",
     );
     Ok(out)
 }
@@ -648,7 +649,7 @@ mod tests {
     fn starter_config_is_loadable_as_user_overrides() {
         let config = Config::from_user_toml_with_overrides(&starter_config(), &[]).unwrap();
 
-        assert_eq!(config.theme, "red.json");
+        assert_eq!(config.theme, crate::assets::DEFAULT_THEME_FILENAME);
         assert!(config.plugins.contains_key("theme_browser"));
         assert!(config.keys.normal.contains_key("Ctrl-t"));
     }
@@ -690,6 +691,45 @@ mod tests {
     fn bundled_asset_lookup_rejects_parent_paths() {
         assert!(bundled_theme("../default_config.toml").is_none());
         assert!(bundled_plugin_specifier("../plugins/theme_browser.hk").is_none());
+    }
+
+    #[test]
+    fn austin_night_user_and_runtime_overrides_preserve_effective_colors() {
+        let config = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        fs::create_dir(config.path().join("themes")).unwrap();
+        fs::create_dir(runtime.path().join("themes")).unwrap();
+        let runtime_path = runtime.path().join("themes").join(DEFAULT_THEME_FILENAME);
+        let user_path = config.path().join("themes").join(DEFAULT_THEME_FILENAME);
+        let tokyo = bundled_theme("tokyo-night.json").unwrap();
+        let mocha = bundled_theme("mocha.json").unwrap();
+        fs::write(&runtime_path, tokyo).unwrap();
+        let _guard = RedRuntimeGuard::set(runtime.path());
+        let asset = resolve_theme(DEFAULT_THEME_FILENAME, config.path()).unwrap();
+        assert_eq!(asset.source, RuntimeAssetSource::Runtime);
+        let parsed =
+            crate::theme::parse_vscode_theme_contents(&asset.read_to_string().unwrap()).unwrap();
+        assert_eq!(
+            parsed.style.bg,
+            crate::theme::parse_vscode_theme_contents(tokyo)
+                .unwrap()
+                .style
+                .bg
+        );
+        fs::write(&user_path, mocha).unwrap();
+        let asset = resolve_theme(DEFAULT_THEME_FILENAME, config.path()).unwrap();
+        assert_eq!(asset.source, RuntimeAssetSource::User);
+        let parsed =
+            crate::theme::parse_vscode_theme_contents(&asset.read_to_string().unwrap()).unwrap();
+        assert_eq!(
+            parsed.style.bg,
+            crate::theme::parse_vscode_theme_contents(mocha)
+                .unwrap()
+                .style
+                .bg
+        );
+        assert_eq!(fs::read_to_string(runtime_path).unwrap(), tokyo);
+        assert_eq!(fs::read_to_string(user_path).unwrap(), mocha);
     }
 
     #[test]

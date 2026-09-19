@@ -2026,7 +2026,7 @@ fn try_merge_valid_user_config(base: &toml::Value, user: &toml::Value) -> Option
 
 fn safe_loaded_config(path: &Path, code: &str, message: String) -> anyhow::Result<LoadedConfig> {
     let mut config = deserialize_config(embedded_config_value()?)?;
-    config.theme = "red.json".to_string();
+    config.theme = crate::assets::DEFAULT_THEME_FILENAME.to_string();
     config.log_file = None;
     config.plugins.clear();
     config.disabled_plugins.clear();
@@ -3307,7 +3307,7 @@ unknown_setting = true
         assert!(!loaded.config.formatting.on_save);
         assert!(loaded.config.lsp.servers.is_empty());
         assert!(loaded.config.log_file.is_none());
-        assert_eq!(loaded.config.theme, "red.json");
+        assert_eq!(loaded.config.theme, crate::assets::DEFAULT_THEME_FILENAME);
     }
 
     #[test]

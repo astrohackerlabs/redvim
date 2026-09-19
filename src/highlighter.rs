@@ -2721,7 +2721,8 @@ fn highlight_git_commit_comment(
         return;
     }
 
-    if body == "--- Red commit context (not part of the commit message) ---"
+    if body == "--- RedVim commit context (not part of the commit message) ---"
+        || body == "--- Red commit context (not part of the commit message) ---"
         || body == "Commands:"
         || body == "Staged diff:"
         || body.ends_with("files:")
@@ -4906,6 +4907,23 @@ mod tests {
             Some("python")
         );
         assert_eq!(highlighter.language_id_for_file(Some("LICENSE")), None);
+    }
+
+    #[test]
+    fn git_commit_branding_preserves_legacy_heading_style() {
+        let theme = theme_with_scopes(&["comment", "markup.heading"]);
+        let mut highlighter = Highlighter::new(&theme).unwrap();
+        for brand in ["RedVim", "Red"] {
+            let heading =
+                format!("--- {brand} commit context (not part of the commit message) ---");
+            let code = format!("subject\n\n# {heading}\n# context\n");
+            let styles = highlighter.highlight("gitcommit", &code).unwrap();
+            let start = code.find(&heading).unwrap();
+            assert!(styles
+                .iter()
+                .any(|style| style.start == start && style.end == start + heading.len()));
+            assert!(effective_style_at(&styles, 0).is_none());
+        }
     }
 
     #[test]
