@@ -1,0 +1,461 @@
+// Typed porcelain-v2 status parsing. The compatibility view is created only at
+// the Red boundary; all parsing and classification uses the native model.
+
+struct RepoPath {
+    value: String,
+}
+
+enum ChangeKind {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    TypeChanged,
+    Updated,
+    Unknown,
+}
+
+enum Change {
+    Tracked {
+        path: RepoPath,
+        original_path: Option<RepoPath>,
+        index: Option<ChangeKind>,
+        worktree: Option<ChangeKind>,
+        renamed: bool,
+    },
+    Untracked {
+        path: RepoPath,
+    },
+    Conflicted {
+        path: RepoPath,
+        index: Option<ChangeKind>,
+        worktree: Option<ChangeKind>,
+    },
+}
+
+struct BranchStatus {
+    head: Option<String>,
+    oid: Option<String>,
+    upstream: Option<String>,
+    ahead: i32,
+    behind: i32,
+    stash_count: i32,
+}
+
+struct GitStatus {
+    branch: BranchStatus,
+    changes: [Change],
+    truncated: bool,
+}
+
+pub struct GitEntry {
+    path: String,
+    original_path: Option<String>,
+    x: String,
+    y: String,
+    kind: String,
+}
+
+pub struct GitState {
+    head: String,
+    oid: String,
+    upstream: String,
+    ahead: i32,
+    behind: i32,
+    stash_count: i32,
+    staged: [GitEntry],
+    unstaged: [GitEntry],
+    untracked: [GitEntry],
+    conflicted: [GitEntry],
+    truncated: bool,
+}
+
+pub struct GitCommitFiles {
+    entries: [GitEntry],
+    truncated: bool,
+}
+
+pub struct DisplayEntry {
+    entry: GitEntry,
+    filename: String,
+    parent: String,
+    label: String,
+}
+
+// Prepare the bounded file list in the native core. The compatibility plugin
+// can then attach theme styles without repeating path parsing for every paint.
+pub fn display_entries(entries: [GitEntry]) -> [DisplayEntry] {
+    let mut result = [];
+    for entry in entries {
+        let parts = entry.path.rsplit_once("/").unwrap_or(("", entry.path));
+        let mut label = "~";
+        if entry.kind == "untracked" { label = "?"; }
+        else if entry.kind == "conflicted" { label = "!"; }
+        else if entry.x == "R" || entry.y == "R" { label = "R"; }
+        else if entry.x == "A" || entry.y == "A" { label = "+"; }
+        else if entry.x == "D" || entry.y == "D" { label = "−"; }
+        result.push(DisplayEntry { entry: entry, filename: parts.1, parent: parts.0, label: label });
+    }
+    result
+}
+
+pub fn parse_status(output: String) -> GitState {
+    status_view(parse_porcelain(output, 500))
+}
+
+pub fn parse_commit_files(output: String) -> GitCommitFiles {
+    let records = output.split("\0");
+    let mut entries = [];
+    let mut index = 0;
+    let mut truncated = false;
+
+    while index < records.len() {
+        let status = records[index];
+        if status.is_empty() {
+            index += 1;
+            continue;
+        }
+        if entries.len() >= 500 {
+            truncated = true;
+            break;
+        }
+
+        let code = status.char_at(0);
+        if index + 1 >= records.len() {
+            break;
+        }
+        let mut path = records[index + 1];
+        let mut original_path = None;
+        let mut kind = "changed";
+        index += 2;
+
+        if code == "R" || code == "C" {
+            if index >= records.len() {
+                break;
+            }
+            original_path = Some(path);
+            path = records[index];
+            index += 1;
+            if code == "R" {
+                kind = "renamed";
+            } else {
+                kind = "copied";
+            }
+        }
+
+        entries.push(GitEntry {
+            path: path,
+            original_path: original_path,
+            x: code,
+            y: ".",
+            kind: kind,
+        });
+    }
+
+    GitCommitFiles { entries: entries, truncated: truncated }
+}
+
+fn parse_porcelain(output: String, limit: i32) -> GitStatus {
+    let mut branch = BranchStatus {
+        head: None,
+        oid: None,
+        upstream: None,
+        ahead: 0,
+        behind: 0,
+        stash_count: 0,
+    };
+    let mut changes = [];
+    let mut truncated = false;
+    let records = output.split("\0");
+    let mut index = 0;
+    let mut visible_slots = 0;
+
+    while index < records.len() {
+        let record = records[index];
+        if let Some(oid) = record.strip_prefix("# branch.oid ") {
+            branch.oid = Some(oid);
+        } else if let Some(head) = record.strip_prefix("# branch.head ") {
+            branch.head = Some(head);
+        } else if let Some(upstream) = record.strip_prefix("# branch.upstream ") {
+            branch.upstream = Some(upstream);
+        } else if let Some(counts) = record.strip_prefix("# branch.ab ") {
+            if let Some(fields) = counts.split_once(" ") {
+                branch.ahead = parse_count(fields.0);
+                branch.behind = parse_count(fields.1);
+            }
+        } else if let Some(count) = record.strip_prefix("# stash ") {
+            branch.stash_count = parse_count(count);
+        } else if let Some(path) = record.strip_prefix("? ") {
+            if visible_slots >= limit {
+                truncated = true;
+                break;
+            }
+            changes.push(Change::Untracked {
+                path: RepoPath { value: path },
+            });
+            visible_slots += 1;
+        } else if record.starts_with("u ") {
+            if visible_slots >= limit {
+                truncated = true;
+                break;
+            }
+            let fields = record.split(" ");
+            if fields.len() >= 11 {
+                let xy = fields[1];
+                changes.push(Change::Conflicted {
+                    path: RepoPath { value: join_fields(fields, 10) },
+                    index: parse_change(xy.char_at(0)),
+                    worktree: parse_change(xy.char_at(1)),
+                });
+                visible_slots += 1;
+            }
+        } else if record.starts_with("1 ") || record.starts_with("2 ") {
+            let fields = record.split(" ");
+            let renamed = record.starts_with("2 ");
+            let mut path_index = 8;
+            if renamed {
+                path_index = 9;
+            }
+            if fields.len() > path_index {
+                let xy = fields[1];
+                let mut original_path = None;
+                if renamed && index + 1 < records.len() {
+                    original_path = Some(RepoPath { value: records[index + 1] });
+                    index += 1;
+                }
+                let index_change = parse_change(xy.char_at(0));
+                let mut worktree_change = parse_change(xy.char_at(1));
+                let mut slots = 0;
+                if index_change.is_some() {
+                    slots += 1;
+                }
+                if worktree_change.is_some() {
+                    slots += 1;
+                }
+                if visible_slots + slots > limit {
+                    truncated = true;
+                    if index_change.is_some() {
+                        worktree_change = None;
+                        slots = 1;
+                    } else {
+                        break;
+                    }
+                }
+                changes.push(Change::Tracked {
+                    path: RepoPath { value: join_fields(fields, path_index) },
+                    original_path: original_path,
+                    index: index_change,
+                    worktree: worktree_change,
+                    renamed: renamed,
+                });
+                visible_slots += slots;
+                if truncated {
+                    break;
+                }
+            }
+        }
+        index += 1;
+    }
+    GitStatus {
+        branch: branch,
+        changes: changes,
+        truncated: truncated,
+    }
+}
+
+fn status_view(status: GitStatus) -> GitState {
+    let mut staged = [];
+    let mut unstaged = [];
+    let mut untracked = [];
+    let mut conflicted = [];
+
+    for change in status.changes {
+        match change {
+            Change::Tracked { path, original_path, index, worktree, renamed } => {
+                let mut original = None;
+                if let Some(value) = original_path {
+                    original = Some(value.value);
+                }
+                let mut kind = "changed";
+                if renamed {
+                    kind = "renamed";
+                }
+                let x = change_code(index);
+                let y = change_code(worktree);
+                let entry = GitEntry {
+                    path: path.value,
+                    original_path: original,
+                    x: x,
+                    y: y,
+                    kind: kind,
+                };
+                if x != "." {
+                    staged.push(entry);
+                }
+                if y != "." {
+                    unstaged.push(entry);
+                }
+            },
+            Change::Untracked { path } => untracked.push(GitEntry {
+                path: path.value,
+                original_path: None,
+                x: "?",
+                y: "?",
+                kind: "untracked",
+            }),
+            Change::Conflicted { path, index, worktree } => conflicted.push(GitEntry {
+                path: path.value,
+                original_path: None,
+                x: change_code(index),
+                y: change_code(worktree),
+                kind: "conflicted",
+            }),
+        }
+    }
+
+    GitState {
+        head: status.branch.head.unwrap_or(""),
+        oid: status.branch.oid.unwrap_or(""),
+        upstream: status.branch.upstream.unwrap_or(""),
+        ahead: status.branch.ahead,
+        behind: status.branch.behind,
+        stash_count: status.branch.stash_count,
+        staged: staged,
+        unstaged: unstaged,
+        untracked: untracked,
+        conflicted: conflicted,
+        truncated: status.truncated,
+    }
+}
+
+fn parse_change(value: String) -> Option<ChangeKind> {
+    if value == "." {
+        return None;
+    }
+    if value == "A" {
+        return Some(ChangeKind::Added);
+    }
+    if value == "M" {
+        return Some(ChangeKind::Modified);
+    }
+    if value == "D" {
+        return Some(ChangeKind::Deleted);
+    }
+    if value == "R" {
+        return Some(ChangeKind::Renamed);
+    }
+    if value == "C" {
+        return Some(ChangeKind::Copied);
+    }
+    if value == "T" {
+        return Some(ChangeKind::TypeChanged);
+    }
+    if value == "U" {
+        return Some(ChangeKind::Updated);
+    }
+    Some(ChangeKind::Unknown)
+}
+
+fn change_code(value: Option<ChangeKind>) -> String {
+    let Some(kind) = value else {
+        return ".";
+    };
+    match kind {
+        ChangeKind::Added => "A",
+        ChangeKind::Modified => "M",
+        ChangeKind::Deleted => "D",
+        ChangeKind::Renamed => "R",
+        ChangeKind::Copied => "C",
+        ChangeKind::TypeChanged => "T",
+        ChangeKind::Updated => "U",
+        ChangeKind::Unknown => "?",
+    }
+}
+
+fn parse_count(value: String) -> i32 {
+    let mut count = 0;
+    for character in value {
+        if let Some(digit) = character.to_digit(10) {
+            count = count.saturating_mul(10).saturating_add(digit);
+        }
+    }
+    count
+}
+
+fn join_fields(fields: [String], start: i32) -> String {
+    fields.slice(start, fields.len()).join(" ")
+}
+
+#[test]
+fn parses_branch_changed_renamed_untracked_and_conflicted_records() {
+    let output = "# branch.oid abcdef\0# branch.head feature/native\0# branch.upstream origin/main\0# branch.ab +2 -3\0# stash 4\01 M. N... 100644 100644 100644 abc def src/changed file.rs\02 RM N... 100644 100644 100644 abc def R100 src/new name.rs\0src/old name.rs\0? notes/todo.txt\0u UU N... 100644 100644 100644 100644 abc def ghi src/conflict.rs\0";
+    assert_msg(change_code(parse_change("M")) == "M", "modified code did not round trip");
+    let parsed = parse_porcelain(output, 500);
+    assert_msg(parsed.changes.len() == 4, format("changes={}", parsed.changes.len()));
+    let state = status_view(parsed);
+
+    assert(state.head == "feature/native");
+    assert(state.upstream == "origin/main");
+    assert(state.ahead == 2);
+    assert(state.behind == 3);
+    assert(state.stash_count == 4);
+    assert_msg(state.staged.len() == 2, format("staged={}", state.staged.len()));
+    assert(state.unstaged.len() == 1);
+    assert(state.staged[1].kind == "renamed");
+    assert(state.staged[1].path == "src/new name.rs");
+    assert(state.staged[0].original_path == None);
+    assert(state.staged[1].original_path == Some("src/old name.rs"));
+    assert(state.untracked[0].path == "notes/todo.txt");
+    assert(state.untracked[0].original_path == None);
+    assert(state.conflicted[0].path == "src/conflict.rs");
+}
+
+#[test]
+fn parses_nul_delimited_commit_changes_and_rename_paths() {
+    let files = parse_commit_files("M\0src/changed file.rs\0A\0notes/new\tfile.txt\0R100\0src/old name.rs\0src/new name.rs\0D\0removed.rs\0");
+
+    assert(!files.truncated);
+    assert(files.entries.len() == 4);
+    assert(files.entries[0].path == "src/changed file.rs");
+    assert(files.entries[0].x == "M");
+    assert(files.entries[1].path == "notes/new\tfile.txt");
+    assert(files.entries[2].kind == "renamed");
+    assert(files.entries[2].original_path == Some("src/old name.rs"));
+    assert(files.entries[2].path == "src/new name.rs");
+    assert(files.entries[3].x == "D");
+}
+
+#[test]
+fn bounds_status_by_visible_slots_not_distinct_paths() {
+    let output = "1 MM N... 100644 100644 100644 abc def one.rs\01 MM N... 100644 100644 100644 abc def two.rs\0? three.rs\0";
+    let status = parse_porcelain(output, 4);
+    let view = status_view(status);
+
+    assert(view.truncated);
+    assert_msg(view.staged.len() == 2, format("bounded staged={}", view.staged.len()));
+    assert(view.unstaged.len() == 2);
+    assert(view.untracked.is_empty());
+}
+
+#[test]
+fn keeps_the_last_available_index_slot_when_a_tracked_path_spans_both_sections() {
+    let output = "? one.rs\01 MM N... 100644 100644 100644 abc def two.rs\0";
+    let view = status_view(parse_porcelain(output, 2));
+
+    assert(view.truncated);
+    assert(view.untracked.len() == 1);
+    assert(view.staged.len() == 1);
+    assert(view.unstaged.is_empty());
+}
+
+#[test]
+fn saturates_pathological_branch_counts_and_preserves_path_spaces() {
+    let output = "# branch.ab +999999999999999999999 -999999999999999999999\0# stash 999999999999999999999\0? src/two  spaces.rs\0";
+    let view = parse_status(output);
+
+    assert(view.ahead == 2147483647);
+    assert(view.behind == 2147483647);
+    assert(view.stash_count == 2147483647);
+    assert(view.untracked[0].path == "src/two  spaces.rs");
+}

@@ -1,0 +1,710 @@
+//! In-memory terminal-cell grid used to compose and diff complete editor frames.
+//!
+//! [`RenderBuffer`] stores grapheme text, width, continuation cells, and style for every
+//! terminal position. Rendering code draws into the grid without writing escape
+//! sequences; the final flush compares frames and emits only changed cells or rows.
+//! Wide graphemes reserve continuation cells, so callers must use the buffer APIs rather
+//! than indexing a string by terminal column.
+
+use crate::{
+    color::{blend_color, Color},
+    log,
+    theme::{SelectionForegroundPriority, Style, Theme},
+    unicode_utils::{display_width, is_printable_ascii},
+};
+use unicode_segmentation::UnicodeSegmentation;
+
+use super::Point;
+
+#[derive(Debug)]
+pub struct Change<'a> {
+    pub x: usize,
+    pub y: usize,
+    pub cell: &'a Cell,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cell {
+    pub c: char,
+    pub text: String,
+    pub style: Style,
+}
+
+impl Cell {
+    fn new(c: char, style: Style) -> Self {
+        Self {
+            c,
+            text: c.to_string(),
+            style,
+        }
+    }
+
+    fn from_grapheme(grapheme: &str, style: Style) -> Self {
+        Self {
+            c: grapheme.chars().next().unwrap_or(' '),
+            text: grapheme.to_string(),
+            style,
+        }
+    }
+
+    /// In-place assignment that reuses the cell's `text` allocation. These
+    /// run thousands of times per frame, so avoiding a fresh `String` per
+    /// cell matters.
+    fn set_grapheme(&mut self, grapheme: &str, style: &Style) {
+        self.c = grapheme.chars().next().unwrap_or(' ');
+        self.text.clear();
+        self.text.push_str(grapheme);
+        self.style = style.clone();
+    }
+
+    fn set_char_in_place(&mut self, c: char, style: &Style) {
+        self.c = c;
+        self.text.clear();
+        self.text.push(c);
+        self.style = style.clone();
+    }
+
+    /// Compares cells exactly while avoiding a general string comparison for ASCII.
+    fn matches_rendered(&self, other: &Self) -> bool {
+        if self.c != other.c || self.style != other.style {
+            return false;
+        }
+
+        match (self.text.as_bytes(), other.text.as_bytes()) {
+            ([left], [right]) => left == right,
+            (left, right) => left == right,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RenderBuffer {
+    pub cells: Vec<Cell>,
+    pub(crate) shortcut_help_regions: Vec<crate::ui::ShortcutHelpRegion>,
+    pub width: usize,
+    #[allow(unused)]
+    pub height: usize,
+}
+
+impl RenderBuffer {
+    pub fn new(width: usize, height: usize, default_style: &Style) -> Self {
+        let cells = vec![Cell::new(' ', default_style.clone()); width * height];
+
+        RenderBuffer {
+            shortcut_help_regions: Vec::new(),
+            cells,
+            width,
+            height,
+        }
+    }
+
+    pub fn new_with_contents(
+        width: usize,
+        height: usize,
+        style: Style,
+        contents: Vec<String>,
+    ) -> Self {
+        let mut cells = vec![];
+
+        for line in contents {
+            for grapheme in line.graphemes(true) {
+                let grapheme_width = display_width(grapheme);
+                if grapheme_width == 0 {
+                    continue;
+                }
+                cells.push(Cell::from_grapheme(grapheme, style.clone()));
+                for _ in 1..grapheme_width {
+                    cells.push(Cell::new(' ', style.clone()));
+                }
+            }
+            for _ in 0..width.saturating_sub(display_width(&line)) {
+                cells.push(Cell::new(' ', style.clone()));
+            }
+        }
+
+        RenderBuffer {
+            shortcut_help_regions: Vec::new(),
+            cells,
+            width,
+            height,
+        }
+    }
+
+    /// Clears the buffer with the given style
+    pub fn clear(&mut self) {
+        self.reset(self.width, self.height, &Style::default());
+    }
+
+    /// Resizes and clears the grid while retaining reusable cell allocations.
+    pub(crate) fn reset(&mut self, width: usize, height: usize, style: &Style) {
+        self.shortcut_help_regions.clear();
+        self.cells
+            .resize_with(width * height, || Cell::new(' ', style.clone()));
+        self.width = width;
+        self.height = height;
+        for cell in &mut self.cells {
+            cell.set_char_in_place(' ', style);
+        }
+    }
+
+    pub fn write_string(
+        &mut self,
+        x: usize,
+        y: usize,
+        text: &str,
+        color: Option<Color>,
+    ) -> anyhow::Result<()> {
+        let style = Style {
+            fg: color,
+            bg: None,
+            bold: false,
+            italic: false,
+            underline: false,
+        };
+        self.set_text(x, y, text, &style);
+        Ok(())
+    }
+
+    pub fn _set_char(&mut self, x: usize, y: usize, c: char, style: &Style) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let pos = (y * self.width) + x;
+        if pos >= self.cells.len() {
+            return;
+        }
+        self.cells[pos] = Cell::new(c, style.clone());
+    }
+
+    pub fn set_bg_for_points(&mut self, points: Vec<Point>, bg: &Color, theme: &Theme) {
+        for point in points {
+            self.set_bg(point.x, point.y, bg, theme);
+        }
+    }
+
+    pub(crate) fn apply_selection_for_points(
+        &mut self,
+        points: Vec<Point>,
+        selection: &Style,
+        theme: &Theme,
+        foreground_priority: SelectionForegroundPriority,
+    ) {
+        for point in points {
+            if point.x >= self.width || point.y >= self.height {
+                continue;
+            }
+            let position = point.y * self.width + point.x;
+            let Some(cell) = self.cells.get_mut(position) else {
+                continue;
+            };
+            cell.style = theme.selected_style(&cell.style, selection, foreground_priority);
+        }
+    }
+
+    pub fn set_bg_for_range(&mut self, start: Point, end: Point, bg: &Color, theme: &Theme) {
+        for y in start.y..=end.y {
+            for x in start.x..=end.x {
+                self.set_bg(x, y, bg, theme);
+            }
+        }
+    }
+
+    pub fn set_bg(&mut self, x: usize, y: usize, bg: &Color, theme: &Theme) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let pos = (y * self.width) + x;
+        if pos >= self.cells.len() {
+            return;
+        }
+
+        // Blend RGBA colors with the background if necessary
+        let bg = match bg {
+            Color::Rgba { r, g, b, a } => blend_color(
+                Color::Rgba {
+                    r: *r,
+                    g: *g,
+                    b: *b,
+                    a: *a,
+                },
+                theme.style.bg.unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
+            ),
+            _ => *bg,
+        };
+
+        self.cells[pos].style.bg = Some(bg);
+    }
+
+    pub fn set_char(&mut self, x: usize, y: usize, c: char, style: &Style, theme: &Theme) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let pos = (y * self.width) + x;
+        if pos >= self.cells.len() {
+            return;
+        }
+
+        // Blend RGBA colors with the background if necessary
+        let bg = style.bg.map(|color| match color {
+            Color::Rgba { r, g, b, a } => blend_color(
+                Color::Rgba { r, g, b, a },
+                theme.style.bg.unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
+            ),
+            _ => color,
+        });
+
+        self.cells[pos].set_char_in_place(
+            c,
+            &Style {
+                fg: style.fg,
+                bg,
+                bold: style.bold,
+                italic: style.italic,
+                underline: style.underline,
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_rect(
+        &mut self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        c: char,
+        style: &Style,
+        theme: &Theme,
+    ) {
+        let end_x = x.saturating_add(width).min(self.width);
+        let end_y = y.saturating_add(height).min(self.height);
+        if x >= end_x || y >= end_y {
+            return;
+        }
+
+        let bg = style.bg.map(|color| match color {
+            Color::Rgba { r, g, b, a } => blend_color(
+                Color::Rgba { r, g, b, a },
+                theme.style.bg.unwrap_or(Color::Rgb { r: 0, g: 0, b: 0 }),
+            ),
+            _ => color,
+        });
+        let style = Style {
+            fg: style.fg,
+            bg,
+            bold: style.bold,
+            italic: style.italic,
+            underline: style.underline,
+        };
+
+        for row in y..end_y {
+            let start = row * self.width + x;
+            let end = row * self.width + end_x;
+            let Some(cells) = self.cells.get_mut(start..end) else {
+                continue;
+            };
+            for cell in cells {
+                cell.set_char_in_place(c, &style);
+            }
+        }
+    }
+
+    pub fn set_text(&mut self, x: usize, y: usize, text: &str, style: &Style) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+
+        if is_printable_ascii(text) {
+            self.set_printable_ascii(x, y, text, style);
+            return;
+        }
+
+        let mut cell_x = x;
+        for grapheme in text.graphemes(true) {
+            if cell_x >= self.width {
+                break;
+            }
+
+            let grapheme_width = display_width(grapheme);
+            if grapheme_width == 0 {
+                continue;
+            }
+            if grapheme_width > self.width.saturating_sub(cell_x) {
+                break;
+            }
+
+            let pos = (y * self.width) + cell_x;
+            if pos >= self.cells.len() {
+                log!("WARN: pos >= self.cells.len()");
+                break;
+            }
+            self.cells[pos].set_grapheme(grapheme, style);
+
+            for offset in 1..grapheme_width {
+                let pad_x = cell_x + offset;
+                if pad_x >= self.width {
+                    break;
+                }
+                let pad_pos = (y * self.width) + pad_x;
+                if pad_pos >= self.cells.len() {
+                    log!("WARN: pad_pos >= self.cells.len()");
+                    break;
+                }
+                self.cells[pad_pos].set_char_in_place(' ', style);
+            }
+
+            cell_x += grapheme_width;
+        }
+    }
+
+    /// Writes a span already verified as printable ASCII without rescanning it.
+    pub(crate) fn set_printable_ascii(&mut self, x: usize, y: usize, text: &str, style: &Style) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let length = text.len().min(self.width - x);
+        let start = y * self.width + x;
+        let Some(cells) = self.cells.get_mut(start..start + length) else {
+            log!("WARN: pos >= self.cells.len()");
+            return;
+        };
+        for (cell, byte) in cells.iter_mut().zip(text.bytes()) {
+            cell.set_char_in_place(char::from(byte), style);
+        }
+    }
+
+    /// Clears a single row segment whose background is already resolved.
+    pub(crate) fn fill_ascii_spaces(&mut self, x: usize, y: usize, width: usize, style: &Style) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let length = width.min(self.width - x);
+        let start = y * self.width + x;
+        let Some(cells) = self.cells.get_mut(start..start + length) else {
+            return;
+        };
+        for cell in cells {
+            cell.set_char_in_place(' ', style);
+        }
+    }
+
+    pub fn dump_diff(&self, changes: &[Change]) -> String {
+        let mut s = String::new();
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if let Some(change) = changes.iter().find(|c| c.x == x && c.y == y) {
+                    s.push_str(&change.cell.text);
+                } else {
+                    s.push('·');
+                }
+            }
+            s.push('\n');
+        }
+
+        s
+    }
+
+    pub fn diff(&self, other: &RenderBuffer) -> Vec<Change<'_>> {
+        if self.width != other.width || self.height != other.height {
+            let mut changes = vec![];
+            for (pos, cell) in self.cells.iter().enumerate() {
+                if other.cells.get(pos) != Some(cell) {
+                    let y = pos / self.width;
+                    let x = pos % self.width;
+                    changes.push(Change { x, y, cell });
+                }
+            }
+            return changes;
+        }
+
+        let mut changes = vec![];
+        for y in 0..self.height {
+            let start = y * self.width;
+            let end = start + self.width;
+            if !self.cells[start..end]
+                .iter()
+                .zip(&other.cells[start..end])
+                .all(|(cell, previous)| cell.matches_rendered(previous))
+            {
+                for x in 0..self.width {
+                    let cell = &self.cells[start + x];
+                    if !cell.matches_rendered(&other.cells[start + x]) {
+                        changes.push(Change { x, y, cell });
+                    }
+                }
+            }
+        }
+
+        changes
+    }
+
+    pub fn snapshot_rows(&self, rows: &[usize]) -> Vec<(usize, Vec<Cell>)> {
+        let mut snapshots = Vec::with_capacity(rows.len());
+        let mut seen = Vec::with_capacity(rows.len());
+
+        for &row in rows {
+            if row >= self.height || seen.contains(&row) {
+                continue;
+            }
+            seen.push(row);
+
+            let start = row * self.width;
+            let end = start + self.width;
+            snapshots.push((row, self.cells[start..end].to_vec()));
+        }
+
+        snapshots
+    }
+
+    pub fn diff_row_snapshots(&self, snapshots: &[(usize, Vec<Cell>)]) -> Vec<Change<'_>> {
+        let mut changes = Vec::new();
+
+        for (row, old_cells) in snapshots {
+            if *row >= self.height {
+                continue;
+            }
+            let start = row * self.width;
+            for (x, old_cell) in old_cells.iter().enumerate().take(self.width) {
+                let pos = start + x;
+                if pos >= self.cells.len() {
+                    break;
+                }
+                let cell = &self.cells[pos];
+                if cell != old_cell {
+                    changes.push(Change { x, y: *row, cell });
+                }
+            }
+        }
+
+        changes
+    }
+
+    pub fn dump(&self, show_style_changes: bool) -> String {
+        let mut s = String::new();
+        let mut current_syle = None;
+        for (i, cell) in self.cells.iter().enumerate() {
+            if i % self.width == 0 {
+                s.push('\n');
+            }
+            if cell.text == " " {
+                // pushes a unicode dot if space
+                s.push('·');
+            } else if show_style_changes {
+                if let Some(ref style) = current_syle {
+                    if *style != cell.style {
+                        s.push('|');
+                        current_syle = Some(cell.style.clone());
+                    } else {
+                        s.push_str(&cell.text);
+                    }
+                } else {
+                    s.push_str(&cell.text);
+                    current_syle = Some(cell.style.clone());
+                }
+            } else {
+                s.push_str(&cell.text);
+            }
+        }
+
+        s
+    }
+
+    /// Applies a frame diff while retaining the allocations owned by this
+    /// buffer. Only changed cells are cloned into the previous-frame buffer.
+    pub(crate) fn apply_changes(&mut self, changes: &[Change<'_>]) {
+        for change in changes {
+            let pos = (change.y * self.width) + change.x;
+            let cell = &mut self.cells[pos];
+            cell.c = change.cell.c;
+            cell.text.clone_from(&change.cell.text);
+            cell.style = change.cell.style.clone();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resetting_a_frame_reuses_cell_storage_and_clears_wide_text() {
+        let mut buffer = RenderBuffer::new(8, 2, &Style::default());
+        buffer.set_text(0, 0, "👩‍💻界", &Style::default());
+        buffer.cells[0].text.reserve(32);
+        let storage = buffer.cells.as_ptr();
+        let text_capacity = buffer.cells[0].text.capacity();
+        let style = Style {
+            bold: true,
+            ..Style::default()
+        };
+        buffer.reset(4, 3, &style);
+        assert_eq!(buffer.cells.as_ptr(), storage);
+        assert_eq!(buffer.cells[0].text.capacity(), text_capacity);
+        assert_eq!(
+            (buffer.width, buffer.height, buffer.cells.len()),
+            (4, 3, 12)
+        );
+        assert!(buffer
+            .cells
+            .iter()
+            .all(|cell| cell.text == " " && cell.style == style));
+        buffer.reset(0, 0, &Style::default());
+        assert!(buffer.cells.is_empty());
+        buffer.reset(2, 2, &Style::default());
+        assert_eq!(buffer.cells.len(), 4);
+    }
+
+    #[test]
+    fn applying_changes_reuses_cell_text_capacity() {
+        let style = Style::default();
+        let mut previous = RenderBuffer::new(1, 1, &style);
+        previous.cells[0].text.reserve(32);
+        let capacity = previous.cells[0].text.capacity();
+
+        let mut next = RenderBuffer::new(1, 1, &style);
+        next.set_text(0, 0, "x", &style);
+        let changes = next.diff(&previous);
+        previous.apply_changes(&changes);
+
+        assert_eq!(previous.cells[0], next.cells[0]);
+        assert_eq!(previous.cells[0].text.capacity(), capacity);
+    }
+
+    #[test]
+    fn diff_reports_only_cells_from_changed_rows() {
+        let style = Style::default();
+        let previous = RenderBuffer::new(4, 3, &style);
+        let mut next = RenderBuffer::new(4, 3, &style);
+        next.set_text(2, 1, "x", &style);
+
+        let changes = next.diff(&previous);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!((changes[0].x, changes[0].y), (2, 1));
+        assert_eq!(changes[0].cell.text, "x");
+    }
+
+    #[test]
+    fn diff_detects_combining_graphemes_styles_and_single_byte_text_changes() {
+        let style = Style::default();
+        let mut previous = RenderBuffer::new(3, 1, &style);
+        previous.set_text(0, 0, "e\u{301}", &style);
+        let mut next = previous.clone();
+        next.cells[0].text = "e\u{300}".to_string();
+        next.cells[1].style.bold = true;
+        next.cells[2].text = "x".to_string();
+
+        let changes = next.diff(&previous);
+
+        assert_eq!(changes.len(), 3);
+        assert_eq!(changes[0].cell.text, "e\u{300}");
+        assert!(changes[1].cell.style.bold);
+        assert_eq!(changes[2].cell.text, "x");
+    }
+
+    #[test]
+    fn diff_reports_new_cells_when_dimensions_grow() {
+        let style = Style::default();
+        let previous = RenderBuffer::new(1, 1, &style);
+        let next = RenderBuffer::new(2, 1, &style);
+
+        let changes = next.diff(&previous);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!((changes[0].x, changes[0].y), (1, 0));
+    }
+
+    #[test]
+    fn printable_ascii_writes_clip_at_the_edge_and_reuse_cell_storage() {
+        let mut buffer = RenderBuffer::new(5, 1, &Style::default());
+        buffer.cells[3].text.reserve(32);
+        let capacity = buffer.cells[3].text.capacity();
+        let style = Style {
+            bold: true,
+            ..Style::default()
+        };
+
+        buffer.set_text(2, 0, "hello", &style);
+
+        assert_eq!(
+            buffer.cells.iter().map(|cell| cell.c).collect::<String>(),
+            "  hel"
+        );
+        assert_eq!(buffer.cells[3].text.capacity(), capacity);
+        assert!(buffer.cells[2..].iter().all(|cell| cell.style == style));
+    }
+
+    #[test]
+    fn ascii_space_fills_clip_at_the_edge_and_preserve_other_cells() {
+        let mut buffer = RenderBuffer::new(5, 1, &Style::default());
+        buffer.set_text(0, 0, "hello", &Style::default());
+        buffer.cells[3].text.reserve(32);
+        let capacity = buffer.cells[3].text.capacity();
+        let style = Style {
+            italic: true,
+            ..Style::default()
+        };
+
+        buffer.fill_ascii_spaces(3, 0, usize::MAX, &style);
+        buffer.fill_ascii_spaces(8, 0, 2, &style);
+        buffer.fill_ascii_spaces(0, 2, 2, &style);
+
+        assert_eq!(
+            buffer.cells.iter().map(|cell| cell.c).collect::<String>(),
+            "hel  "
+        );
+        assert_eq!(buffer.cells[3].text.capacity(), capacity);
+        assert!(buffer.cells[3..].iter().all(|cell| cell.style == style));
+        assert!(buffer.cells[..3]
+            .iter()
+            .all(|cell| cell.style == Style::default()));
+    }
+
+    #[test]
+    fn fill_rect_clips_blends_rgba_once_and_reuses_cell_text_capacity() {
+        let mut theme = Theme::default();
+        theme.style.bg = Some(Color::Rgb {
+            r: 20,
+            g: 30,
+            b: 40,
+        });
+        let background = Color::Rgba {
+            r: 220,
+            g: 120,
+            b: 20,
+            a: 128,
+        };
+        let style = Style {
+            fg: Some(Color::Rgb { r: 1, g: 2, b: 3 }),
+            bg: Some(background),
+            bold: true,
+            italic: true,
+            underline: false,
+        };
+        let mut buffer = RenderBuffer::new(4, 3, &Style::default());
+        buffer.cells[6].text.reserve(32);
+        let capacity = buffer.cells[6].text.capacity();
+
+        buffer.fill_rect(2, 1, usize::MAX, usize::MAX, 'x', &style, &theme);
+        buffer.fill_rect(20, 20, 2, 2, 'z', &style, &theme);
+
+        let blended = blend_color(background, theme.style.bg.unwrap());
+        for (index, cell) in buffer.cells.iter().enumerate() {
+            let x = index % buffer.width;
+            let y = index / buffer.width;
+            if x >= 2 && y >= 1 {
+                assert_eq!(cell.c, 'x');
+                assert_eq!(cell.text, "x");
+                assert_eq!(cell.style.fg, style.fg);
+                assert_eq!(cell.style.bg, Some(blended));
+                assert!(cell.style.bold);
+                assert!(cell.style.italic);
+            } else {
+                assert_eq!(cell.c, ' ');
+                assert_eq!(cell.style, Style::default());
+            }
+        }
+        assert_eq!(buffer.cells[6].text.capacity(), capacity);
+    }
+}

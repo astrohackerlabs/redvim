@@ -1,0 +1,440 @@
+// Viewport-scoped indentation and active-scope decorations.
+//
+// The plugin consumes the editor's width-aware viewport snapshot, measures indentation
+// in display columns, and replaces one namespace per refresh. It does not infer cursor
+// coordinates from UTF-8 bytes, and deactivate clears every guide atomically.
+
+struct ViewportIndentation {
+    shift_width: i32,
+    tab_width: i32,
+}
+
+struct ViewportCursor {
+    x: i32,
+    y: i32,
+}
+
+struct ViewportRow {
+    line: i32,
+    text: String,
+    indent_width: i32,
+    first_segment: bool,
+}
+
+struct IndentViewportLayout {
+    buffer_index: i32,
+    revision: i32,
+    vtop: i32,
+    width: i32,
+    height: i32,
+    cursor: ViewportCursor,
+    indentation: ViewportIndentation,
+    indentation_key: String,
+    rows: [ViewportRow],
+}
+
+struct SourceRow {
+    line: i32,
+    text: String,
+    indent_width: i32,
+}
+
+struct MeasuredRow {
+    line: i32,
+    width: i32,
+}
+
+struct IndentScope {
+    active: bool,
+    column: i32,
+    start: i32,
+    end: i32,
+}
+
+struct IndentDecoration {
+    buffer_index: i32,
+    anchor: String,
+    line: i32,
+    column: i32,
+    text: String,
+    style: Style,
+    priority: i32,
+    repeat_linebreak: bool,
+    only_whitespace: bool,
+}
+
+struct ThemeBaseStyle {
+    fg: Json,
+    bg: Json,
+}
+
+struct IndentTheme {
+    // Theme colors are an open-ended map whose values may be null or any supported color form.
+    colors: Json,
+    gutter_style: ThemeBaseStyle,
+    style: ThemeBaseStyle,
+}
+
+struct IndentEditorInfo {
+    theme: IndentTheme,
+}
+
+struct IndentGuidesState {
+    layout_key: String,
+}
+
+#[red::state]
+fn initial_state() -> IndentGuidesState {
+    return IndentGuidesState { layout_key: "" };
+}
+
+fn state() -> IndentGuidesState {
+    return red::state();
+}
+
+#[red::lifecycle("activate")]
+fn initialize_guides() {
+    refresh(EmptyEvent {});
+}
+
+#[red::on("editor:ready")]
+#[red::on("editor:state_restored")]
+#[red::on("buffer:changed")]
+#[red::on("cursor:moved")]
+#[red::on("viewport:changed")]
+#[red::on("mode:changed")]
+fn refresh(event: EmptyEvent) {
+    let layout: IndentViewportLayout = red::viewport_layout();
+    let indentation_key = red::string(layout.indentation_key, "");
+    if indentation_key == "" {
+        indentation_key = red::int(layout.revision, -1) + "";
+    }
+    let key = red::int(layout.buffer_index, -1)
+        + ":" + indentation_key
+        + ":" + red::int(layout.vtop, -1)
+        + ":" + red::int(layout.cursor.y, -1)
+        + ":" + red::int(layout.width, -1)
+        + ":" + red::int(layout.height, -1)
+        + ":" + red::int(layout.indentation.shift_width, -1)
+        + ":" + red::int(layout.indentation.tab_width, -1);
+    if key == state().layout_key {
+        return;
+    }
+    red::state_patch(IndentGuidesState { layout_key: key });
+    render(layout, red::editor_info());
+}
+
+#[red::on("theme:changed")]
+fn refresh_theme(event: EmptyEvent) {
+    red::state_patch(IndentGuidesState { layout_key: "" });
+    refresh(event);
+}
+
+fn render(layout: IndentViewportLayout, info: IndentEditorInfo) {
+    red::execute("SetDecorations", "indent-guides", build_decorations(layout, info));
+}
+
+#[red::lifecycle("deactivate")]
+fn deactivate() {
+    red::execute("ClearDecorations", "indent-guides");
+}
+
+fn build_decorations(layout: IndentViewportLayout, info: IndentEditorInfo) -> [IndentDecoration] {
+    let shift_width = positive_or(red::int(layout.indentation.shift_width, 4), 4);
+    let tab_width = positive_or(red::int(layout.indentation.tab_width, shift_width), shift_width);
+    let buffer_index = red::int(layout.buffer_index, 0);
+    let rows = measured_rows(unique_first_segment_rows(layout.rows), tab_width);
+    let scope = active_scope(layout, rows, shift_width);
+    let decorations: [IndentDecoration] = [];
+    let guide = red::char(9474);
+    let guide_style = indent_style(info);
+    let active_guide_style = scope_style(info);
+    let i = 0;
+
+    while i < red::len(rows) {
+        let row = rows[i];
+        if row.width >= shift_width {
+            decorations = red::push(decorations, indent_decoration(
+                buffer_index,
+                row.line,
+                guide_text(row.width, shift_width, guide),
+                guide_style
+            ));
+
+            if scope.active && row.line >= scope.start && row.line <= scope.end && row.width > scope.column {
+                decorations = red::push(decorations, scope_decoration(
+                    buffer_index,
+                    row.line,
+                    scope.column,
+                    guide,
+                    active_guide_style
+                ));
+            }
+        }
+        i = i + 1;
+    }
+
+    return decorations;
+}
+
+fn unique_first_segment_rows(source_rows: [ViewportRow]) -> [SourceRow] {
+    let rows: [SourceRow] = [];
+    let i = 0;
+
+    while i < red::len(source_rows) && red::len(rows) < 500 {
+        let row = source_rows[i];
+        let line = red::int(row.line, 0);
+        if red::bool(row.first_segment, true) {
+            rows = red::push(rows, SourceRow {
+                line: line,
+                text: red::string(row.text, ""),
+                indent_width: red::int(row.indent_width, -1),
+            });
+        }
+        i = i + 1;
+    }
+
+    return rows;
+}
+
+fn measured_rows(rows: [SourceRow], tab_width: i32) -> [MeasuredRow] {
+    let measured: [MeasuredRow] = [];
+    let i = 0;
+    let previous = -1;
+
+    while i < red::len(rows) {
+        let row = rows[i];
+        if !is_blank(row.text) {
+            let width = non_blank_indent(row, tab_width);
+            measured = red::push(measured, MeasuredRow { line: row.line, width: width });
+            previous = width;
+            i = i + 1;
+            continue;
+        }
+
+        let end = i + 1;
+        while end < red::len(rows) && is_blank(rows[end].text) {
+            end = end + 1;
+        }
+        let after = -1;
+        if end < red::len(rows) {
+            after = non_blank_indent(rows[end], tab_width);
+        }
+        let width = 0;
+        if previous >= 0 && after >= 0 {
+            width = min_int(previous, after);
+        } else if previous >= 0 {
+            width = previous;
+        } else if after >= 0 {
+            width = after;
+        }
+        while i < end {
+            measured = red::push(measured, MeasuredRow { line: rows[i].line, width: width });
+            i = i + 1;
+        }
+    }
+
+    return measured;
+}
+
+fn non_blank_indent(row: SourceRow, tab_width: i32) -> i32 {
+    let width = red::int(row.indent_width, -1);
+    if width >= 0 {
+        return width;
+    }
+    return leading_indent_width(row.text, tab_width);
+}
+
+fn active_scope(layout: IndentViewportLayout, rows: [MeasuredRow], shift_width: i32) -> IndentScope {
+    let cursor_line = red::int(layout.cursor.y, 0);
+    let cursor_index = 0;
+    while cursor_index < red::len(rows) && rows[cursor_index].line != cursor_line {
+        cursor_index = cursor_index + 1;
+    }
+    if cursor_index >= red::len(rows) {
+        return IndentScope { active: false, column: 0, start: 0, end: 0 };
+    }
+    let current_indent = rows[cursor_index].width;
+    if current_indent < shift_width {
+        return IndentScope { active: false, column: 0, start: 0, end: 0 };
+    }
+
+    let level = (current_indent / shift_width) * shift_width;
+    let start = cursor_line;
+    let expected_line = cursor_line - 1;
+    let index = cursor_index - 1;
+    while index >= 0 {
+        let row = rows[index];
+        if row.line != expected_line || row.width < level {
+            break;
+        }
+        start = row.line;
+        expected_line = expected_line - 1;
+        index = index - 1;
+    }
+
+    let end = cursor_line;
+    expected_line = cursor_line + 1;
+    index = cursor_index + 1;
+    while index < red::len(rows) {
+        let row = rows[index];
+        if row.line != expected_line || row.width < level {
+            break;
+        }
+        end = row.line;
+        expected_line = expected_line + 1;
+        index = index + 1;
+    }
+
+    return IndentScope {
+        active: true,
+        column: level - shift_width,
+        start: start,
+        end: end,
+    };
+}
+
+fn leading_indent_width(line: String, tab_width: i32) -> i32 {
+    let width = 0;
+    let i = 0;
+    let tab = red::char(9);
+
+    while i < red::len(line) {
+        let character = red::char_at(line, i);
+        if character == " " {
+            width = width + 1;
+        } else if character == tab {
+            width = width + positive_or(tab_width, 1) - (width % positive_or(tab_width, 1));
+        } else if red::is_whitespace(character) {
+            width = width + 1;
+        } else {
+            return width;
+        }
+        i = i + 1;
+    }
+
+    return width;
+}
+
+fn guide_text(indent_width: i32, shift_width: i32, guide: String) -> String {
+    let text = "";
+    let column = 0;
+    while column < indent_width {
+        if column % shift_width == 0 {
+            text = text + guide;
+        } else {
+            text = text + " ";
+        }
+        column = column + 1;
+    }
+    return text;
+}
+
+fn is_blank(text: String) -> bool {
+    return red::trim(text) == "";
+}
+
+fn positive_or(value: i32, fallback: i32) -> i32 {
+    if value > 0 {
+        return value;
+    }
+    if fallback > 0 {
+        return fallback;
+    }
+    return 1;
+}
+
+fn min_int(left: i32, right: i32) -> i32 {
+    if left < right {
+        return left;
+    }
+    return right;
+}
+
+fn indent_decoration(buffer_index: i32, line: i32, text: String, style: Style) -> IndentDecoration {
+    return IndentDecoration {
+        buffer_index: buffer_index,
+        anchor: "column",
+        line: line,
+        column: 0,
+        text: text,
+        style: style,
+        priority: 1,
+        repeat_linebreak: true,
+        only_whitespace: true,
+    };
+}
+
+fn scope_decoration(buffer_index: i32, line: i32, column: i32, text: String, style: Style) -> IndentDecoration {
+    return IndentDecoration {
+        buffer_index: buffer_index,
+        anchor: "column",
+        line: line,
+        column: column,
+        text: text,
+        style: style,
+        priority: 1024,
+        repeat_linebreak: true,
+        only_whitespace: true,
+    };
+}
+
+fn indent_style(info: IndentEditorInfo) -> Style {
+    let fg = info.theme.colors["editorIndentGuide.background"];
+    if fg == red::null() {
+        fg = info.theme.colors["tree.inactiveIndentGuidesStroke"];
+    }
+    if fg == red::null() {
+        fg = info.theme.gutter_style.fg;
+    }
+    if fg == red::null() {
+        fg = red::blend_color(theme_foreground(info), theme_background(info), 0.35);
+    }
+    return Style {
+        fg: fg,
+        bg: red::null(),
+        bold: false,
+        italic: false,
+    };
+}
+
+fn scope_style(info: IndentEditorInfo) -> Style {
+    let fg = info.theme.colors["editorIndentGuide.activeBackground"];
+    if fg == red::null() {
+        fg = info.theme.colors["tree.indentGuidesStroke"];
+    }
+    if fg == red::null() {
+        fg = info.theme.colors["editorLineNumber.activeForeground"];
+    }
+    if fg == red::null() {
+        fg = red::blend_color(theme_foreground(info), theme_background(info), 0.65);
+    }
+    return Style {
+        fg: fg,
+        bg: red::null(),
+        bold: true,
+        italic: false,
+    };
+}
+
+fn theme_foreground(info: IndentEditorInfo) -> Json {
+    let color = info.theme.colors["editor.foreground"];
+    if color != red::null() {
+        return color;
+    }
+    if info.theme.style.fg != red::null() {
+        return info.theme.style.fg;
+    }
+    return Color { Rgb: Json { r: 255, g: 255, b: 255 } };
+}
+
+fn theme_background(info: IndentEditorInfo) -> Json {
+    let color = info.theme.colors["editor.background"];
+    if color != red::null() {
+        return color;
+    }
+    if info.theme.style.bg != red::null() {
+        return info.theme.style.bg;
+    }
+    return Color { Rgb: Json { r: 0, g: 0, b: 0 } };
+}

@@ -1,0 +1,2665 @@
+//! Editable text storage and the raw mutation seam beneath editor transactions.
+//!
+//! A [`Buffer`] stores UTF-8 text in a Ropey rope, assigns it a stable process-local
+//! [`BufferId`], and tracks content revision, dirty state, cursor fallback state, and
+//! buffer-local [`UndoHistory`]. Public positions used for edits are line plus Unicode
+//! scalar index; display columns and grapheme cursor positions must be converted before
+//! entering this module.
+//!
+//! Methods such as [`Buffer::replace_range_raw`] mutate text without opening an undo
+//! transaction or notifying LSP and plugins. Production features must call the editor's
+//! transaction boundary instead; raw replacement exists for that boundary and for
+//! controlled undo/redo replay.
+
+use ropey::{Rope, RopeSlice};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+
+use crate::undo::{TextPosition, TextRange, UndoHistory};
+use crate::unicode_utils::{char_to_column, column_to_char, display_width, trim_line_ending};
+use crate::utils::{expand_user_path, normalized_file_path, same_file_path};
+
+const FIRST_BUFFER_ID: u64 = 1;
+static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(FIRST_BUFFER_ID);
+
+#[derive(Default)]
+struct StartupFileIdentities {
+    paths: HashSet<PathBuf>,
+    #[cfg(unix)]
+    files: HashSet<(u64, u64)>,
+}
+
+impl StartupFileIdentities {
+    fn insert(&mut self, path: &Path) -> bool {
+        if self.paths.contains(path) {
+            return false;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            if std::fs::metadata(path)
+                .ok()
+                .is_some_and(|metadata| !self.files.insert((metadata.dev(), metadata.ino())))
+            {
+                return false;
+            }
+        }
+
+        #[cfg(not(unix))]
+        if self
+            .paths
+            .iter()
+            .any(|previous| same_file_path(previous, path))
+        {
+            return false;
+        }
+
+        self.paths.insert(path.to_path_buf())
+    }
+}
+
+/// Loads startup files in argument order while collapsing aliases of the same file.
+#[doc(hidden)]
+pub async fn load_startup_buffers(files: &[String]) -> anyhow::Result<Vec<Buffer>> {
+    let mut buffers = Vec::with_capacity(files.len());
+    let mut identities = StartupFileIdentities::default();
+    for file in files {
+        let buffer = Buffer::load_or_create(Some(file.clone())).await?;
+        let duplicate = buffer
+            .file
+            .as_deref()
+            .is_some_and(|candidate| !identities.insert(Path::new(candidate)));
+        if !duplicate {
+            buffers.push(buffer);
+        }
+    }
+    Ok(buffers)
+}
+
+/// Stable identity for one in-memory buffer.
+///
+/// Unlike a buffer's position in `Editor::buffers`, this value does not change when
+/// another buffer is closed. It is process-local and is not a persistence identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BufferId(u64);
+
+impl BufferId {
+    fn next() -> Self {
+        const BUFFER_ID_INCREMENT: u64 = 1;
+        Self(NEXT_BUFFER_ID.fetch_add(BUFFER_ID_INCREMENT, /*order*/ Ordering::Relaxed))
+    }
+
+    /// Returns the stable process-local number shown in buffer lists and plugin snapshots.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+/// Half-open regular-expression match in zero-based line and scalar coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchMatch {
+    /// Inclusive Unicode scalar index on `start_y`.
+    pub start_x: usize,
+    /// Zero-based start line.
+    pub start_y: usize,
+    /// Exclusive Unicode scalar index on `end_y`.
+    pub end_x: usize,
+    /// Zero-based end line.
+    pub end_y: usize,
+}
+
+/// Buffer-local syntax-highlighting selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SyntaxSelection {
+    /// Detect syntax from the file name, then the first-line shebang.
+    #[default]
+    Auto,
+    /// Disable syntax highlighting.
+    Off,
+    /// Highlight using the selected canonical language identifier.
+    Language(String),
+}
+
+/// How the on-disk file diverged from the buffer's last loaded or saved version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalFileChange {
+    /// The existing file now contains different bytes.
+    Modified,
+    /// A file appeared where the buffer originally represented a missing path.
+    Created,
+    /// The file was removed after the buffer loaded or saved it.
+    Deleted,
+}
+
+/// Exact disk state last observed for the file associated with a buffer.
+#[derive(Debug)]
+struct BackingFileSnapshot {
+    path: PathBuf,
+    contents: Option<Rope>,
+}
+
+/// Buffer represents an editable text buffer, which may be associated with a file.
+/// It maintains the text content as a rope data structure for efficient editing operations.
+#[derive(Debug)]
+pub struct Buffer {
+    /// Stable process-local identity.
+    id: BufferId,
+
+    /// Optional path to the file this buffer represents
+    pub file: Option<String>,
+
+    /// The text content stored as a rope for efficient editing
+    content: Rope,
+
+    /// Last loaded or successfully saved text. Unknown recovered baselines stay dirty.
+    saved_content: Option<Rope>,
+
+    /// Last known disk contents; `None` contents represent a file that did not exist.
+    backing_file: Option<BackingFileSnapshot>,
+
+    /// An observed external change that still needs an explicit user decision.
+    external_file_change: Option<ExternalFileChange>,
+
+    /// Content revision for which `dirty` was last computed.
+    dirty_revision: u64,
+
+    /// Whether the buffer has unsaved changes
+    pub dirty: bool,
+
+    /// Current cursor position as (x, y) coordinates
+    pub pos: (usize, usize),
+
+    /// Top line number of the viewport (for scrolling)
+    pub vtop: usize,
+
+    /// Buffer-local undo and redo history.
+    pub undo_history: UndoHistory,
+
+    /// Monotonic content revision used by render caches.
+    revision: u64,
+
+    /// Buffer-local syntax-highlighting selection.
+    syntax_selection: SyntaxSelection,
+}
+
+impl Buffer {
+    /// Creates a new Buffer instance with the given file path and contents
+    pub fn new(file: Option<String>, contents: String) -> Self {
+        let contents = if contents.is_empty() && file.is_none() {
+            "\n".to_string()
+        } else {
+            contents
+        };
+
+        Self::with_content(file, Rope::from_str(&contents))
+    }
+
+    fn with_content(file: Option<String>, content: Rope) -> Self {
+        let backing_file = file.as_ref().map(|file| {
+            let path = PathBuf::from(file);
+            BackingFileSnapshot {
+                contents: path.exists().then(|| content.clone()),
+                path,
+            }
+        });
+        Self {
+            id: BufferId::next(),
+            file,
+            saved_content: Some(content.clone()),
+            backing_file,
+            external_file_change: None,
+            content,
+            dirty_revision: 0,
+            dirty: false,
+            pos: (0, 0),
+            vtop: 0,
+            undo_history: UndoHistory::default(),
+            revision: 0,
+            syntax_selection: SyntaxSelection::Auto,
+        }
+    }
+
+    /// Creates a new Buffer by reading contents from a file
+    pub async fn from_file(file: Option<String>) -> anyhow::Result<Self> {
+        match &file {
+            Some(file) => {
+                let path = normalized_file_path(file)?;
+                if !path.exists() {
+                    return Err(anyhow::anyhow!("file {:?} not found", file));
+                }
+
+                let contents = std::fs::read_to_string(&path)?;
+                let file = path.to_string_lossy().into_owned();
+
+                // Debug: Check for emoji in loaded content
+                if contents
+                    .chars()
+                    .any(|c| c as u32 >= 0x1F300 && c as u32 <= 0x1F9FF)
+                {
+                    crate::log!(
+                        "from_file: Loaded file contains emoji. First 100 chars: {:?}",
+                        &contents.chars().take(100).collect::<String>()
+                    );
+                }
+
+                Ok(Self::new(Some(file), contents))
+            }
+            None => Ok(Self::new(file, "\n".to_string())),
+        }
+    }
+
+    /// Loads an existing UTF-8 file or creates an unsaved buffer for a missing path.
+    ///
+    /// A path whose directory entry exists but cannot be followed as a regular file is
+    /// an error rather than a new-file buffer. The method reads synchronously despite its
+    /// async signature and does not create the file on disk.
+    pub async fn load_or_create(file: Option<String>) -> anyhow::Result<Self> {
+        match &file {
+            Some(file) => {
+                let path = normalized_file_path(file)?;
+                let resolved_file = path.to_string_lossy().into_owned();
+                if !path.exists() {
+                    if std::fs::symlink_metadata(&path).is_ok() {
+                        return Err(anyhow::anyhow!("file {:?} not found", resolved_file));
+                    }
+
+                    return Ok(Self::new(Some(resolved_file), "\n".to_string()));
+                }
+
+                let contents = std::fs::read_to_string(&path)?;
+
+                Ok(Self::new(Some(resolved_file), contents))
+            }
+            None => Ok(Self::new(file, "\n".to_string())),
+        }
+    }
+
+    /// Reads the current file contents without mutating the buffer.
+    ///
+    /// The editor owns applying the returned contents through its transaction boundary so
+    /// reloads retain undo history, marks, dirty-state revisions, and change notifications.
+    /// This fails for unnamed, missing, unreadable, or non-UTF-8 files.
+    pub(crate) fn read_backing_file(&self) -> anyhow::Result<(String, String)> {
+        let Some(file) = self.file.clone() else {
+            return Err(anyhow::anyhow!("No file name"));
+        };
+
+        let path = expand_user_path(&file)?;
+        if !path.exists() {
+            return Err(anyhow::anyhow!("file {:?} not found", file));
+        }
+
+        let contents = std::fs::read_to_string(&path)?;
+        Ok((path.to_string_lossy().into_owned(), contents))
+    }
+
+    /// Gets the file type based on the file extension
+    pub fn file_type(&self) -> Option<String> {
+        // TODO: use PathBuf?
+        self.file.as_ref().and_then(|file| {
+            file.split('.')
+                .next_back()
+                .map(|ext| ext.to_string().to_lowercase())
+        })
+    }
+
+    /// Returns the buffer-local syntax-highlighting selection.
+    pub fn syntax_selection(&self) -> &SyntaxSelection {
+        &self.syntax_selection
+    }
+
+    /// Sets the buffer-local syntax-highlighting selection without changing the text.
+    pub fn set_syntax_selection(&mut self, selection: SyntaxSelection) {
+        self.syntax_selection = selection;
+    }
+
+    /// Gets the full contents of the buffer as a single string
+    pub fn contents(&self) -> String {
+        self.content.to_string()
+    }
+
+    /// Returns a cheap, structurally shared snapshot of the buffer contents.
+    pub(crate) fn contents_snapshot(&self) -> Rope {
+        self.content.clone()
+    }
+
+    /// Returns the last saved text without flattening it on the editor thread.
+    pub(crate) fn saved_contents_snapshot(&self) -> Option<Rope> {
+        self.saved_content.clone()
+    }
+
+    /// Gets the exact contents of the half-open line range `[start, end)`.
+    ///
+    /// Line endings are preserved and no separators are synthesized.
+    pub fn line_range_contents(&self, start: usize, end: usize) -> String {
+        let line_count = self.content.len_lines();
+        let start = start.min(line_count);
+        let end = end.min(line_count).max(start);
+        let start_char = if start == line_count {
+            self.content.len_chars()
+        } else {
+            self.content.line_to_char(start)
+        };
+        let end_char = if end == line_count {
+            self.content.len_chars()
+        } else {
+            self.content.line_to_char(end)
+        };
+        self.content.slice(start_char..end_char).to_string()
+    }
+
+    /// Copies a line range once while recording each exact UTF-8 line boundary.
+    /// Rope chunks are borrowed directly, avoiding one temporary allocation per
+    /// visible line while preserving CRLF and Ropey's full line-break rules.
+    pub(crate) fn line_range_contents_with_offsets(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> (String, Vec<usize>) {
+        let line_count = self.content.len_lines();
+        let start = start.min(line_count);
+        let end = end.min(line_count).max(start);
+        let mut text = String::with_capacity(self.line_range_byte_len(start, end));
+        let mut offsets = Vec::with_capacity(end - start + 1);
+        if start < line_count {
+            for line in self.content.lines_at(start).take(end - start) {
+                offsets.push(text.len());
+                for chunk in line.chunks() {
+                    text.push_str(chunk);
+                }
+            }
+        }
+        offsets.push(text.len());
+        (text, offsets)
+    }
+
+    /// Borrows complete lines before `line` in reverse without flattening the rope.
+    pub(crate) fn preceding_lines(&self, line: usize) -> ropey::iter::Lines<'_> {
+        self.content
+            .lines_at(line.min(self.content.len_lines()))
+            .reversed()
+    }
+
+    /// Returns at most `max_chars` Unicode scalar values from one line.
+    pub(crate) fn line_prefix_contents(&self, line: usize, max_chars: usize) -> String {
+        let line_count = self.content.len_lines();
+        if line >= line_count || max_chars == 0 {
+            return String::new();
+        }
+
+        let start = self.content.line_to_char(line);
+        let line_end = if line + 1 == line_count {
+            self.content.len_chars()
+        } else {
+            self.content.line_to_char(line + 1)
+        };
+        let end = start.saturating_add(max_chars).min(line_end);
+        self.content.slice(start..end).to_string()
+    }
+
+    /// Returns the exact byte length of the half-open line range `[start, end)`.
+    pub fn line_range_byte_len(&self, start: usize, end: usize) -> usize {
+        let line_count = self.content.len_lines();
+        let start = start.min(line_count);
+        let end = end.min(line_count).max(start);
+        let start_byte = if start == line_count {
+            self.content.len_bytes()
+        } else {
+            self.content.line_to_byte(start)
+        };
+        let end_byte = if end == line_count {
+            self.content.len_bytes()
+        } else {
+            self.content.line_to_byte(end)
+        };
+        end_byte.saturating_sub(start_byte)
+    }
+
+    /// Returns the monotonic content revision used to invalidate external caches.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Reconstructs an in-memory buffer from a trusted, versioned session snapshot.
+    /// This never reads or writes the associated file.
+    pub fn from_session_snapshot(
+        file: Option<String>,
+        contents: String,
+        saved_contents: Option<String>,
+        dirty: bool,
+        revision: u64,
+        undo_history: UndoHistory,
+    ) -> Self {
+        let mut buffer = Self::with_content(file, Rope::from_str(&contents));
+        buffer.saved_content = saved_contents
+            .map(|contents| Rope::from_str(&contents))
+            .or_else(|| (!dirty).then(|| buffer.content.clone()));
+        if let Some(backing_file) = &mut buffer.backing_file {
+            if backing_file.contents.is_some() {
+                backing_file.contents.clone_from(&buffer.saved_content);
+            }
+        }
+        buffer.revision = revision;
+        buffer.dirty_revision = revision.wrapping_sub(1);
+        buffer.undo_history = undo_history;
+        buffer.refresh_dirty();
+        buffer
+    }
+
+    /// Returns the stable process-local buffer identity.
+    pub fn id(&self) -> BufferId {
+        self.id
+    }
+
+    /// Finds every regex match and converts byte offsets into line and scalar coordinates.
+    pub fn regex_matches(&self, regex: &Regex) -> Vec<SearchMatch> {
+        let contents = self.contents();
+        let bytes = contents.as_bytes();
+        let mut previous_byte = 0;
+        let mut x = 0;
+        let mut y = 0;
+
+        let mut position_at = |byte: usize| {
+            if byte.saturating_sub(previous_byte) > 1_024 {
+                let character = self.content.byte_to_char(byte);
+                y = self.content.char_to_line(character);
+                x = character - self.content.line_to_char(y);
+                previous_byte = byte;
+                return (x, y);
+            }
+            for (offset, character) in contents[previous_byte..byte].char_indices() {
+                match character {
+                    '\r' if bytes.get(previous_byte + offset + 1) == Some(&b'\n') => x += 1,
+                    '\n' | '\r' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}'
+                    | '\u{2029}' => {
+                        x = 0;
+                        y += 1;
+                    }
+                    _ => x += 1,
+                }
+            }
+            previous_byte = byte;
+            (x, y)
+        };
+
+        regex
+            .find_iter(&contents)
+            .filter(|match_| match_.start() != match_.end())
+            .map(|match_| {
+                let (start_x, start_y) = position_at(match_.start());
+                let (end_x, end_y) = position_at(match_.end());
+                SearchMatch {
+                    start_x,
+                    start_y,
+                    end_x,
+                    end_y,
+                }
+            })
+            .collect()
+    }
+
+    /// Finds one non-empty regex match relative to a character-position origin.
+    pub fn regex_match_from(
+        &self,
+        regex: &Regex,
+        origin: (usize, usize),
+        backward: bool,
+        wrap: bool,
+    ) -> Option<SearchMatch> {
+        let contents = self.contents();
+        let origin_char = self.xy_to_char_idx(origin.0, origin.1);
+        let origin_byte = self.content.char_to_byte(origin_char);
+
+        let matched = if backward {
+            regex
+                .find_iter(&contents)
+                .filter(|matched| matched.start() != matched.end())
+                .take_while(|matched| matched.start() < origin_byte)
+                .last()
+                .or_else(|| {
+                    wrap.then(|| {
+                        regex
+                            .find_iter(&contents)
+                            .filter(|matched| matched.start() != matched.end())
+                            .last()
+                    })
+                    .flatten()
+                })
+        } else {
+            regex
+                .find_iter(&contents)
+                .filter(|matched| matched.start() != matched.end())
+                .find(|matched| matched.start() > origin_byte)
+                .or_else(|| {
+                    wrap.then(|| {
+                        regex
+                            .find_iter(&contents)
+                            .find(|matched| matched.start() != matched.end())
+                    })
+                    .flatten()
+                })
+        }?;
+
+        let position = |byte| {
+            let character = self.content.byte_to_char(byte);
+            let line = self.content.char_to_line(character);
+            (character - self.content.line_to_char(line), line)
+        };
+        let (start_x, start_y) = position(matched.start());
+        let (end_x, end_y) = position(matched.end());
+        Some(SearchMatch {
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+        })
+    }
+
+    fn mark_changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        self.refresh_dirty();
+    }
+
+    /// Returns the unresolved way this buffer's backing file changed on disk.
+    pub fn external_file_change(&self) -> Option<ExternalFileChange> {
+        self.external_file_change
+    }
+
+    /// Returns whether an external change needs to be reloaded, saved elsewhere, or overwritten.
+    pub fn has_external_file_conflict(&self) -> bool {
+        self.external_file_change.is_some()
+    }
+
+    /// Accepts only proposed edits that leave every unsaved user-edited range intact.
+    ///
+    /// Comparing both edit scripts in current-buffer coordinates lets an agent keep
+    /// working beside unsaved human changes without silently replacing those changes.
+    pub(crate) fn preserves_unsaved_edits(&self, proposed: &str) -> bool {
+        if !self.is_dirty() || self.content == proposed {
+            return true;
+        }
+        let Some(saved) = self.saved_content.as_ref() else {
+            return false;
+        };
+        let saved = saved.to_string();
+        let current = self.contents();
+        let user_diff = similar::TextDiff::configure()
+            .timeout(std::time::Duration::from_millis(250))
+            .diff_chars(saved.as_str(), current.as_str());
+        let proposed_diff = similar::TextDiff::configure()
+            .timeout(std::time::Duration::from_millis(250))
+            .diff_chars(current.as_str(), proposed);
+
+        !user_diff
+            .ops()
+            .iter()
+            .filter(|operation| operation.tag() != similar::DiffTag::Equal)
+            .any(|user_change| {
+                let protected = user_change.new_range();
+                proposed_diff
+                    .ops()
+                    .iter()
+                    .filter(|operation| operation.tag() != similar::DiffTag::Equal)
+                    .any(|agent_change| {
+                        let changed = agent_change.old_range();
+                        match (protected.is_empty(), changed.is_empty()) {
+                            (true, true) => protected.start == changed.start,
+                            (true, false) => {
+                                changed.start <= protected.start && protected.start < changed.end
+                            }
+                            (false, true) => {
+                                protected.start < changed.start && changed.start < protected.end
+                            }
+                            (false, false) => {
+                                protected.start < changed.end && changed.start < protected.end
+                            }
+                        }
+                    })
+            })
+    }
+
+    /// Compares the backing file's exact bytes with its last loaded or saved baseline.
+    pub(crate) fn detect_external_file_change(&self) -> anyhow::Result<Option<ExternalFileChange>> {
+        let Some(backing_file) = self.backing_file.as_ref() else {
+            return Ok(None);
+        };
+        let disk_contents = Self::read_disk_contents(&backing_file.path)?;
+        Ok(match (&backing_file.contents, disk_contents.as_deref()) {
+            (None, None) => None,
+            (None, Some(_)) => Some(ExternalFileChange::Created),
+            (Some(_), None) => Some(ExternalFileChange::Deleted),
+            (Some(expected), Some(actual)) => (!Self::rope_matches_disk_contents(expected, actual))
+                .then_some(ExternalFileChange::Modified),
+        })
+    }
+
+    /// Updates conflict state without mutating the text, history, or saved baseline.
+    pub(crate) fn set_external_file_change(&mut self, change: Option<ExternalFileChange>) -> bool {
+        if self.external_file_change == change {
+            return false;
+        }
+        self.external_file_change = change;
+        true
+    }
+
+    fn read_disk_contents(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+        match std::fs::read(path) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn rope_matches_disk_contents(expected: &Rope, actual: &[u8]) -> bool {
+        if expected.len_bytes() != actual.len() {
+            return false;
+        }
+        let mut remaining = actual;
+        expected.chunks().all(|chunk| {
+            let Some(rest) = remaining.strip_prefix(chunk.as_bytes()) else {
+                return false;
+            };
+            remaining = rest;
+            true
+        }) && remaining.is_empty()
+    }
+
+    /// Rejects writes when the destination no longer matches its last known disk state.
+    pub(crate) fn ensure_backing_file_unchanged(&self, path: &Path) -> anyhow::Result<()> {
+        let disk_contents = Self::read_disk_contents(path)?;
+
+        let Some(backing_file) = self
+            .backing_file
+            .as_ref()
+            .filter(|backing_file| same_file_path(&backing_file.path, path))
+        else {
+            anyhow::ensure!(
+                disk_contents.is_none(),
+                "Refusing to overwrite existing file {:?}; it was not opened or saved by Red",
+                path.display().to_string()
+            );
+            return Ok(());
+        };
+
+        let unchanged = match (&backing_file.contents, disk_contents.as_deref()) {
+            (None, None) => true,
+            (Some(expected), Some(actual)) => Self::rope_matches_disk_contents(expected, actual),
+            _ => false,
+        };
+
+        anyhow::ensure!(
+            unchanged,
+            "File changed on disk since Red last read or saved it: {:?}; use :diffdisk to compare, :e! to reload, :w <file> to save elsewhere, or :w! to overwrite",
+            path.display().to_string()
+        );
+        Ok(())
+    }
+
+    /// Keeps the last known contents attached to a file moved by Red or an LSP server.
+    pub(crate) fn rename_backing_file(&mut self, path: &Path) {
+        if let Some(backing_file) = &mut self.backing_file {
+            backing_file.path = path.to_path_buf();
+        }
+        self.external_file_change = None;
+    }
+
+    /// Drops the backing identity when a removed file becomes an unnamed scratch buffer.
+    pub(crate) fn detach_backing_file(&mut self) {
+        self.backing_file = None;
+        self.external_file_change = None;
+    }
+
+    /// Saves the buffer contents to its associated file
+    pub fn save(&mut self) -> anyhow::Result<String> {
+        if let Some(file) = self.file.clone() {
+            self.save_to_path(&file, /*force*/ false)
+        } else {
+            Err(anyhow::anyhow!("No file name"))
+        }
+    }
+
+    /// Overwrites the associated file only after an explicit forced-save action.
+    pub fn force_save(&mut self) -> anyhow::Result<String> {
+        if let Some(file) = self.file.clone() {
+            self.save_to_path(&file, /*force*/ true)
+        } else {
+            Err(anyhow::anyhow!("No file name"))
+        }
+    }
+
+    /// Saves the buffer contents to a new file path
+    pub fn save_as(&mut self, new_file_name: &str) -> anyhow::Result<String> {
+        self.save_to_path(new_file_name, /*force*/ false)
+    }
+
+    /// Overwrites an explicitly requested destination after a forced Save As command.
+    pub fn force_save_as(&mut self, new_file_name: &str) -> anyhow::Result<String> {
+        self.save_to_path(new_file_name, /*force*/ true)
+    }
+
+    fn save_to_path(&mut self, new_file_name: &str, force: bool) -> anyhow::Result<String> {
+        let path = normalized_file_path(new_file_name)?;
+        let file = path.to_string_lossy().into_owned();
+        if !force {
+            if let Err(error) = self.ensure_backing_file_unchanged(&path) {
+                if self
+                    .backing_file
+                    .as_ref()
+                    .is_some_and(|backing_file| same_file_path(&backing_file.path, &path))
+                {
+                    if let Ok(change) = self.detect_external_file_change() {
+                        self.set_external_file_change(change);
+                    }
+                }
+                return Err(error);
+            }
+        }
+        let contents = self.contents();
+        std::fs::write(&path, &contents)?;
+        self.file = Some(file.clone());
+        self.mark_saved();
+        let message = format!("{:?} {}L, {}B written", file, self.len(), contents.len());
+        Ok(message)
+    }
+
+    /// Returns the display name used by buffer and status UI.
+    pub fn name(&self) -> &str {
+        self.file.as_deref().unwrap_or("[No Name]")
+    }
+
+    /// True when the buffer has never been associated with a file.
+    pub fn is_unnamed(&self) -> bool {
+        self.file.is_none()
+    }
+
+    /// True when the buffer holds no text. Unlike [`Buffer::is_empty`], this
+    /// treats the single newline that `Buffer::new` normalizes empty scratch
+    /// buffers to as blank.
+    pub fn is_blank(&self) -> bool {
+        self.content.len_bytes() <= 1 && self.content.chars().all(|c| c == '\n')
+    }
+
+    /// Returns a file URI for named buffers and `None` for unnamed buffers.
+    ///
+    /// Invalid or non-absolute file paths are reported as conversion errors.
+    pub fn uri(&self) -> anyhow::Result<Option<String>> {
+        let Some(file) = &self.file else {
+            return Ok(None);
+        };
+        let file = expand_user_path(file)?;
+        Ok(Some(crate::lsp::file_uri(&file)?))
+    }
+
+    /// Gets a line from the buffer by line number
+    pub fn get(&self, line: usize) -> Option<String> {
+        if line > self.len() {
+            return None;
+        }
+        Some(self.content.line(line).to_string())
+    }
+
+    /// Sets the content of a line
+    pub fn set(&mut self, line: usize, content: String) {
+        if line > self.len() {
+            return;
+        }
+        let start_char = self.content.line_to_char(line);
+        let end_char = if line + 1 < self.content.len_lines() {
+            self.content.line_to_char(line + 1)
+        } else {
+            self.content.len_chars()
+        };
+        self.content.remove(start_char..end_char);
+        self.content.insert(start_char, &content);
+        self.mark_changed();
+    }
+
+    /// Gets the number of lines in the buffer
+    pub fn len(&self) -> usize {
+        self.content.len_lines() - 1
+    }
+
+    /// Returns the UTF-8 byte length of the complete buffer.
+    pub fn byte_len(&self) -> usize {
+        self.content.len_bytes()
+    }
+
+    /// Returns the Unicode scalar count without flattening or scanning the rope.
+    pub(crate) fn char_len(&self) -> usize {
+        self.content.len_chars()
+    }
+
+    /// Checks ASCII without flattening or scanning the rope.
+    pub(crate) fn is_ascii(&self) -> bool {
+        self.content.len_bytes() == self.content.len_chars()
+    }
+
+    /// Returns the last line that can hold an editor cursor.
+    pub fn last_navigable_line(&self) -> usize {
+        let last_line = self.len();
+        if last_line > 0 && self.content.line(last_line).len_chars() == 0 {
+            last_line - 1
+        } else {
+            last_line
+        }
+    }
+
+    /// Returns the logical line count after excluding Ropey's synthetic trailing line.
+    pub fn navigable_line_count(&self) -> usize {
+        self.last_navigable_line() + 1
+    }
+
+    /// Reports whether a logical line contains only its LF or CRLF terminator.
+    ///
+    /// Whitespace-only lines remain nonempty, matching Vim paragraph semantics.
+    pub(crate) fn line_is_empty(&self, line: usize) -> bool {
+        self.content
+            .get_line(line)
+            .is_some_and(Self::line_slice_is_empty)
+    }
+
+    /// Checks one borrowed rope line without allocating or flattening its text.
+    pub(crate) fn line_slice_is_empty(line: RopeSlice<'_>) -> bool {
+        match line.len_chars() {
+            0 => true,
+            1 => matches!(line.char(0), '\n' | '\r'),
+            2 => line.char(0) == '\r' && line.char(1) == '\n',
+            _ => false,
+        }
+    }
+
+    /// Returns true if the buffer is empty
+    pub fn is_empty(&self) -> bool {
+        self.content.len_bytes() == 0
+    }
+
+    /// Inserts a string at the given position
+    pub fn insert_str(&mut self, x: usize, y: usize, s: &str) {
+        // Calculate the character index within the rope
+        let char_idx = self.xy_to_char_idx(x, y);
+        self.content.insert(char_idx, s);
+        self.mark_changed();
+    }
+
+    /// Inserts a character at the given position
+    pub fn insert(&mut self, x: usize, y: usize, c: char) {
+        use crate::log;
+
+        let char_idx = self.xy_to_char_idx(x, y);
+        let total_chars = self.content.len_chars();
+
+        log!(
+            "Buffer::insert - x: {}, y: {}, char: '{}', char_idx: {}, total_chars: {}",
+            x,
+            y,
+            c,
+            char_idx,
+            total_chars
+        );
+
+        if char_idx > total_chars {
+            log!(
+                "ERROR: char_idx {} exceeds total_chars {}! Clamping to end.",
+                char_idx,
+                total_chars
+            );
+            self.content.insert_char(total_chars, c);
+        } else {
+            self.content.insert_char(char_idx, c);
+        }
+        self.mark_changed();
+    }
+
+    /// Removes a character at the given position
+    pub fn remove(&mut self, x: usize, y: usize) {
+        let char_idx = self.xy_to_char_idx(x, y);
+        if char_idx < self.content.len_chars() {
+            // rope.remove expects character indices, not byte indices!
+            self.content.remove(char_idx..char_idx + 1);
+            self.mark_changed();
+        }
+    }
+
+    /// Removes a half-open scalar-coordinate range without opening an undo transaction.
+    ///
+    /// Production editor actions should use the canonical editor transaction boundary.
+    pub fn remove_range(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
+        let start_char = self.xy_to_char_idx(x0, y0);
+        let end_char = self.xy_to_char_idx(x1, y1);
+        self.content.remove(start_char..end_char);
+        self.mark_changed();
+    }
+
+    /// Returns the exact text in a half-open canonical range.
+    pub fn text_in_range(&self, range: TextRange) -> String {
+        let start_char = self.position_to_char_idx(range.start);
+        let end_char = self.position_to_char_idx(range.end);
+        self.text_in_char_range(start_char, end_char)
+    }
+
+    /// Returns an exact scalar range without repeating line-to-Rope conversion.
+    pub(crate) fn text_in_char_range(&self, start: usize, end: usize) -> String {
+        self.content
+            .get_slice(start..end)
+            .map(|slice| slice.to_string())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn text_in_char_range_matches(&self, start: usize, end: usize, text: &str) -> bool {
+        self.content
+            .get_slice(start..end)
+            .is_some_and(|slice| slice == text)
+    }
+
+    /// Applies a replacement directly and advances the buffer revision.
+    ///
+    /// This method updates content-based dirty state, but does not record undo history,
+    /// update marks, or notify external consumers. Using it from a new action handler
+    /// would create an untracked edit; production changes must use `Editor::replace_range`.
+    pub fn replace_range_raw(&mut self, range: TextRange, text: &str) {
+        let start_char = self.position_to_char_idx(range.start);
+        let end_char = self.position_to_char_idx(range.end);
+        self.replace_char_range_raw(start_char, end_char, text);
+    }
+
+    /// Applies an already-resolved scalar range beneath the transactional boundary.
+    pub(crate) fn replace_char_range_raw(&mut self, start: usize, end: usize, text: &str) {
+        self.content.remove(start..end);
+        self.content.insert(start, text);
+        self.mark_changed();
+    }
+
+    /// Computes the half-open range occupied by `text` when inserted at `start`.
+    pub fn range_for_text(&self, start: TextPosition, text: &str) -> TextRange {
+        let mut line = start.line;
+        let mut character = start.character;
+
+        for c in text.chars() {
+            if c == '\n' {
+                line += 1;
+                character = 0;
+            } else {
+                character += 1;
+            }
+        }
+
+        TextRange::new(start, TextPosition::new(line, character))
+    }
+
+    /// Converts a canonical line and scalar position to an absolute Ropey character index.
+    ///
+    /// Positions beyond the current buffer clamp to its final character boundary.
+    pub fn position_to_char_idx(&self, position: TextPosition) -> usize {
+        if position.line >= self.content.len_lines() {
+            return self.content.len_chars();
+        }
+
+        let line_start = self.content.line_to_char(position.line);
+        let line_len = self.line_char_len_without_ending(position.line);
+        line_start + position.character.min(line_len)
+    }
+
+    /// Converts a canonical position to an LSP UTF-16 position without flattening
+    /// the document. Canonical ranges cannot split a Unicode scalar or CRLF.
+    pub(crate) fn position_to_lsp(&self, position: TextPosition) -> crate::lsp::Position {
+        let line_count = self.content.len_lines();
+        let line = position.line.min(line_count.saturating_sub(1));
+        let contents = self.content.line(line);
+        let scalar = if position.line >= line_count {
+            contents.len_chars()
+        } else {
+            position
+                .character
+                .min(self.line_char_len_without_ending(line))
+        };
+        let prefix = contents.slice(..scalar);
+        let character = if prefix.len_bytes() == scalar {
+            scalar
+        } else {
+            prefix.chars().map(char::len_utf16).sum()
+        };
+        crate::lsp::Position { line, character }
+    }
+
+    /// Converts a canonical line and scalar position to its UTF-8 byte offset.
+    pub(crate) fn position_to_byte_idx(&self, position: TextPosition) -> usize {
+        self.content
+            .char_to_byte(self.position_to_char_idx(position))
+    }
+
+    /// Converts an absolute Ropey character index to a canonical line and scalar position.
+    ///
+    /// Indexes beyond the current buffer clamp to its final character boundary.
+    pub fn char_idx_to_position(&self, char_index: usize) -> TextPosition {
+        let char_index = char_index.min(self.content.len_chars());
+        let line = self.content.char_to_line(char_index);
+        let line_start = self.content.line_to_char(line);
+        TextPosition::new(line, char_index.saturating_sub(line_start))
+    }
+
+    /// Converts a UTF-8 byte boundary to Red's canonical line/scalar position.
+    pub(crate) fn byte_idx_to_position(&self, byte_index: usize) -> Option<TextPosition> {
+        self.content
+            .try_byte_to_char(byte_index)
+            .ok()
+            .map(|char_index| self.char_idx_to_position(char_index))
+    }
+
+    /// Inserts a new line at the given line number
+    pub fn insert_line(&mut self, y: usize, content: String) {
+        let char_idx = if y >= self.content.len_lines() {
+            self.content.len_chars()
+        } else {
+            self.content.line_to_char(y)
+        };
+        self.content.insert(char_idx, &format!("{}\n", content));
+        self.mark_changed();
+    }
+
+    /// Removes a line at the given line number
+    pub fn remove_line(&mut self, line: usize) {
+        if line >= self.content.len_lines() {
+            return;
+        }
+        let start_char = self.content.line_to_char(line);
+        let end_char = if line + 1 < self.content.len_lines() {
+            self.content.line_to_char(line + 1)
+        } else {
+            self.content.len_chars()
+        };
+        self.content.remove(start_char..end_char);
+        self.mark_changed();
+    }
+
+    /// Replaces a line with new content
+    pub fn replace_line(&mut self, line: usize, new_line: String) {
+        if line > self.len() {
+            return;
+        }
+        let start_char = self.content.line_to_char(line);
+        let end_char = if line + 1 < self.content.len_lines() {
+            self.content.line_to_char(line + 1)
+        } else {
+            self.content.len_chars()
+        };
+        self.content.remove(start_char..end_char);
+        self.content.insert(start_char, &format!("{}\n", new_line));
+        self.mark_changed();
+    }
+
+    /// Gets a portion of the buffer for viewport rendering
+    pub fn viewport(&self, vtop: usize, vheight: usize) -> String {
+        let height = std::cmp::min(vtop + vheight, self.navigable_line_count());
+        let mut result = String::new();
+        for i in vtop..height {
+            result.push_str(&self.content.line(i).to_string());
+        }
+        result
+    }
+
+    /// Checks if a position is within a word
+    /// Note: x is a character index, not a display column
+    pub fn is_in_word(&self, (x, y): (usize, usize)) -> bool {
+        self.content
+            .get_line(y)
+            .and_then(|line| line.chars().nth(x))
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    }
+
+    /// Finds the start of the current word
+    pub fn find_word_start(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
+        let mut x = x;
+        let mut y = y;
+
+        loop {
+            let line = self.get(y)?;
+            let mut characters = line.chars().enumerate().skip(x);
+            let Some((_, current_char)) = characters.next() else {
+                // Move to next line if at end
+                y += 1;
+                x = 0;
+                if y > self.len() {
+                    return None;
+                }
+                continue;
+            };
+
+            let current_type = Self::get_char_type(current_char);
+            let mut skipping_current = true;
+
+            // Skip current word/sequence
+            for (index, c) in characters {
+                let char_type = Self::get_char_type(c);
+                if skipping_current && char_type == current_type {
+                    continue;
+                }
+                skipping_current = false;
+
+                // Skip whitespace
+                if char_type != CharType::Whitespace {
+                    return Some((index, y));
+                }
+            }
+
+            // If we reach end of line, continue to next line
+            y += 1;
+            x = 0;
+            if y > self.len() {
+                return None;
+            }
+        }
+    }
+
+    /// Finds the end of the current word
+    pub fn find_word_end(&self, (x, y): (usize, usize)) -> Option<(usize, usize)> {
+        let line = self.content.get_line(y)?;
+        if x >= line.len_chars() {
+            return Some((x, y));
+        }
+        let mut position = x;
+        for character in line.slice(x..).chars() {
+            if !character.is_alphanumeric() && character != '_' {
+                return Some((position, y));
+            }
+            position += 1;
+        }
+        Some((position, y))
+    }
+
+    /// Finds the next word from the current position
+    pub fn find_next_word(&self, (mut x, mut y): (usize, usize)) -> Option<(usize, usize)> {
+        // Get current line
+        let mut current_line = self.line_without_ending(y)?;
+
+        // Check if we're at the last character of the buffer
+        let line_len = current_line.len_chars();
+        if y >= self.len() && x >= line_len.saturating_sub(1) {
+            return None;
+        }
+
+        // If we're on an empty line now, move to start of next line
+        // without doing anything else
+        if line_len == 0 {
+            y += 1;
+            if y > self.len() {
+                return None;
+            }
+            return Some((0, y));
+        }
+
+        // If we're at the end of current line, move to next line
+        if x >= line_len {
+            y += 1;
+            if y > self.len() {
+                return None;
+            }
+            x = 0;
+            current_line = self.line_without_ending(y)?;
+            if current_line.len_chars() == 0 {
+                return Some((0, y));
+            }
+            // Find first non-whitespace on next line
+            if let Some(i) = Self::first_non_whitespace_char(current_line) {
+                return Some((i, y));
+            }
+        }
+
+        if current_line.len_chars() == 0 {
+            return Some((0, y));
+        }
+
+        let line_len = current_line.len_chars();
+        let last_char_position = line_len.checked_sub(1).map(|last_x| (last_x, y));
+
+        if x < line_len {
+            let start_type = Self::get_char_type(current_line.char(x));
+            x += 1;
+
+            for character in current_line.slice(x..).chars() {
+                if start_type == CharType::Whitespace {
+                    break;
+                }
+                if Self::get_char_type(character) != start_type {
+                    break;
+                }
+                x += 1;
+            }
+        }
+
+        for (offset, character) in current_line.slice(x..).chars().enumerate() {
+            if Self::get_char_type(character) != CharType::Whitespace {
+                return Some((x + offset, y));
+            }
+        }
+
+        y += 1;
+        if y > self.len() {
+            return last_char_position;
+        }
+
+        // Find first non-whitespace on next line
+        let next_line = self.line_without_ending(y)?;
+        if let Some(i) = Self::first_non_whitespace_char(next_line) {
+            return Some((i, y));
+        }
+
+        Some((0, y))
+    }
+
+    /// Finds the previous word from the current position
+    pub fn find_prev_word(&self, (mut x, mut y): (usize, usize)) -> Option<(usize, usize)> {
+        // Get current line
+        let line = self.line_without_ending(y)?;
+
+        // Check if we're at start of buffer
+        if y == 0 && x == 0 {
+            return None;
+        }
+
+        let line_len = line.len_chars();
+
+        // If we're at the end of line, move back one
+        if x >= line_len {
+            x = line_len.saturating_sub(1);
+        }
+
+        // Move one character backward
+        if x == 0 {
+            // Move to end of previous line
+            if y == 0 {
+                return None;
+            }
+            y -= 1;
+            let prev_line = self.line_without_ending(y)?;
+            if prev_line.len_chars() == 0 {
+                return Some((0, y));
+            }
+            x = prev_line.len_chars() - 1;
+        } else {
+            x -= 1;
+        }
+
+        let current_line = self.line_without_ending(y)?;
+
+        // Get the type of character we landed on
+        let start_type = Self::get_char_type(current_line.get_char(x)?);
+
+        // Skip whitespace backward
+        if start_type == CharType::Whitespace {
+            x = match Self::last_non_whitespace_at_or_before(current_line, x) {
+                Some(x) => x,
+                None => {
+                    if y == 0 {
+                        return None;
+                    }
+                    y -= 1;
+                    let prev_line = self.line_without_ending(y)?;
+                    if prev_line.len_chars() == 0 {
+                        return Some((0, y));
+                    }
+                    Self::last_non_whitespace_at_or_before(
+                        prev_line,
+                        prev_line.len_chars().saturating_sub(1),
+                    )?
+                }
+            };
+
+            // If we hit start of line while skipping whitespace, go to previous line
+            if x == 0 && Self::get_char_type(current_line.get_char(0)?) == CharType::Whitespace {
+                if y == 0 {
+                    return None;
+                }
+                y -= 1;
+                let prev_line = self.line_without_ending(y)?;
+                if prev_line.len_chars() == 0 {
+                    return Some((0, y));
+                }
+                x = Self::last_non_whitespace_at_or_before(
+                    prev_line,
+                    prev_line.len_chars().saturating_sub(1),
+                )?;
+            }
+        }
+
+        let current_line = self.line_without_ending(y)?;
+        let current_type = Self::get_char_type(current_line.get_char(x)?);
+
+        // Move backward to start of current word/symbol
+        x = Self::word_start_at_or_before(current_line, x, current_type);
+
+        // If we're at start of line, check previous line
+        if x == 0 && y > 0 {
+            let prev_line = self.line_without_ending(y - 1)?;
+            if prev_line.len_chars() == 0 {
+                return Some((0, y - 1));
+            }
+        }
+
+        Some((x, y))
+    }
+
+    /// Finds the next occurrence of a search query
+    pub fn find_next(&self, query: &str, (x, y): (usize, usize)) -> Option<(usize, usize)> {
+        let (mut x, mut y) = self.find_word_end((x, y))?;
+
+        loop {
+            if y > self.len() {
+                return None;
+            }
+
+            let line = self.get(y)?;
+            let suffix = crate::unicode_utils::char_suffix(&line, x);
+            if let Some(pos) = suffix.find(query) {
+                let prefix_chars = suffix[..pos].chars().count();
+                return Some((prefix_chars + x, y));
+            }
+
+            x = 0;
+            y += 1;
+        }
+    }
+
+    /// Finds the previous occurrence of a search query
+    pub fn find_prev(&self, query: &str, (x, y): (usize, usize)) -> Option<(usize, usize)> {
+        let (mut x, mut y) = (x, y);
+
+        loop {
+            if y > self.len() {
+                return None;
+            }
+
+            let line = self.get(y)?;
+            let prefix = crate::unicode_utils::char_prefix(&line, x.min(line.chars().count()));
+            if let Some(pos) = prefix.rfind(query) {
+                return Some((prefix[..pos].chars().count(), y));
+            }
+
+            if y == 0 {
+                return None;
+            }
+
+            y -= 1;
+            x = self.get(y)?.chars().count();
+        }
+    }
+
+    /// Deletes the word at the current position
+    pub fn delete_word(&mut self, (x, y): (usize, usize)) -> Option<String> {
+        let start = (x, y);
+        let end = self.find_next_word((x, y))?;
+
+        let start_char = self.xy_to_char_idx(start.0, start.1);
+        let end_char = self.xy_to_char_idx(end.0, end.1);
+
+        // Get the text before removing (need to use byte indices for slice)
+        let result = self
+            .content
+            .get_slice(start_char..end_char)
+            .map(|s| s.to_string());
+
+        self.content.remove(start_char..end_char);
+        self.mark_changed();
+
+        result
+    }
+
+    /// Returns whether the buffer has unsaved changes
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Refreshes dirty state once per content revision, independently of undo history.
+    ///
+    /// An open transaction can change the text without advancing its history revision.
+    /// Compare exact Rope contents so manually restoring saved text is clean as well.
+    /// Recovery without a trustworthy baseline remains dirty until save or reload.
+    pub fn refresh_dirty(&mut self) {
+        if self.dirty_revision == self.revision {
+            return;
+        }
+        self.dirty = match &self.saved_content {
+            Some(saved) => {
+                !self.content.is_instance(saved)
+                    && (self.content.len_bytes() != saved.len_bytes() || self.content != *saved)
+            }
+            None => true,
+        };
+        self.dirty_revision = self.revision;
+    }
+
+    /// Records the current contents and history revision as the saved state.
+    pub fn mark_saved(&mut self) {
+        self.saved_content = Some(self.content.clone());
+        self.backing_file = self.file.as_ref().map(|file| BackingFileSnapshot {
+            path: PathBuf::from(file),
+            contents: Some(self.content.clone()),
+        });
+        self.external_file_change = None;
+        self.undo_history.mark_saved();
+        self.dirty = false;
+        self.dirty_revision = self.revision;
+    }
+
+    // Helper method to convert (x,y) coordinates to character index in the rope
+    fn xy_to_char_idx(&self, x: usize, y: usize) -> usize {
+        if y >= self.content.len_lines() {
+            return self.content.len_chars();
+        }
+
+        // Get the line start character index
+        let line_start_char = self.content.line_to_char(y);
+
+        // Clamp x to valid range
+        let x = x.min(self.line_char_len_without_ending(y));
+
+        line_start_char + x
+    }
+
+    pub(crate) fn line_char_len_without_ending(&self, line: usize) -> usize {
+        let line = self.content.line(line);
+        let mut len = line.len_chars();
+        if len > 0 && line.char(len - 1) == '\n' {
+            len -= 1;
+        }
+        if len > 0 && line.char(len - 1) == '\r' {
+            len -= 1;
+        }
+        len
+    }
+
+    /// Get the display width of a line
+    pub fn line_display_width(&self, y: usize) -> usize {
+        if let Some(line) = self.get(y) {
+            display_width(trim_line_ending(&line))
+        } else {
+            0
+        }
+    }
+
+    /// Convert a display column to a character index
+    pub fn column_to_char_index(&self, column: usize, y: usize) -> usize {
+        if let Some(line) = self.get(y) {
+            let line = trim_line_ending(&line);
+            column_to_char(line, column)
+        } else {
+            0
+        }
+    }
+
+    /// Convert a character index to a display column
+    pub fn char_index_to_column(&self, char_idx: usize, y: usize) -> usize {
+        if let Some(line) = self.get(y) {
+            let line = trim_line_ending(&line);
+            char_to_column(line, char_idx)
+        } else {
+            0
+        }
+    }
+
+    fn get_char_type(c: char) -> CharType {
+        if c.is_whitespace() {
+            CharType::Whitespace
+        } else if c.is_alphanumeric() || c == '_' {
+            CharType::Word
+        } else if c.is_ascii_punctuation() {
+            CharType::Punctuation
+        } else {
+            CharType::Symbol
+        }
+    }
+
+    fn line_without_ending(&self, line: usize) -> Option<RopeSlice<'_>> {
+        let line = self.content.get_line(line)?;
+        let mut len = line.len_chars();
+        if len > 0 && line.char(len - 1) == '\n' {
+            len -= 1;
+        }
+        if len > 0 && line.char(len - 1) == '\r' {
+            len -= 1;
+        }
+        Some(line.slice(..len))
+    }
+
+    fn first_non_whitespace_char(line: RopeSlice<'_>) -> Option<usize> {
+        line.chars()
+            .position(|character| Self::get_char_type(character) != CharType::Whitespace)
+    }
+
+    fn last_non_whitespace_at_or_before(line: RopeSlice<'_>, x: usize) -> Option<usize> {
+        line.chars_at(x + 1)
+            .reversed()
+            .position(|character| Self::get_char_type(character) != CharType::Whitespace)
+            .map(|offset| x - offset)
+    }
+
+    fn word_start_at_or_before(line: RopeSlice<'_>, x: usize, target_type: CharType) -> usize {
+        let matching = line
+            .chars_at(x + 1)
+            .reversed()
+            .take_while(|character| Self::get_char_type(*character) == target_type)
+            .count();
+        x + 1 - matching
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CharType {
+    Whitespace,
+    Word,
+    Punctuation,
+    Symbol,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    fn replace_all(buffer: &mut Buffer, text: &str) {
+        let end = buffer.char_idx_to_position(buffer.content.len_chars());
+        buffer.replace_range_raw(TextRange::new(TextPosition::new(0, 0), end), text);
+    }
+
+    fn commit_text(buffer: &mut Buffer, text: &str) {
+        use crate::undo::CursorSnapshot;
+        buffer
+            .undo_history
+            .begin_transaction("replace text", CursorSnapshot::default());
+        let end = buffer.char_idx_to_position(buffer.content.len_chars());
+        crate::editing::apply_transactional_replacement(
+            buffer,
+            TextRange::new(TextPosition::new(0, 0), end),
+            text,
+        );
+        buffer
+            .undo_history
+            .commit_transaction(CursorSnapshot::default());
+        buffer.refresh_dirty();
+    }
+
+    #[tokio::test]
+    async fn startup_file_loading_preserves_order_and_deduplicates_missing_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.rs");
+        let missing = directory.path().join("not-created.rs");
+        let last = directory.path().join("last.rs");
+        fs::write(&first, "first\n").unwrap();
+        fs::write(&last, "last\n").unwrap();
+        let first = first.to_string_lossy().into_owned();
+        let missing = missing.to_string_lossy().into_owned();
+        let last = last.to_string_lossy().into_owned();
+
+        let buffers = load_startup_buffers(&[
+            first.clone(),
+            missing.clone(),
+            first.clone(),
+            last.clone(),
+            missing.clone(),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(
+            buffers
+                .iter()
+                .map(|buffer| buffer.file.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            [first.as_str(), missing.as_str(), last.as_str()]
+        );
+        assert_eq!(buffers[1].contents(), "\n");
+        assert!(!Path::new(&missing).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_file_loading_collapses_hard_links_and_symbolic_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.rs");
+        let hard_link = directory.path().join("hard-link.rs");
+        let symbolic = directory.path().join("symbolic.rs");
+        let distinct = directory.path().join("distinct.rs");
+        fs::write(&original, "shared\n").unwrap();
+        fs::hard_link(&original, &hard_link).unwrap();
+        symlink(&original, &symbolic).unwrap();
+        fs::write(&distinct, "distinct\n").unwrap();
+        let hard_link = hard_link.to_string_lossy().into_owned();
+        let original = original.to_string_lossy().into_owned();
+        let symbolic = symbolic.to_string_lossy().into_owned();
+        let distinct = distinct.to_string_lossy().into_owned();
+
+        let buffers =
+            load_startup_buffers(&[hard_link.clone(), original, symbolic, distinct.clone()])
+                .await
+                .unwrap();
+
+        assert_eq!(buffers.len(), 2);
+        assert_eq!(buffers[0].file.as_deref(), Some(hard_link.as_str()));
+        assert_eq!(buffers[0].contents(), "shared\n");
+        assert_eq!(buffers[1].file.as_deref(), Some(distinct.as_str()));
+    }
+
+    #[test]
+    fn dirty_tracks_exact_contents_during_an_open_transaction() {
+        let original = "a👋\r\nbeta\n";
+        let mut buffer = Buffer::new(None, original.to_string());
+        buffer
+            .undo_history
+            .begin_transaction("insert session", crate::undo::CursorSnapshot::default());
+        let revision = buffer.revision();
+        for changed in ["a🙂\r\nbeta\n", "a👋\nbeta\n", "a👋\r\nbeta"] {
+            replace_all(&mut buffer, changed);
+            assert!(buffer.is_dirty());
+            assert!(!buffer.undo_history.is_dirty());
+            replace_all(&mut buffer, original);
+            assert!(!buffer.is_dirty());
+        }
+        assert!(buffer.revision() > revision);
+        assert!(buffer.undo_history.is_transaction_active());
+    }
+
+    #[test]
+    fn dirty_clears_on_an_equivalent_undo_branch_and_after_history_pruning() {
+        let mut buffer = Buffer::new(None, "abc".to_string());
+        commit_text(&mut buffer, "saved");
+        buffer.mark_saved();
+        let mut history = std::mem::take(&mut buffer.undo_history);
+        assert!(history.undo(&mut buffer).is_some());
+        buffer.undo_history = history;
+        assert!(buffer.is_dirty());
+
+        commit_text(&mut buffer, "saved");
+        assert!(buffer.undo_history.is_dirty());
+        assert_eq!(buffer.undo_history.node_count(), 2);
+        assert!(!buffer.is_dirty());
+
+        buffer.undo_history.set_max_nodes(1);
+        commit_text(&mut buffer, "other");
+        commit_text(&mut buffer, "saved");
+        assert_eq!(buffer.undo_history.node_count(), 1);
+        assert!(!buffer.is_dirty());
+    }
+
+    #[test]
+    fn dirty_baseline_moves_only_after_a_successful_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.txt");
+        let second = directory.path().join("second.txt");
+        fs::write(&first, "abc").unwrap();
+        let mut buffer = Buffer::new(Some(first.to_string_lossy().into_owned()), "abc".into());
+
+        replace_all(&mut buffer, "def");
+        let invalid = directory.path().join("missing/failed.txt");
+        assert!(buffer.save_as(&invalid.to_string_lossy()).is_err());
+        assert_eq!(buffer.file.as_deref(), first.to_str());
+        assert!(buffer.is_dirty());
+        replace_all(&mut buffer, "abc");
+        assert!(!buffer.is_dirty());
+
+        replace_all(&mut buffer, "def");
+        buffer.save().unwrap();
+        assert!(!buffer.is_dirty());
+        replace_all(&mut buffer, "abc");
+        assert!(buffer.is_dirty());
+        buffer.save_as(&second.to_string_lossy()).unwrap();
+        replace_all(&mut buffer, "def");
+        assert!(buffer.is_dirty());
+        replace_all(&mut buffer, "abc");
+        assert!(!buffer.is_dirty());
+        assert_eq!(fs::read_to_string(first).unwrap(), "def");
+        assert_eq!(fs::read_to_string(second).unwrap(), "abc");
+    }
+
+    #[tokio::test]
+    async fn save_refuses_same_size_external_changes_and_preserves_local_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.txt");
+        fs::write(&path, "first\n").unwrap();
+        let mut buffer = Buffer::load_or_create(Some(path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+
+        replace_all(&mut buffer, "local\n");
+        fs::write(&path, "other\n").unwrap();
+        let error = buffer.save().unwrap_err();
+
+        assert!(error.to_string().contains("changed on disk"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "other\n");
+        assert_eq!(buffer.contents(), "local\n");
+        assert!(buffer.is_dirty());
+        assert_eq!(
+            buffer.external_file_change(),
+            Some(ExternalFileChange::Modified)
+        );
+        assert!(buffer.has_external_file_conflict());
+    }
+
+    #[tokio::test]
+    async fn backing_file_change_distinguishes_modification_creation_and_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let existing_path = directory.path().join("existing.txt");
+        fs::write(&existing_path, "first\n").unwrap();
+        let existing = Buffer::load_or_create(Some(existing_path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+
+        assert_eq!(existing.detect_external_file_change().unwrap(), None);
+        fs::write(&existing_path, "other\n").unwrap();
+        assert_eq!(
+            existing.detect_external_file_change().unwrap(),
+            Some(ExternalFileChange::Modified)
+        );
+        fs::write(&existing_path, "first\n").unwrap();
+        assert_eq!(existing.detect_external_file_change().unwrap(), None);
+        fs::remove_file(&existing_path).unwrap();
+        assert_eq!(
+            existing.detect_external_file_change().unwrap(),
+            Some(ExternalFileChange::Deleted)
+        );
+
+        let missing_path = directory.path().join("created.txt");
+        let missing = Buffer::load_or_create(Some(missing_path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        assert_eq!(missing.detect_external_file_change().unwrap(), None);
+        fs::write(&missing_path, "created\n").unwrap();
+        assert_eq!(
+            missing.detect_external_file_change().unwrap(),
+            Some(ExternalFileChange::Created)
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_save_explicitly_overwrites_and_refreshes_the_disk_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.txt");
+        fs::write(&path, "first\n").unwrap();
+        let mut buffer = Buffer::load_or_create(Some(path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        replace_all(&mut buffer, "local\n");
+        fs::write(&path, "other\n").unwrap();
+
+        assert!(buffer.save().is_err());
+        assert!(buffer.has_external_file_conflict());
+        buffer.force_save().unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "local\n");
+        assert!(!buffer.is_dirty());
+        assert!(!buffer.has_external_file_conflict());
+        fs::write(&path, "again\n").unwrap();
+        assert!(buffer.save().is_err());
+    }
+
+    #[tokio::test]
+    async fn forced_save_as_overwrites_only_the_explicit_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.txt");
+        let destination = directory.path().join("destination.txt");
+        fs::write(&source, "source\n").unwrap();
+        fs::write(&destination, "destination\n").unwrap();
+        let mut buffer = Buffer::load_or_create(Some(source.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        replace_all(&mut buffer, "local\n");
+
+        assert!(buffer.save_as(&destination.to_string_lossy()).is_err());
+        buffer
+            .force_save_as(&destination.to_string_lossy())
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(&source).unwrap(), "source\n");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "local\n");
+        assert_eq!(buffer.file.as_deref(), destination.to_str());
+        assert!(!buffer.has_external_file_conflict());
+    }
+
+    #[test]
+    fn agent_edits_can_extend_but_cannot_replace_unsaved_human_changes() {
+        let mut buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        replace_all(&mut buffer, "human first\nsecond\n");
+
+        assert!(buffer.preserves_unsaved_edits("human first\nagent second\n"));
+        assert!(!buffer.preserves_unsaved_edits("agent first\nsecond\n"));
+        assert!(!buffer.preserves_unsaved_edits("first\nsecond\n"));
+    }
+
+    #[test]
+    fn agent_edits_do_not_reinsert_text_deleted_by_the_user() {
+        let mut buffer = Buffer::new(None, "remove\nkeep\n".to_string());
+        replace_all(&mut buffer, "keep\n");
+
+        assert!(!buffer.preserves_unsaved_edits("remove\nkeep\n"));
+        assert!(buffer.preserves_unsaved_edits("keep\nagent\n"));
+    }
+
+    #[tokio::test]
+    async fn save_refuses_files_created_or_deleted_outside_red() {
+        let directory = tempfile::tempdir().unwrap();
+        let created_path = directory.path().join("created.txt");
+        let mut created = Buffer::load_or_create(Some(created_path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        replace_all(&mut created, "local\n");
+        fs::write(&created_path, "external\n").unwrap();
+
+        assert!(created
+            .save()
+            .unwrap_err()
+            .to_string()
+            .contains("changed on disk"));
+        assert_eq!(fs::read_to_string(&created_path).unwrap(), "external\n");
+        assert!(created.is_dirty());
+
+        let deleted_path = directory.path().join("deleted.txt");
+        fs::write(&deleted_path, "original\n").unwrap();
+        let mut deleted = Buffer::from_file(Some(deleted_path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        replace_all(&mut deleted, "local\n");
+        fs::remove_file(&deleted_path).unwrap();
+
+        assert!(deleted
+            .save()
+            .unwrap_err()
+            .to_string()
+            .contains("changed on disk"));
+        assert!(!deleted_path.exists());
+        assert!(deleted.is_dirty());
+    }
+
+    #[tokio::test]
+    async fn successful_saves_advance_the_disk_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.txt");
+        fs::write(&path, "first\n").unwrap();
+        let mut buffer = Buffer::load_or_create(Some(path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+
+        replace_all(&mut buffer, "second\n");
+        buffer.save().unwrap();
+        replace_all(&mut buffer, "third\n");
+        buffer.save().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "third\n");
+
+        replace_all(&mut buffer, "local\n");
+        fs::write(&path, "other\n").unwrap();
+
+        assert!(buffer
+            .save()
+            .unwrap_err()
+            .to_string()
+            .contains("changed on disk"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "other\n");
+    }
+
+    #[tokio::test]
+    async fn save_as_preserves_existing_destinations_and_external_source_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.txt");
+        let existing = directory.path().join("existing.txt");
+        let recovered = directory.path().join("recovered.txt");
+        fs::write(&source, "source\n").unwrap();
+        fs::write(&existing, "existing\n").unwrap();
+        let mut buffer = Buffer::load_or_create(Some(source.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        replace_all(&mut buffer, "local\n");
+
+        let error = buffer.save_as(&existing.to_string_lossy()).unwrap_err();
+        assert!(error.to_string().contains("Refusing to overwrite"));
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "existing\n");
+        assert_eq!(buffer.file.as_deref(), source.to_str());
+        assert!(buffer.is_dirty());
+
+        fs::write(&source, "external\n").unwrap();
+        buffer.save_as(&recovered.to_string_lossy()).unwrap();
+
+        assert_eq!(fs::read_to_string(&source).unwrap(), "external\n");
+        assert_eq!(fs::read_to_string(&recovered).unwrap(), "local\n");
+        assert_eq!(buffer.file.as_deref(), recovered.to_str());
+        assert!(!buffer.is_dirty());
+    }
+
+    #[test]
+    fn recovered_buffers_preserve_their_original_saved_disk_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recovered.txt");
+        fs::write(&path, "external\n").unwrap();
+        let mut buffer = Buffer::from_session_snapshot(
+            Some(path.to_string_lossy().into_owned()),
+            "local\n".into(),
+            Some("saved\n".into()),
+            true,
+            1,
+            UndoHistory::default(),
+        );
+
+        assert!(buffer
+            .save()
+            .unwrap_err()
+            .to_string()
+            .contains("changed on disk"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
+        assert!(buffer.is_dirty());
+    }
+
+    #[test]
+    fn dirty_recovery_uses_the_saved_baseline_and_preserves_unknown_state() {
+        let mut restored = Buffer::from_session_snapshot(
+            None,
+            "modified".into(),
+            Some("saved".into()),
+            true,
+            19,
+            UndoHistory::default(),
+        );
+        assert!(restored.is_dirty());
+        replace_all(&mut restored, "saved");
+        assert!(!restored.is_dirty());
+
+        let mut unknown = Buffer::from_session_snapshot(
+            None,
+            "recovered".into(),
+            None,
+            true,
+            0,
+            UndoHistory::default(),
+        );
+        unknown.refresh_dirty();
+        assert!(unknown.is_dirty());
+        replace_all(&mut unknown, "different");
+        replace_all(&mut unknown, "recovered");
+        assert!(unknown.is_dirty());
+        unknown.mark_saved();
+        assert!(!unknown.is_dirty());
+    }
+
+    #[test]
+    fn dirty_recovery_preserves_an_empty_unnamed_buffer() {
+        let mut buffer = Buffer::from_session_snapshot(
+            None,
+            String::new(),
+            None,
+            false,
+            0,
+            UndoHistory::default(),
+        );
+        assert_eq!(buffer.contents(), "");
+        replace_all(&mut buffer, "x");
+        assert!(buffer.is_dirty());
+        replace_all(&mut buffer, "");
+        assert!(!buffer.is_dirty());
+    }
+
+    #[test]
+    fn syntax_selection_is_buffer_local_and_does_not_change_revision() {
+        let mut buffer = Buffer::new(Some("notes.txt".to_string()), "fn main() {}".to_string());
+        let revision = buffer.revision();
+
+        assert_eq!(buffer.syntax_selection(), &SyntaxSelection::Auto);
+
+        buffer.set_syntax_selection(SyntaxSelection::Language("rust".to_string()));
+        assert_eq!(
+            buffer.syntax_selection(),
+            &SyntaxSelection::Language("rust".to_string())
+        );
+        assert_eq!(buffer.revision(), revision);
+        assert!(!buffer.is_dirty());
+
+        buffer.set_syntax_selection(SyntaxSelection::Off);
+        assert_eq!(buffer.syntax_selection(), &SyntaxSelection::Off);
+        assert_eq!(buffer.revision(), revision);
+    }
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("red-{name}-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn test_home_dir() -> PathBuf {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .expect("HOME or USERPROFILE should be set for tests")
+    }
+
+    #[tokio::test]
+    async fn load_or_create_expands_home_paths() {
+        let home = test_home_dir();
+        let dir_name = format!(".red-load-home-{}", uuid::Uuid::new_v4());
+        let dir = home.join(&dir_name);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        fs::write(&file, "theme = \"kanso\"\n").unwrap();
+
+        let buffer = Buffer::load_or_create(Some(format!("~/{dir_name}/config.toml")))
+            .await
+            .unwrap();
+
+        assert_eq!(buffer.contents(), "theme = \"kanso\"\n");
+        assert_eq!(buffer.file, Some(file.to_string_lossy().into_owned()));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_or_create_stores_relative_paths_as_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("red-relative-buffer-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let absolute = directory.path().join("main.c");
+        fs::write(&absolute, "int main(void) { return 0; }\n").unwrap();
+        let relative = absolute.strip_prefix(&cwd).unwrap();
+
+        let buffer = Buffer::load_or_create(Some(relative.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+
+        assert_eq!(buffer.file.as_deref(), absolute.to_str());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_or_create_reads_through_symlinked_directory() {
+        let root = unique_temp_dir("symlink-open");
+        let real_dir = root.join("real");
+        let link_dir = root.join("link");
+        fs::create_dir_all(&real_dir).unwrap();
+        symlink(&real_dir, &link_dir).unwrap();
+        fs::write(real_dir.join("config.toml"), "theme = \"latte\"\n").unwrap();
+
+        let link_path = link_dir.join("config.toml");
+        let buffer = Buffer::load_or_create(Some(link_path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+
+        assert_eq!(buffer.contents(), "theme = \"latte\"\n");
+        assert_eq!(buffer.file, Some(link_path.to_string_lossy().into_owned()));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_through_symlinked_directory() {
+        let root = unique_temp_dir("symlink-save");
+        let real_dir = root.join("real");
+        let link_dir = root.join("link");
+        fs::create_dir_all(&real_dir).unwrap();
+        symlink(&real_dir, &link_dir).unwrap();
+
+        let link_path = link_dir.join("config.toml");
+        let mut buffer = Buffer::new(
+            Some(link_path.to_string_lossy().into_owned()),
+            "theme = \"zen\"\n".to_string(),
+        );
+
+        buffer.save().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(real_dir.join("config.toml")).unwrap(),
+            "theme = \"zen\"\n"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_and_save_preserves_empty_file() {
+        let root = unique_temp_dir("empty-file");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("empty.txt");
+        fs::write(&file, "").unwrap();
+
+        let mut buffer = Buffer::load_or_create(Some(file.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+
+        assert_eq!(buffer.contents(), "");
+
+        buffer.save().unwrap();
+
+        assert_eq!(fs::read(&file).unwrap(), b"");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_or_create_errors_for_broken_symlink() {
+        let root = unique_temp_dir("broken-symlink");
+        fs::create_dir_all(&root).unwrap();
+        let link_path = root.join("config.toml");
+        symlink(root.join("missing.toml"), &link_path).unwrap();
+
+        let err = Buffer::load_or_create(Some(link_path.to_string_lossy().into_owned()))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("not found"));
+
+        fs::remove_file(link_path).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn test_find_next_word() {
+        let buffer = Buffer::new(
+            None,
+            [
+                "struct Person {".to_string(),
+                "    name: String,".to_string(),
+                "    age: usize,".to_string(),
+                "}".to_string(),
+                "".to_string(),
+                "fn main() {".to_string(),
+                "    let mut person = Person {".to_string(),
+                "        name: \"Felipe\".to_string(),".to_string(),
+                "        age: 46,".to_string(),
+            ]
+            .join("\n"),
+        );
+
+        // first line
+        assert_eq!(buffer.find_next_word((0, 0)), Some((7, 0))); // struct -> Person
+        assert_eq!(buffer.find_next_word((7, 0)), Some((14, 0))); // Person -> {
+        assert_eq!(buffer.find_next_word((14, 0)), Some((4, 1))); // { -> name:
+
+        // fourth line
+        assert_eq!(buffer.find_next_word((0, 3)), Some((0, 4))); // } -> empty line
+
+        // fifth line (empty line)
+        assert_eq!(buffer.find_next_word((0, 4)), Some((0, 5))); // empty line -> fn
+
+        // sixth line
+        assert_eq!(buffer.find_next_word((0, 5)), Some((3, 5))); // fn -> main
+        assert_eq!(buffer.find_next_word((3, 5)), Some((7, 5))); // main -> (
+        assert_eq!(buffer.find_next_word((7, 5)), Some((10, 5))); // ( -> skips the closing parens
+                                                                  // -> {
+
+        // eighth line
+        assert_eq!(buffer.find_next_word((21, 7)), Some((23, 7))); // "Felipe" -> skips the dot -> to_string
+    }
+
+    #[test]
+    fn test_find_next_word_matches_nvim_delimiter_boundaries() {
+        let buffer = Buffer::new(None, "foo:bar baz".to_string());
+
+        assert_eq!(buffer.find_next_word((0, 0)), Some((3, 0))); // foo -> :
+        assert_eq!(buffer.find_next_word((1, 0)), Some((3, 0))); // oo -> :
+        assert_eq!(buffer.find_next_word((2, 0)), Some((3, 0))); // final o -> :
+        assert_eq!(buffer.find_next_word((3, 0)), Some((4, 0))); // : -> bar
+        assert_eq!(buffer.find_next_word((4, 0)), Some((8, 0))); // bar -> baz
+        assert_eq!(buffer.find_next_word((7, 0)), Some((8, 0))); // space -> baz
+    }
+
+    #[test]
+    fn test_find_next_word_matches_nvim_generic_delimiters() {
+        let buffer = Buffer::new(None, "Option<Result<T, E>> rest".to_string());
+
+        assert_eq!(buffer.find_next_word((0, 0)), Some((6, 0))); // Option -> <
+        assert_eq!(buffer.find_next_word((5, 0)), Some((6, 0))); // final n -> <
+        assert_eq!(buffer.find_next_word((6, 0)), Some((7, 0))); // < -> Result
+        assert_eq!(buffer.find_next_word((12, 0)), Some((13, 0))); // final t -> <
+        assert_eq!(buffer.find_next_word((17, 0)), Some((18, 0))); // E -> >>
+        assert_eq!(buffer.find_next_word((18, 0)), Some((21, 0))); // >> -> rest
+        assert_eq!(buffer.find_next_word((19, 0)), Some((21, 0))); // final > -> rest
+    }
+
+    #[test]
+    fn test_find_next_word_moves_from_prefix_punctuation_to_keyword() {
+        let buffer = Buffer::new(None, "&Config::path".to_string());
+
+        assert_eq!(buffer.find_next_word((0, 0)), Some((1, 0))); // & -> Config
+        assert_eq!(buffer.find_next_word((6, 0)), Some((7, 0))); // final g -> ::
+        assert_eq!(buffer.find_next_word((7, 0)), Some((9, 0))); // :: -> path
+    }
+
+    #[test]
+    fn test_find_next_word_treats_digits_as_keyword_chars() {
+        let buffer = Buffer::new(None, "value123 next".to_string());
+
+        assert_eq!(buffer.find_next_word((0, 0)), Some((9, 0)));
+        assert_eq!(buffer.find_next_word((4, 0)), Some((9, 0)));
+        assert_eq!(buffer.find_next_word((7, 0)), Some((9, 0)));
+    }
+
+    #[test]
+    fn test_find_next_word_moves_to_eof_like_nvim() {
+        let buffer = Buffer::new(None, "final".to_string());
+
+        assert_eq!(buffer.find_next_word((0, 0)), Some((4, 0)));
+        assert_eq!(buffer.find_next_word((3, 0)), Some((4, 0)));
+        assert_eq!(buffer.find_next_word((4, 0)), None);
+    }
+
+    #[test]
+    fn word_navigation_preserves_unicode_crlf_and_long_rope_lines() {
+        let buffer = Buffer::new(None, "αβ_世界 :: 👋\r\n  終わり".to_string());
+
+        assert_eq!(buffer.find_next_word((0, 0)), Some((6, 0)));
+        assert_eq!(buffer.find_next_word((6, 0)), Some((9, 0)));
+        assert_eq!(buffer.find_next_word((9, 0)), Some((2, 1)));
+        assert_eq!(buffer.find_prev_word((9, 0)), Some((6, 0)));
+        assert_eq!(buffer.find_prev_word((6, 0)), Some((0, 0)));
+        assert_eq!(buffer.find_prev_word((2, 1)), Some((9, 0)));
+        assert_eq!(buffer.find_next_word((usize::MAX, 1)), None);
+        assert_eq!(buffer.find_prev_word((0, 9)), None);
+
+        let prefix = "ordinary_identifier ".repeat(512);
+        let offset = prefix.len();
+        let long_line = Buffer::new(None, format!("{prefix}target_identifier remaining"));
+        assert_eq!(
+            long_line.find_next_word((offset, 0)),
+            Some((offset + 18, 0))
+        );
+        assert_eq!(
+            long_line.find_prev_word((offset + 17, 0)),
+            Some((offset, 0))
+        );
+    }
+
+    #[test]
+    fn empty_line_checks_distinguish_crlf_from_whitespace_and_missing_lines() {
+        let buffer = Buffer::new(None, "alpha\r\n\r\n  \r\n\n終わり".to_string());
+
+        assert!(!buffer.line_is_empty(0));
+        assert!(buffer.line_is_empty(1));
+        assert!(!buffer.line_is_empty(2));
+        assert!(buffer.line_is_empty(3));
+        assert!(!buffer.line_is_empty(4));
+        assert!(!buffer.line_is_empty(5));
+    }
+
+    #[test]
+    fn navigable_line_boundaries_preserve_trailing_breaks_and_unicode() {
+        for (contents, expected_line, expected_count) in [
+            ("", 0, 1),
+            ("\n", 0, 1),
+            ("\n\n", 1, 2),
+            ("alpha", 0, 1),
+            ("alpha\n", 0, 1),
+            ("alpha\n\n", 1, 2),
+            ("alpha\nfinal", 1, 2),
+            ("alpha\r\n", 0, 1),
+            ("alpha\r\n\r\n", 1, 2),
+            ("alpha\r\n漢字 👨‍👩‍👧 e\u{301}", 1, 2),
+        ] {
+            let buffer = Buffer::new(Some("source.txt".to_string()), contents.to_string());
+            assert_eq!(buffer.last_navigable_line(), expected_line, "{contents:?}");
+            assert_eq!(
+                buffer.navigable_line_count(),
+                expected_count,
+                "{contents:?}"
+            );
+        }
+
+        let unnamed = Buffer::new(None, String::new());
+        assert_eq!(unnamed.last_navigable_line(), 0);
+        assert_eq!(unnamed.navigable_line_count(), 1);
+    }
+
+    #[test]
+    fn test_find_prev_word() {
+        let buffer = Buffer::new(
+            None,
+            [
+                "struct Person {".to_string(),
+                "    name: String,".to_string(),
+                "    age: usize,".to_string(),
+                "}".to_string(),
+                "".to_string(),
+                "fn main() {".to_string(),
+                "    let mut person = Person {".to_string(),
+                "        name: \"Felipe\".to_string(),".to_string(),
+                "        age: 46,".to_string(),
+                "    };".to_string(),
+                "".to_string(),
+                "    println!(\"Hello, {}!\", person.name);".to_string(),
+                "".to_string(),
+                "    person.age = \"25\";".to_string(),
+                "    person.name = \"22\";".to_string(),
+                "}".to_string(),
+            ]
+            .join("\n"),
+        );
+
+        assert_eq!(buffer.find_prev_word((0, 15)), Some((21, 14))); // } -> " before ;
+        assert_eq!(buffer.find_prev_word((4, 14)), Some((20, 13))); // } -> empty line
+        assert_eq!(buffer.find_prev_word((0, 0)), None); // struct -> start of buffer
+    }
+
+    #[test]
+    fn test_find_prev_search_skips_current_match_start() {
+        let buffer = Buffer::new(None, "alpha beta alpha gamma alpha".to_string());
+
+        assert_eq!(buffer.find_prev("alpha", (23, 0)), Some((11, 0)));
+        assert_eq!(buffer.find_prev("alpha", (11, 0)), Some((0, 0)));
+    }
+
+    #[test]
+    fn regex_matches_preserve_rope_positions_for_unicode_and_line_breaks() {
+        let contents =
+            "α\r\nbeta\u{000B}γ\u{000C}delta\u{0085}終\u{2028}emoji 👋\u{2029}tail\rfinal";
+        let buffer = Buffer::new(Some("unicode.txt".to_string()), contents.to_string());
+
+        for pattern in [
+            r"(?s).",
+            r"(?s)beta.*?emoji",
+            r"(?m)^.*$",
+            r"(?:α|終|👋|final)",
+            r"\b",
+        ] {
+            let regex = Regex::new(pattern).unwrap();
+            let expected = regex
+                .find_iter(contents)
+                .filter(|match_| match_.start() != match_.end())
+                .map(|match_| {
+                    let position = |byte| {
+                        let character = buffer.content.byte_to_char(byte);
+                        let line = buffer.content.char_to_line(character);
+                        (character - buffer.content.line_to_char(line), line)
+                    };
+                    let (start_x, start_y) = position(match_.start());
+                    let (end_x, end_y) = position(match_.end());
+                    SearchMatch {
+                        start_x,
+                        start_y,
+                        end_x,
+                        end_y,
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(buffer.regex_matches(&regex), expected, "pattern: {pattern}");
+        }
+    }
+
+    #[test]
+    fn sparse_regex_matches_preserve_indexed_unicode_and_crlf_positions() {
+        let prefix = "α\r\nbeta\u{000B}γ\u{000C}終\u{0085}👋\u{2028}tail\u{2029}".repeat(256);
+        let contents = format!("{prefix}first needle\r\n{prefix}second needle");
+        let buffer = Buffer::new(Some("unicode.txt".to_string()), contents.clone());
+
+        for pattern in ["needle", r"(?s)first.*?second", r"\b"] {
+            let regex = Regex::new(pattern).unwrap();
+            let expected = regex
+                .find_iter(&contents)
+                .filter(|matched| matched.start() != matched.end())
+                .map(|matched| {
+                    let position = |byte| {
+                        let character = buffer.content.byte_to_char(byte);
+                        let line = buffer.content.char_to_line(character);
+                        (character - buffer.content.line_to_char(line), line)
+                    };
+                    let (start_x, start_y) = position(matched.start());
+                    let (end_x, end_y) = position(matched.end());
+                    SearchMatch {
+                        start_x,
+                        start_y,
+                        end_x,
+                        end_y,
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(buffer.regex_matches(&regex), expected, "pattern: {pattern}");
+        }
+    }
+
+    #[test]
+    fn regex_match_from_finds_one_match_in_either_direction() {
+        let contents = "α target\nmiddle target\nfinal target";
+        let buffer = Buffer::new(Some("unicode.txt".to_string()), contents.to_string());
+        let regex = Regex::new("target").unwrap();
+
+        let forward = buffer
+            .regex_match_from(&regex, (0, 0), /*backward*/ false, /*wrap*/ false)
+            .unwrap();
+        assert_eq!((forward.start_x, forward.start_y), (2, 0));
+
+        let backward = buffer
+            .regex_match_from(&regex, (0, 2), /*backward*/ true, /*wrap*/ false)
+            .unwrap();
+        assert_eq!((backward.start_x, backward.start_y), (7, 1));
+
+        let wrapped = buffer
+            .regex_match_from(&regex, (0, 0), /*backward*/ true, /*wrap*/ true)
+            .unwrap();
+        assert_eq!((wrapped.start_x, wrapped.start_y), (6, 2));
+
+        assert!(buffer
+            .regex_match_from(&Regex::new(r"\b").unwrap(), (0, 0), false, true)
+            .is_none());
+    }
+
+    #[test]
+    fn test_file_end() {
+        let buffer = Buffer::new(None, "a\nb\nc".to_string());
+        assert_eq!(buffer.get(3), None);
+    }
+
+    #[test]
+    fn crlf_line_endings_do_not_count_toward_display_positions() {
+        let buffer = Buffer::new(None, "abc\r\ndef\r\n".to_string());
+
+        assert_eq!(buffer.line_display_width(0), 3);
+        assert_eq!(buffer.column_to_char_index(3, 0), 3);
+        assert_eq!(buffer.char_index_to_column(3, 0), 3);
+        assert_eq!(buffer.position_to_char_idx(TextPosition::new(0, 99)), 3);
+    }
+
+    #[test]
+    fn lsp_positions_preserve_unicode_crlf_and_clamped_boundaries() {
+        let buffer = Buffer::new(None, "😀abc\r\nnext".to_string());
+        assert_eq!(
+            buffer.position_to_lsp(TextPosition::new(0, 1)),
+            crate::lsp::Position {
+                line: 0,
+                character: 2,
+            }
+        );
+        assert_eq!(
+            buffer.position_to_lsp(TextPosition::new(0, usize::MAX)),
+            crate::lsp::Position {
+                line: 0,
+                character: 5,
+            }
+        );
+        assert_eq!(
+            buffer.position_to_lsp(TextPosition::new(usize::MAX, 0)),
+            crate::lsp::Position {
+                line: 1,
+                character: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn line_ranges_preserve_exact_line_endings_and_final_line() {
+        for contents in ["", "a", "a\n", "a\nb", "a\r\nb", "α\r\nβ\n終"] {
+            let buffer = Buffer::new(Some("test.txt".to_string()), contents.to_string());
+
+            assert_eq!(buffer.line_range_contents(0, usize::MAX), contents);
+            assert_eq!(buffer.line_range_byte_len(0, usize::MAX), contents.len());
+            for start in 0..=buffer.content.len_lines() + 1 {
+                for end in 0..=buffer.content.len_lines() + 1 {
+                    let (text, offsets) = buffer.line_range_contents_with_offsets(start, end);
+                    assert_eq!(text, buffer.line_range_contents(start, end));
+                    let clamped_start = start.min(buffer.content.len_lines());
+                    let clamped_end = end.min(buffer.content.len_lines()).max(clamped_start);
+                    let mut expected = Vec::with_capacity(clamped_end - clamped_start + 1);
+                    let mut bytes = 0;
+                    for line in clamped_start..clamped_end {
+                        expected.push(bytes);
+                        bytes += buffer.get(line).unwrap().len();
+                    }
+                    expected.push(bytes);
+                    assert_eq!(offsets, expected, "{contents:?}: {start}..{end}");
+                }
+            }
+        }
+
+        let buffer = Buffer::new(Some("test.txt".to_string()), "zero\r\none\ntwo".to_string());
+        assert_eq!(buffer.line_range_contents(0, 1), "zero\r\n");
+        assert_eq!(buffer.line_range_contents(1, 2), "one\n");
+        assert_eq!(buffer.line_range_contents(1, 3), "one\ntwo");
+        assert_eq!(buffer.line_range_contents(2, 99), "two");
+        assert_eq!(buffer.line_range_contents(3, 99), "");
+        assert_eq!(buffer.line_range_contents(2, 1), "");
+        assert_eq!(buffer.line_range_byte_len(0, 1), "zero\r\n".len());
+        assert_eq!(buffer.line_range_byte_len(1, 3), "one\ntwo".len());
+        assert_eq!(buffer.line_range_byte_len(2, 1), 0);
+
+        let unicode = Buffer::new(None, "αβγ\r\n終わり".to_string());
+        assert_eq!(unicode.line_prefix_contents(0, 2), "αβ");
+        assert_eq!(unicode.line_prefix_contents(1, 99), "終わり");
+        assert_eq!(unicode.line_prefix_contents(2, 99), "");
+        assert_eq!(
+            unicode
+                .preceding_lines(2)
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>(),
+            vec!["終わり", "αβγ\r\n"]
+        );
+        assert!(unicode.preceding_lines(0).next().is_none());
+        assert_eq!(
+            unicode
+                .preceding_lines(usize::MAX)
+                .next()
+                .unwrap()
+                .to_string(),
+            "終わり"
+        );
+    }
+
+    #[test]
+    fn text_in_char_range_matches_across_rope_chunks() {
+        let prefix = "a".repeat(4095);
+        let target = "👋終λ";
+        let suffix = "b".repeat(4095);
+        let buffer = Buffer::new(None, format!("{prefix}{target}{suffix}"));
+        let start = prefix.chars().count();
+        let end = start + target.chars().count();
+
+        assert!(buffer.text_in_char_range_matches(start, end, target));
+        assert!(!buffer.text_in_char_range_matches(start, end, "👋終x"));
+        assert!(!buffer.text_in_char_range_matches(start, end + suffix.len() + 1, target));
+    }
+
+    #[test]
+    fn revision_advances_only_when_content_changes() {
+        let mut buffer = Buffer::new(None, "abc".to_string());
+        let initial_revision = buffer.revision();
+
+        buffer.insert(1, 0, 'x');
+        assert_eq!(buffer.revision(), initial_revision + 1);
+
+        let changed_revision = buffer.revision();
+        buffer.remove(99, 0);
+        assert_eq!(buffer.revision(), changed_revision);
+
+        buffer.remove(1, 0);
+        assert_eq!(buffer.revision(), changed_revision + 1);
+    }
+
+    #[test]
+    fn test_viewport() {
+        let buffer = Buffer::new(
+            Some("sample".to_string()),
+            "a\nb\nc\nd\n\ne\n\nf".to_string(),
+        );
+
+        assert_eq!(buffer.viewport(0, 2), "a\nb\n");
+    }
+
+    #[test]
+    fn test_viewport_with_small_buffer() {
+        let buffer = Buffer::new(Some("sample".to_string()), "a\nb".to_string());
+        assert_eq!(buffer.viewport(0, 5), "a\nb");
+    }
+
+    #[test]
+    fn test_is_in_word() {
+        let text = "use std::{\n    collections::HashMap,\n    io::{self, Write},\n};";
+        let buffer = Buffer::new(None, text.to_string());
+
+        assert!(buffer.is_in_word((0, 0)));
+        assert!(buffer.is_in_word((1, 0)));
+        assert!(buffer.is_in_word((2, 0)));
+        assert!(!buffer.is_in_word((3, 0)));
+        assert!(!buffer.is_in_word((7, 0)));
+        assert!(!buffer.is_in_word((8, 0)));
+    }
+
+    #[test]
+    fn test_find_word_end() {
+        let text = "use std::{\n    collections::HashMap,\n    io::{self, Write},\n};";
+        let buffer = Buffer::new(None, text.to_string());
+
+        let word_end = buffer.find_word_end((0, 0));
+        assert_eq!(word_end.unwrap(), (3, 0));
+
+        let word_end = buffer.find_word_end((3, 0));
+        assert_eq!(word_end.unwrap(), (3, 0));
+
+        let word_end = buffer.find_word_end((4, 0));
+        assert_eq!(word_end.unwrap(), (7, 0));
+
+        let word_end = buffer.find_word_end((7, 0));
+        assert_eq!(word_end.unwrap(), (7, 0));
+    }
+
+    #[test]
+    fn word_end_motion_preserves_unicode_scalars_and_out_of_range_positions() {
+        let buffer = Buffer::new(None, "prefix αβ_世界 👋\r\nsecond".to_string());
+
+        assert_eq!(buffer.find_word_end((7, 0)), Some((12, 0)));
+        assert_eq!(buffer.find_word_end((12, 0)), Some((12, 0)));
+        assert_eq!(buffer.find_word_end((13, 0)), Some((13, 0)));
+        assert_eq!(buffer.find_word_end((usize::MAX, 0)), Some((usize::MAX, 0)));
+        assert_eq!(buffer.find_word_end((0, 5)), None);
+    }
+
+    #[test]
+    fn test_find_word_start() {
+        let text = "use std::{\n    collections::HashMap,\n    io::{self, Write},\n};";
+        let buffer = Buffer::new(None, text.to_string());
+
+        // find_word_start actually finds the start of the NEXT word, not the current word
+        // From position (0, 0) which is 'u' in "use", it should find 's' in "std"
+        let word_start = buffer.find_word_start((0, 0));
+        assert_eq!(word_start.unwrap(), (4, 0)); // 's' in "std"
+
+        let word_start = buffer.find_word_start((2, 0));
+        assert_eq!(word_start.unwrap(), (4, 0)); // 's' in "std"
+
+        let word_start = buffer.find_word_start((1, 0));
+        assert_eq!(word_start.unwrap(), (4, 0)); // 's' in "std"
+
+        let word_start = buffer.find_word_start((3, 0));
+        assert_eq!(word_start.unwrap(), (4, 0)); // space after "use", next word is "std"
+
+        let word_start = buffer.find_word_start((4, 0));
+        assert_eq!(word_start.unwrap(), (7, 0)); // From 's' in "std", next is ':'
+
+        let word_start = buffer.find_word_start((7, 0));
+        assert_eq!(word_start.unwrap(), (4, 1)); // From ':', skips to 'c' in "collections" on next line
+
+        let word_start = buffer.find_word_start((5, 1));
+        assert_eq!(word_start.unwrap(), (15, 1)); // From 'o' in "collections", next is ':' (punctuation)
+    }
+}

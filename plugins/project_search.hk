@@ -1,0 +1,713 @@
+// Debounced project search picker and export panel backed by a permitted ripgrep process.
+//
+// A new query cancels older process and timer state, parsed matches retain byte-encoded
+// locations explicitly, and refreshes are batched to protect the editor loop. Query
+// history is plugin storage, while result text belongs to the current process only.
+
+struct StringValueEvent {
+    value: String,
+}
+
+struct StoredValueEvent {
+    // Storage values are user-defined JSON and are keyed by arbitrary workspace paths.
+    value: Json,
+}
+
+struct RipgrepSubmatch {
+    start: i32,
+    end: i32,
+}
+
+struct RipgrepMatchData {
+    // Ripgrep text fields may be `{ text }` or `{ bytes }` depending on UTF-8 validity.
+    path: Json,
+    lines: Json,
+    line_number: i32,
+    submatches: [RipgrepSubmatch],
+}
+
+struct ProjectSearchPanelRow {
+    id: String,
+}
+
+struct ProjectSearchPanelEvent {
+    action: String,
+    row: ProjectSearchPanelRow,
+}
+
+struct RestoredPane {
+    id: String,
+    visible: bool,
+}
+
+struct RestoredPanesEvent {
+    panels: [RestoredPane],
+}
+
+struct ProjectSearchStoredPanel {
+    items: [ProjectSearchItem],
+    query: String,
+    hidden: bool,
+    ignored: bool,
+    follow: bool,
+    regex: bool,
+    preview: bool,
+    truncated: bool,
+}
+
+struct ProjectSearchStoredPanelEvent {
+    value: Option<ProjectSearchStoredPanel>,
+}
+
+struct ProjectSearchItem {
+    id: String,
+    label: String,
+    kind: String,
+    annotation: String,
+    detail: String,
+    detail_matches: [[i32]],
+    // Picker-owned location and preview payloads cross the dynamic host protocol.
+    data: Json,
+    preview: Json,
+}
+
+struct ProjectSearchState {
+    picker: Option<i32>,
+    cwd: String,
+    // Persisted histories are keyed by arbitrary workspace paths.
+    history_by_cwd: Json,
+    history: [String],
+    history_index: i32,
+    history_draft: String,
+    items: [ProjectSearchItem],
+    process: String,
+    query: String,
+    generation: i32,
+    debounce: String,
+    refresh: String,
+    stderr: String,
+    running: bool,
+    error: String,
+    hidden: bool,
+    ignored: bool,
+    follow: bool,
+    regex: bool,
+    preview: bool,
+    truncated: bool,
+    panel_open: bool,
+}
+
+#[red::state]
+fn initial_state() -> ProjectSearchState {
+    return ProjectSearchState {
+        picker: None,
+        cwd: ".",
+        history_by_cwd: Json {},
+        history: [],
+        history_index: -1,
+        history_draft: "",
+        items: [],
+        process: "",
+        query: "",
+        generation: 0,
+        debounce: "",
+        refresh: "",
+        stderr: "",
+        running: false,
+        error: "",
+        hidden: false,
+        ignored: false,
+        follow: false,
+        regex: true,
+        preview: true,
+        truncated: false,
+        panel_open: false,
+    };
+}
+
+fn state() -> ProjectSearchState {
+    return red::state();
+}
+
+#[red::command(
+    name = "ProjectSearch",
+    title = "Search project",
+    category = "Search",
+    description = "Find text across the workspace",
+    aliases = ["ripgrep", "find text"],
+    scope = "global",
+)]
+fn project_search() {
+    close_search_picker();
+    cancel_process();
+    reset_state();
+    red::request("GetConfig", cwd_loaded, "cwd");
+}
+
+fn reset_state() {
+    cancel_timers();
+    red::state_set(initial_state());
+}
+
+fn cwd_loaded(event: StringValueEvent) {
+    let cwd = red::string(event.value, ".");
+    red::state_patch(ProjectSearchState { cwd: cwd });
+    red::request("GetStorage", history_loaded, "history_by_cwd");
+}
+
+fn history_loaded(event: StoredValueEvent) {
+    let history_by_cwd = event.value;
+    if history_by_cwd == red::null() {
+        history_by_cwd = Json {};
+    }
+    red::state_patch(ProjectSearchState { history_by_cwd: history_by_cwd });
+    let history = history_by_cwd[red::string(state().cwd, ".")];
+    if history == red::null() { history = []; }
+    red::state_patch(ProjectSearchState { history: history });
+    let handle = red::execute("OpenPicker", "Find in Files", [], PickerOptions {
+        external_filter: true,
+        placeholder: "Search with ripgrep",
+        status: status_text(),
+        actions: [
+            PickerAction { action: "open_horizontal", key: "Ctrl-s", label: "Open horizontal split" },
+            PickerAction { action: "open_vertical", key: "Ctrl-v", label: "Open vertical split" },
+            PickerAction { action: "export", key: "Ctrl-q", label: "Export results" },
+            PickerAction { action: "toggle_regex", key: "Alt-r", label: "Toggle regex" },
+            PickerAction { action: "toggle_hidden", key: "Alt-h", label: "Toggle hidden" },
+            PickerAction { action: "toggle_ignored", key: "Alt-i", label: "Toggle ignored" },
+            PickerAction { action: "toggle_follow", key: "Alt-f", label: "Toggle symlink following" },
+            PickerAction { action: "toggle_all", key: "Ctrl-e", label: "Toggle hidden and ignored" },
+            PickerAction { action: "toggle_preview", key: "Alt-p", label: "Toggle preview" },
+            PickerAction { action: "history_back", key: "Ctrl-h", label: "Previous search" },
+            PickerAction { action: "history_forward", key: "Ctrl-l", label: "Next search" },
+        ],
+    }, PickerHandlers {
+        query: search_query,
+        action: picker_action,
+        selected: open_current,
+        cancelled: picker_cancelled,
+    });
+    red::state_patch(ProjectSearchState { picker: Some(handle) });
+}
+
+fn search_query(query: String) {
+    red::state_patch(ProjectSearchState { query: query });
+    red::state_patch(ProjectSearchState { history_index: -1 });
+    red::state_patch(ProjectSearchState { history_draft: query });
+    schedule_run();
+}
+
+fn schedule_run() {
+    let previous = red::string(state().debounce, "");
+    if previous != "" {
+        red::execute("CancelTimeout", previous);
+    }
+    let timer = red::execute("SetTimeout", 100);
+    red::state_patch(ProjectSearchState { debounce: timer });
+}
+
+#[red::on("timeout:callback")]
+fn timeout_callback(event: TimerEvent) {
+    if event.timer_id == state().debounce {
+        red::state_patch(ProjectSearchState { debounce: "" });
+        run_search(red::string(state().query, ""));
+        return;
+    }
+
+    if event.timer_id == state().refresh {
+        red::state_patch(ProjectSearchState { refresh: "" });
+        refresh_picker();
+    }
+}
+
+fn run_search(query: String) {
+    cancel_process();
+    red::state_patch(ProjectSearchState { generation: red::int(state().generation, 0) + 1 });
+    red::state_patch(ProjectSearchState { query: query });
+    red::state_patch(ProjectSearchState { items: [] });
+    red::state_patch(ProjectSearchState { stderr: "" });
+    red::state_patch(ProjectSearchState { error: "" });
+    red::state_patch(ProjectSearchState { truncated: false });
+    red::state_patch(ProjectSearchState { running: query != "" });
+    refresh_picker();
+
+    if query == "" {
+        return;
+    }
+
+    let process_id = red::execute("SpawnProcess", Process {
+        command: "rg",
+        args: ripgrep_args(query),
+        cwd: red::string(state().cwd, "."),
+    });
+    red::state_patch(ProjectSearchState { process: process_id });
+    red::on("process:" + process_id, process_event);
+}
+
+fn ripgrep_args(query: String) -> [String] {
+    let args: [String] = [
+        "--json",
+        "--color=never",
+        "--no-heading",
+        "--with-filename",
+        "--line-number",
+        "--column",
+        "--smart-case",
+        "--max-columns=500",
+        "--max-columns-preview",
+        "--glob=!.bare",
+        "--glob=!.git",
+    ];
+    if state().hidden {
+        args = red::push(args, "--hidden");
+    } else {
+        args = red::push(args, "--no-hidden");
+    }
+    if state().ignored {
+        args = red::push(args, "--no-ignore");
+    }
+    if state().follow {
+        args = red::push(args, "--follow");
+    }
+    if !state().regex {
+        args = red::push(args, "--fixed-strings");
+    }
+    args = red::push(args, "--");
+    return red::push(args, query);
+}
+
+fn cancel_process() {
+    let process_id = red::string(state().process, "");
+    if process_id != "" {
+        red::execute("KillProcess", process_id);
+        red::state_patch(ProjectSearchState { process: "" });
+    }
+}
+
+fn cancel_timers() {
+    let debounce = red::string(state().debounce, "");
+    if debounce != "" {
+        red::execute("CancelTimeout", debounce);
+    }
+    let refresh = red::string(state().refresh, "");
+    if refresh != "" {
+        red::execute("CancelTimeout", refresh);
+    }
+    red::state_patch(ProjectSearchState { debounce: "" });
+    red::state_patch(ProjectSearchState { refresh: "" });
+}
+
+fn process_event(event: ProcessEvent) {
+    match event {
+        ProcessEvent::Stdout { process_id, line, plugin_name } => {
+            if process_id == state().process {
+                process_stdout(line);
+            }
+        }
+        ProcessEvent::Stderr { process_id, line, plugin_name } => {
+            if process_id == state().process {
+                red::state_patch(ProjectSearchState { stderr: state().stderr + line + "\n" });
+            }
+        }
+        ProcessEvent::Error { process_id, message, plugin_name } => {
+            if process_id == state().process {
+                red::state_patch(ProjectSearchState { running: false });
+                red::state_patch(ProjectSearchState { error: message });
+                red::state_patch(ProjectSearchState { process: "" });
+                schedule_refresh();
+            }
+        }
+        ProcessEvent::Exit { process_id, code, plugin_name } => {
+            if process_id != state().process {
+                return;
+            }
+            red::state_patch(ProjectSearchState { running: false });
+            red::state_patch(ProjectSearchState { process: "" });
+            let exit_code = 0;
+            if let Some(value) = code {
+                exit_code = value;
+            }
+            if !state().truncated && exit_code != 0 && exit_code != 1 {
+                let error = red::trim(state().stderr);
+                if error == "" {
+                    error = "rg exited with code " + exit_code;
+                }
+                red::state_patch(ProjectSearchState { error: error });
+            }
+            schedule_refresh();
+        }
+    }
+}
+
+fn process_stdout(line: String) {
+    let message = red::parse_json(line);
+    if message["type"] != "match" {
+        return;
+    }
+
+    let items = state().items;
+    if red::len(items) >= 500 {
+        return;
+    }
+
+    let item = match_item(message.data, red::len(items));
+    items = red::push(items, item);
+    red::state_patch(ProjectSearchState { items: items });
+    if red::len(items) >= 500 {
+        red::state_patch(ProjectSearchState { truncated: true });
+        red::state_patch(ProjectSearchState { running: false });
+        cancel_process();
+    }
+    schedule_refresh();
+}
+
+fn schedule_refresh() {
+    if red::string(state().refresh, "") != "" {
+        return;
+    }
+    red::state_patch(ProjectSearchState { refresh: red::execute("SetTimeout", 16) });
+}
+
+fn refresh_picker() {
+    let Some(handle) = state().picker else {
+        return;
+    };
+    red::execute("UpdatePickerItems", handle, state().items);
+    red::execute("UpdatePickerStatus", handle, status_text());
+}
+
+fn status_text() -> String {
+    let error = red::string(state().error, "");
+    if error != "" {
+        return error;
+    }
+
+    let flags = "";
+    if state().regex {
+        flags = append_flag(flags, "regex");
+    } else {
+        flags = append_flag(flags, "literal");
+    }
+    if state().hidden {
+        flags = append_flag(flags, "hidden");
+    }
+    if state().ignored {
+        flags = append_flag(flags, "ignored");
+    }
+    if state().follow {
+        flags = append_flag(flags, "follow");
+    }
+    if state().preview {
+        flags = append_flag(flags, "preview");
+    }
+
+    let count = red::len(state().items);
+    if state().running {
+        return "Searching (" + count + "/500) [" + flags + "]";
+    }
+    if red::string(state().query, "") == "" {
+        return "Type to search";
+    }
+    let status = count + " matches";
+    if state().truncated {
+        status = status + " (limit reached)";
+    }
+    return status + " [" + flags + "]";
+}
+
+fn append_flag(flags: String, flag: String) -> String {
+    if flags == "" {
+        return flag;
+    }
+    return flags + " " + flag;
+}
+
+fn match_item(data: RipgrepMatchData, index: i32) -> ProjectSearchItem {
+    let path = red::text_field(data.path);
+    let normalized_path = red::replace_all(path, "\\", "/");
+    let path_parts = red::split(normalized_path, "/");
+    let display_name = red::string(path_parts[red::len(path_parts) - 1], normalized_path);
+    let display_parent = "";
+    if red::len(path_parts) > 1 {
+        let parent_parts = [];
+        let part_index = 0;
+        for part in path_parts {
+            if part_index < red::len(path_parts) - 1 {
+                parent_parts = red::push(parent_parts, part);
+            }
+            part_index = part_index + 1;
+        }
+        display_parent = red::join(parent_parts, "/") + "/";
+    }
+    let line = red::int(data.line_number, 1) - 1;
+    let text = red::trim_line_end(red::text_field(data.lines));
+    let first_match = data.submatches[0];
+    let start = red::int(first_match.start, 0);
+    let end = red::int(first_match.end, start);
+    let detail_matches = [];
+    let preview_matches = [];
+    for submatch in data.submatches {
+        let match_start = red::int(submatch.start, 0);
+        let match_end = red::int(submatch.end, match_start);
+        detail_matches = red::push(detail_matches, [
+            red::utf8_byte_to_char_index(text, match_start),
+            red::utf8_byte_to_char_index(text, match_end),
+        ]);
+        preview_matches = red::push(preview_matches, [match_start, match_end]);
+    }
+
+    let stored_preview = Json {
+        path: path,
+        line: line,
+        column: start,
+        matches: preview_matches,
+    };
+    let preview = red::null();
+    if state().preview {
+        preview = stored_preview;
+    }
+
+    return ProjectSearchItem {
+        id: path + ":" + line + ":" + start + ":" + index,
+        label: display_name,
+        kind: "FileMatch",
+        annotation: display_parent + ":" + (line + 1) + ":" + (start + 1),
+        detail: text,
+        detail_matches: detail_matches,
+        data: Json {
+            location: Location {
+                path: path,
+                line: line,
+                column: start,
+                column_encoding: "utf8-byte",
+            },
+            preview: stored_preview,
+        },
+        preview: preview,
+    };
+}
+
+fn picker_action(event: PickerActionEvent) {
+    if event.action == "open_horizontal" {
+        open_item(event.item, "horizontal");
+    } else if event.action == "open_vertical" {
+        open_item(event.item, "vertical");
+    } else if event.action == "export" {
+        export_results();
+    } else if event.action == "toggle_regex" {
+        red::state_patch(ProjectSearchState { regex: !state().regex });
+        run_search(red::string(state().query, ""));
+    } else if event.action == "toggle_hidden" {
+        red::state_patch(ProjectSearchState { hidden: !state().hidden });
+        run_search(red::string(state().query, ""));
+    } else if event.action == "toggle_ignored" {
+        red::state_patch(ProjectSearchState { ignored: !state().ignored });
+        run_search(red::string(state().query, ""));
+    } else if event.action == "toggle_follow" {
+        red::state_patch(ProjectSearchState { follow: !state().follow });
+        run_search(red::string(state().query, ""));
+    } else if event.action == "toggle_all" {
+        let enabled = !state().hidden;
+        red::state_patch(ProjectSearchState { hidden: enabled });
+        red::state_patch(ProjectSearchState { ignored: enabled });
+        run_search(red::string(state().query, ""));
+    } else if event.action == "toggle_preview" {
+        red::state_patch(ProjectSearchState { preview: !state().preview });
+        rebuild_items();
+    } else if event.action == "history_back" {
+        move_history(1);
+    } else if event.action == "history_forward" {
+        move_history(-1);
+    }
+}
+
+fn open_current(item: PickerItem) {
+    open_item(item, "current");
+}
+
+fn open_item(item: PickerItem, target: String) {
+    if item == red::null() {
+        return;
+    }
+    remember_query();
+    cancel_process();
+    cancel_timers();
+    close_search_picker();
+    red::execute("OpenLocation", item.data.location, target);
+}
+
+fn remember_query() {
+    let query = red::trim(red::string(state().query, ""));
+    if query == "" {
+        return;
+    }
+    let history = [query];
+    for entry in state().history {
+        if entry != query && red::len(history) < 100 {
+            history = red::push(history, entry);
+        }
+    }
+    red::state_patch(ProjectSearchState { history: history });
+    let history_by_cwd = state().history_by_cwd;
+    history_by_cwd[red::string(state().cwd, ".")] = history;
+    red::state_patch(ProjectSearchState { history_by_cwd: history_by_cwd });
+    red::execute("SetStorage", "history_by_cwd", history_by_cwd);
+}
+
+fn move_history(delta: i32) {
+    let history = state().history;
+    if red::len(history) == 0 {
+        return;
+    }
+    let index = red::int(state().history_index, -1);
+    if index == -1 && delta > 0 {
+        red::state_patch(ProjectSearchState { history_draft: red::string(state().query, "") });
+    }
+    index = index + delta;
+    if index < -1 {
+        index = -1;
+    }
+    if index >= red::len(history) {
+        index = red::len(history) - 1;
+    }
+    red::state_patch(ProjectSearchState { history_index: index });
+    let query = red::string(state().history_draft, "");
+    if index >= 0 {
+        query = red::string(history[index], "");
+    }
+    let Some(handle) = state().picker else {
+        return;
+    };
+    red::execute("UpdatePickerQuery", handle, query);
+    run_search(query);
+}
+
+fn rebuild_items() {
+    let rebuilt = [];
+    for item in state().items {
+        let preview = red::null();
+        if state().preview {
+            preview = item.data.preview;
+        }
+        item.preview = preview;
+        rebuilt = red::push(rebuilt, item);
+    }
+    red::state_patch(ProjectSearchState { items: rebuilt });
+    refresh_picker();
+}
+
+fn export_results() {
+    export_results_panel(true);
+}
+
+fn export_results_panel(focus: bool) {
+    let rows = [];
+    for item in state().items {
+        rows = red::push(rows, PanelRow {
+            id: item.id,
+            path: item.data.location.path,
+            expanded: red::null(),
+            kind: "file",
+            segments: [PanelSegment {
+                text: item.data.location.path +
+                    ":" + (item.data.location.line + 1) +
+                    ":" + (item.data.location.column + 1) +
+                    ": " + item.detail,
+            }],
+            right_segments: [],
+        });
+    }
+    red::execute("CreatePanel", "project-search-results", PanelConfig {
+        side: "right",
+        width: 64,
+        title: "Project Search Results",
+    });
+    red::execute("UpdatePanel", "project-search-results", rows);
+    red::state_patch(ProjectSearchState { panel_open: true });
+    if focus {
+        red::execute("FocusPanel", "project-search-results");
+    }
+}
+
+#[red::on("editor:panes_restore")]
+fn restore_project_search_pane(event: RestoredPanesEvent) {
+    for pane in event.panels {
+        if pane.id == "project-search-results" && red::bool(pane.visible, false) {
+            red::request("GetStorage", project_search_panel_loaded, "exported_panel");
+            return;
+        }
+    }
+}
+
+fn project_search_panel_loaded(event: ProjectSearchStoredPanelEvent) {
+    let Some(saved) = event.value else {
+        return;
+    };
+    red::state_patch(ProjectSearchState { items: saved.items });
+    red::state_patch(ProjectSearchState { query: saved.query });
+    red::state_patch(ProjectSearchState { hidden: saved.hidden });
+    red::state_patch(ProjectSearchState { ignored: saved.ignored });
+    red::state_patch(ProjectSearchState { follow: saved.follow });
+    red::state_patch(ProjectSearchState { regex: saved.regex });
+    red::state_patch(ProjectSearchState { preview: saved.preview });
+    red::state_patch(ProjectSearchState { truncated: saved.truncated });
+    export_results_panel(false);
+}
+
+#[red::on("panel:event:project-search-results")]
+fn export_panel_event(event: ProjectSearchPanelEvent) {
+    if event.action == "close" {
+        red::execute("ClosePanel", "project-search-results");
+        red::state_patch(ProjectSearchState { panel_open: false });
+        return;
+    }
+    if event.action != "activate" || event.row == red::null() {
+        return;
+    }
+    for item in state().items {
+        if item.id == event.row.id {
+            red::execute("OpenLocation", item.data.location, "current");
+            return;
+        }
+    }
+}
+
+fn picker_cancelled(event: PickerCancelled) {
+    red::state_patch(ProjectSearchState { picker: None });
+    cancel_process();
+    cancel_timers();
+}
+
+fn close_search_picker() {
+    let Some(handle) = state().picker else {
+        return;
+    };
+    red::state_patch(ProjectSearchState { picker: None });
+    red::execute("ClosePicker", handle);
+}
+
+#[red::lifecycle("deactivate")]
+fn deactivate() {
+    close_search_picker();
+    cancel_process();
+    cancel_timers();
+    red::execute("ClosePanel", "project-search-results");
+}
+
+#[red::lifecycle("before_exit")]
+fn before_exit(snapshot: Json) {
+    if !state().panel_open {
+        red::execute("SetStorage", "exported_panel", red::null());
+        return;
+    }
+    red::execute("SetStorage", "exported_panel", ProjectSearchStoredPanel {
+        items: state().items,
+        query: state().query,
+        hidden: state().hidden,
+        ignored: state().ignored,
+        follow: state().follow,
+        regex: state().regex,
+        preview: state().preview,
+        truncated: state().truncated,
+    });
+}

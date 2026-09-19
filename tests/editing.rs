@@ -1,0 +1,12732 @@
+mod common;
+
+use common::{EditorHarness, LspEvent, MockLsp, RecordingLsp};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use red::{
+    agent_tools::{
+        EditorActionName, EditorOpenTarget, EditorPosition, EditorSelectionKind, EditorTextEdit,
+        EditorToolCall, EditorToolRequest,
+    },
+    buffer::{Buffer, SyntaxSelection},
+    clipboard::MemoryClipboardProvider,
+    color::Color,
+    config::{Config, KeyAction, LanguageConfig, MatchitLanguageConfig},
+    editor::{Action, Content, Editor, Mode, SearchDirection},
+    lsp::LspClient,
+    notification::{
+        MessageAction, Notice, Notification, NotificationSource, NotificationState,
+        ProgressOutcome, Severity,
+    },
+    plugin::{
+        PanelConfig, PanelRow, PanelRowKind, PanelSegment, PanelSide, Runtime, TextPanelBlock,
+        TextPanelBlockFormat, TextPanelBlockKind, TextPanelComposerConfig,
+    },
+    preferences::PreferencesStore,
+    theme::{Style, Theme},
+    undo::EditOrigin,
+    window::SplitSnapshot,
+};
+use std::{
+    env, fs,
+    path::PathBuf,
+    sync::{Arc, Mutex, MutexGuard},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+static COMMAND_COMPLETION_CWD_LOCK: Mutex<()> = Mutex::new(());
+
+#[tokio::test]
+async fn language_reload_opens_previously_tracked_buffers_that_gain_a_route() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let file = directory
+        .path()
+        .join("Buildfile")
+        .to_string_lossy()
+        .into_owned();
+    fs::write(&config_path, "").unwrap();
+    let lsp = RecordingLsp::default();
+    let events = lsp.events();
+    let mut editor = Editor::test_with_size(
+        Box::new(lsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        vec![Buffer::new(Some(file.clone()), "contents".to_string())],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    editor.set_language_reload_source(config_path.clone(), Vec::new());
+    editor.reload_languages().await.unwrap();
+    events.lock().unwrap().clear();
+    fs::write(
+        &config_path,
+        r#"
+[languages.buildspec]
+filenames = ["Buildfile"]
+
+[languages.buildspec.lsp]
+command = "mock-lsp"
+"#,
+    )
+    .unwrap();
+
+    editor.reload_languages().await.unwrap();
+
+    assert_eq!(*events.lock().unwrap(), [LspEvent::DidOpen(file)]);
+}
+
+#[tokio::test]
+async fn failed_language_reload_restores_previous_lsp_routing_and_can_be_retried() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    let file = directory
+        .path()
+        .join("Buildfile")
+        .to_string_lossy()
+        .into_owned();
+    fs::write(
+        &config_path,
+        r#"
+[languages.buildspec]
+filenames = ["Buildfile"]
+
+[languages.buildspec.lsp]
+command = "mock-lsp"
+"#,
+    )
+    .unwrap();
+    let lsp = RecordingLsp::failing_next_did_open();
+    let events = lsp.events();
+    let reconfigurations = lsp.reconfigurations();
+    let mut editor = Editor::test_with_size(
+        Box::new(lsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        vec![Buffer::new(Some(file.clone()), "contents".to_string())],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    editor.set_language_reload_source(config_path, Vec::new());
+
+    let error = editor.reload_languages().await.unwrap_err();
+
+    assert!(error.to_string().contains("injected didOpen failure"));
+    {
+        let configurations = reconfigurations.lock().unwrap();
+        assert_eq!(configurations.len(), 2);
+        assert!(configurations[0].servers.contains_key("buildspec"));
+        assert!(!configurations[1].servers.contains_key("buildspec"));
+    }
+
+    editor.reload_languages().await.unwrap();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        [LspEvent::DidOpen(file.clone()), LspEvent::DidOpen(file)]
+    );
+}
+
+#[tokio::test]
+async fn agent_editor_tools_navigate_select_and_apply_saved_unicode_edits() {
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("first.rs");
+    let second = root.path().join("second.rs");
+    fs::write(&first, "disk first\n").unwrap();
+    fs::write(&second, "a😀b\nsecond\n").unwrap();
+    let buffer = Buffer::new(
+        Some(first.to_string_lossy().into_owned()),
+        "unsaved first\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness.editor.test_set_agent_root(root.path());
+
+    let opened = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::OpenFile {
+                path: "second.rs".to_string(),
+                line: 0,
+                character: 1,
+                target: EditorOpenTarget::Current,
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(opened["file"], "second.rs");
+    assert_eq!(opened["cursor"]["line"], 0);
+    assert_eq!(opened["cursor"]["character"], 1);
+
+    let selected = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::SelectText {
+                path: "second.rs".to_string(),
+                start: EditorPosition {
+                    line: 0,
+                    character: 1,
+                },
+                end: EditorPosition {
+                    line: 0,
+                    character: 3,
+                },
+                kind: EditorSelectionKind::Character,
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(selected["selection"]["kind"], "character");
+    assert_eq!(selected["selection"]["text"], "😀");
+    assert_eq!(selected["selection"]["start"]["character"], 1);
+    assert_eq!(selected["selection"]["end"]["character"], 3);
+    let revision = selected["revision"].as_u64().unwrap();
+
+    let applied = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::ApplyEdits {
+                path: "second.rs".to_string(),
+                expected_revision: revision,
+                edits: vec![EditorTextEdit {
+                    start: EditorPosition {
+                        line: 0,
+                        character: 1,
+                    },
+                    end: EditorPosition {
+                        line: 0,
+                        character: 3,
+                    },
+                    new_text: "λ".to_string(),
+                }],
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(applied["ok"], true);
+    assert_eq!(applied["applied"], true);
+    assert_eq!(applied["saved"], true);
+    assert_eq!(harness.buffer_contents(), "aλb\nsecond\n");
+    assert_eq!(fs::read_to_string(&second).unwrap(), "aλb\nsecond\n");
+    assert!(matches!(
+        harness.editor.test_last_transaction_origin(),
+        Some(EditOrigin::Agent { session_id, .. }) if session_id == "session-1"
+    ));
+
+    let created = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::WriteFile {
+                path: "created.rs".to_string(),
+                expected_revision: 0,
+                content: "fn created() {}\n".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(created["applied"], true);
+    assert_eq!(created["saved"], true);
+    assert_eq!(
+        fs::read_to_string(root.path().join("created.rs")).unwrap(),
+        "fn created() {}\n"
+    );
+
+    let moved = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::RunEditorAction {
+                action: EditorActionName::PreviousBuffer,
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(moved["file"], "second.rs");
+    let moved = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::RunEditorAction {
+                action: EditorActionName::PreviousBuffer,
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(moved["file"], "first.rs");
+}
+
+#[tokio::test]
+async fn agent_editor_tools_reject_workspace_escape_and_stale_edits() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("main.rs");
+    fs::write(&file, "original\n").unwrap();
+    let buffer = Buffer::new(
+        Some(file.to_string_lossy().into_owned()),
+        "unsaved\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness.editor.test_set_agent_root(root.path());
+
+    let escaped = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::OpenFile {
+                path: "../outside.rs".to_string(),
+                line: 0,
+                character: 0,
+                target: EditorOpenTarget::Current,
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(escaped.to_string().contains("outside workspace"));
+
+    let stale = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::ApplyEdits {
+                path: "main.rs".to_string(),
+                expected_revision: 999,
+                edits: vec![EditorTextEdit {
+                    start: EditorPosition {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: EditorPosition {
+                        line: 0,
+                        character: 7,
+                    },
+                    new_text: "changed".to_string(),
+                }],
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(stale.to_string().contains("stale editor revision"));
+    assert_eq!(harness.buffer_contents(), "unsaved\n");
+    assert_eq!(fs::read_to_string(file).unwrap(), "original\n");
+
+    let secret = root.path().join(".env");
+    fs::write(&secret, "TOKEN=must-not-be-exposed\n").unwrap();
+    let blocked = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::OpenFile {
+                path: ".env".to_string(),
+                line: 0,
+                character: 0,
+                target: EditorOpenTarget::Current,
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(blocked.to_string().contains("sensitive file"));
+}
+
+#[tokio::test]
+async fn agent_editor_navigation_preserves_a_focused_conversation_composer() {
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("first.rs");
+    let second = root.path().join("second.rs");
+    fs::write(&first, "first\n").unwrap();
+    fs::write(&second, "second\n").unwrap();
+    let buffer = Buffer::new(
+        Some(first.to_string_lossy().into_owned()),
+        "first\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness.editor.test_set_agent_root(root.path());
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 30,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask a follow-up".to_string(),
+                rows: 2,
+            }),
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+
+    let state = harness
+        .editor
+        .test_run_agent_editor_tool(EditorToolRequest {
+            session_id: "session-1".to_string(),
+            call: EditorToolCall::OpenFile {
+                path: "second.rs".to_string(),
+                line: 0,
+                character: 0,
+                target: EditorOpenTarget::Current,
+            },
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(state["file"], "second.rs");
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+    assert!(harness.render_cursor_position().is_some());
+}
+
+fn temp_file_path(name: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir()
+        .join(format!("red-{name}-{}-{nanos}.txt", std::process::id()))
+        .to_string_lossy()
+        .into_owned()
+}
+
+async fn type_normal_keys(harness: &mut EditorHarness, keys: &str) {
+    for key in keys.chars() {
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(key),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+    }
+}
+
+async fn execute_window_chord(harness: &mut EditorHarness, key: char) {
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(key),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+}
+
+async fn execute_unmodified_key(harness: &mut EditorHarness, key: KeyCode) {
+    harness
+        .execute_event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+}
+
+async fn drag_window_divider(harness: &mut EditorHarness, start: (u16, u16), end: (u16, u16)) {
+    for (kind, (column, row)) in [
+        (MouseEventKind::Down(MouseButton::Left), start),
+        (MouseEventKind::Drag(MouseButton::Left), end),
+        (MouseEventKind::Up(MouseButton::Left), end),
+    ] {
+        harness
+            .execute_event(Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .await
+            .unwrap();
+    }
+}
+
+fn default_key_config() -> Config {
+    toml::from_str(include_str!("../default_config.toml")).unwrap()
+}
+
+fn mouse_selection_config() -> Config {
+    Config {
+        scrolloff: Some(0),
+        splash: Some(false),
+        ..default_key_config()
+    }
+}
+
+fn mouse_selection_harness(content: &str) -> EditorHarness {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, content.to_string()),
+        mouse_selection_config(),
+    );
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::default()));
+    harness
+}
+
+async fn mouse_selection_event(
+    harness: &mut EditorHarness,
+    kind: MouseEventKind,
+    position: (u16, u16),
+) {
+    modified_mouse_selection_event(harness, kind, position, KeyModifiers::NONE).await;
+}
+
+async fn modified_mouse_selection_event(
+    harness: &mut EditorHarness,
+    kind: MouseEventKind,
+    (column, row): (u16, u16),
+    modifiers: KeyModifiers,
+) {
+    harness
+        .execute_event(Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers,
+        }))
+        .await
+        .unwrap();
+}
+
+async fn select_with_mouse(harness: &mut EditorHarness, start: (u16, u16), end: (u16, u16)) {
+    for (kind, position) in [
+        (MouseEventKind::Down(MouseButton::Left), start),
+        (MouseEventKind::Drag(MouseButton::Left), end),
+        (MouseEventKind::Up(MouseButton::Left), end),
+    ] {
+        mouse_selection_event(harness, kind, position).await;
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_preserves_inclusive_forward_reverse_and_multiline_ranges_for_yank() {
+    for (start, end, selection, expected) in [
+        ((5, 0), (7, 0), (1, 0, 3, 0), "bcd"),
+        ((7, 0), (5, 0), (1, 0, 3, 0), "bcd"),
+        ((5, 0), (6, 2), (1, 0, 2, 2), "bcdef\n\nwxy"),
+        ((6, 2), (5, 0), (1, 0, 2, 2), "bcdef\n\nwxy"),
+    ] {
+        let mut harness = mouse_selection_harness("abcdef\n\nwxyz");
+        let clipboard = MemoryClipboardProvider::default();
+        let clipboard_text = clipboard.shared_text();
+        harness.editor.test_set_clipboard(Box::new(clipboard));
+
+        mouse_selection_event(&mut harness, MouseEventKind::Down(MouseButton::Left), start).await;
+        harness.assert_mode(Mode::Normal);
+        mouse_selection_event(&mut harness, MouseEventKind::Drag(MouseButton::Left), end).await;
+        harness.assert_mode(Mode::Visual);
+        assert_eq!(harness.selection(), Some(selection));
+        mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), end).await;
+        harness.assert_mode(Mode::Visual);
+        assert_eq!(harness.selection(), Some(selection));
+        harness.assert_buffer_contents("abcdef\n\nwxyz");
+
+        type_normal_keys(&mut harness, "y").await;
+        harness.assert_mode(Mode::Normal);
+        assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_uses_the_release_position_even_without_a_drag_event() {
+    let mut harness = mouse_selection_harness("abcdef");
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Down(MouseButton::Left),
+        (5, 0),
+    )
+    .await;
+    mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), (7, 0)).await;
+
+    harness.assert_mode(Mode::Visual);
+    assert_eq!(harness.selection(), Some((1, 0, 3, 0)));
+
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Drag(MouseButton::Left),
+        (9, 0),
+    )
+    .await;
+    assert_eq!(harness.selection(), Some((1, 0, 3, 0)));
+}
+
+#[tokio::test]
+async fn mouse_selection_ignores_strays_and_keeps_an_unmoved_click_in_normal_mode() {
+    let mut harness = mouse_selection_harness("abcdef");
+    for kind in [
+        MouseEventKind::Moved,
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        mouse_selection_event(&mut harness, kind, (7, 0)).await;
+        harness.assert_cursor_at(0, 0);
+        harness.assert_mode(Mode::Normal);
+        assert_eq!(harness.selection(), None);
+    }
+
+    select_with_mouse(&mut harness, (6, 0), (6, 0)).await;
+    harness.assert_cursor_at(2, 0);
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(harness.selection(), None);
+
+    type_normal_keys(&mut harness, "vl").await;
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Down(MouseButton::Left),
+        (4, 0),
+    )
+    .await;
+    mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), (4, 0)).await;
+    harness.assert_cursor_at(0, 0);
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(harness.selection(), None);
+}
+
+#[tokio::test]
+async fn mouse_selection_highlight_survives_release_and_keyboard_adjustment_and_gv() {
+    let mut harness = mouse_selection_harness("abcdefgh");
+    let unselected = harness.render_cell_bg(7, 0).unwrap();
+    select_with_mouse(&mut harness, (8, 0), (6, 0)).await;
+    assert_ne!(harness.render_cell_bg(7, 0).unwrap(), unselected);
+    assert_eq!(harness.render_cell_bg(10, 0).unwrap(), unselected);
+
+    type_normal_keys(&mut harness, "h").await;
+    harness.assert_cursor_at(1, 0);
+    assert_eq!(harness.selection(), Some((1, 0, 4, 0)));
+    execute_unmodified_key(&mut harness, KeyCode::Esc).await;
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(harness.render_cell_bg(7, 0).unwrap(), unselected);
+
+    type_normal_keys(&mut harness, "Ggv").await;
+    harness.assert_mode(Mode::Visual);
+    harness.assert_cursor_at(1, 0);
+    assert_eq!(harness.selection(), Some((1, 0, 4, 0)));
+}
+
+#[tokio::test]
+async fn mouse_selection_delete_and_change_use_visual_operators_and_undo() {
+    for (operator, expected) in [('d', "aef"), ('c', "aXef")] {
+        let mut harness = mouse_selection_harness("abcdef");
+        select_with_mouse(&mut harness, (5, 0), (7, 0)).await;
+        execute_unmodified_key(&mut harness, KeyCode::Char(operator)).await;
+        if operator == 'c' {
+            harness.assert_mode(Mode::Insert);
+            harness.type_text("X").await.unwrap();
+            execute_unmodified_key(&mut harness, KeyCode::Esc).await;
+        }
+        harness.assert_mode(Mode::Normal);
+        harness.assert_buffer_contents(expected);
+
+        type_normal_keys(&mut harness, "u").await;
+        harness.assert_buffer_contents("abcdef");
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_started_in_insert_resumes_insert_with_separate_undo_groups() {
+    for (finish, expected_cursor, expected_text) in [
+        (KeyCode::Esc, (3, 0), "XabYcdef"),
+        (KeyCode::Char('y'), (2, 0), "XaYbcdef"),
+    ] {
+        let mut harness = mouse_selection_harness("abcdef");
+        type_normal_keys(&mut harness, "i").await;
+        harness.type_text("X").await.unwrap();
+        select_with_mouse(&mut harness, (6, 0), (7, 0)).await;
+        harness.assert_mode(Mode::Visual);
+        execute_unmodified_key(&mut harness, finish).await;
+        harness.assert_mode(Mode::Insert);
+        assert_eq!(harness.cursor_position(), expected_cursor);
+        harness.type_text("Y").await.unwrap();
+        execute_unmodified_key(&mut harness, KeyCode::Esc).await;
+        harness.assert_buffer_contents(expected_text);
+
+        type_normal_keys(&mut harness, "u").await;
+        harness.assert_buffer_contents("Xabcdef");
+        type_normal_keys(&mut harness, "u").await;
+        harness.assert_buffer_contents("abcdef");
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_from_insert_separates_delete_from_typing_but_keeps_change_atomic() {
+    for operator in ['d', 'c'] {
+        let mut harness = mouse_selection_harness("abcdef");
+        type_normal_keys(&mut harness, "i").await;
+        harness.type_text("X").await.unwrap();
+        select_with_mouse(&mut harness, (6, 0), (7, 0)).await;
+        execute_unmodified_key(&mut harness, KeyCode::Char(operator)).await;
+        harness.assert_mode(Mode::Insert);
+        harness.assert_cursor_at(2, 0);
+        harness.assert_buffer_contents("Xadef");
+        harness.type_text("Y").await.unwrap();
+        execute_unmodified_key(&mut harness, KeyCode::Esc).await;
+        harness.assert_buffer_contents("XaYdef");
+
+        type_normal_keys(&mut harness, "u").await;
+        if operator == 'd' {
+            harness.assert_buffer_contents("Xadef");
+            type_normal_keys(&mut harness, "u").await;
+        }
+        harness.assert_buffer_contents("Xabcdef");
+        type_normal_keys(&mut harness, "u").await;
+        harness.assert_buffer_contents("abcdef");
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_from_insert_restores_the_eol_insertion_position_after_escape_or_delete() {
+    for (start, finish, cursor, after_finish, after_typing) in [
+        ((5, 0), KeyCode::Esc, 6, "abcdef", "abcdefX"),
+        ((7, 0), KeyCode::Char('d'), 3, "abc", "abcX"),
+    ] {
+        let mut harness = mouse_selection_harness("abcdef");
+        type_normal_keys(&mut harness, "i").await;
+        select_with_mouse(&mut harness, start, (70, 0)).await;
+        execute_unmodified_key(&mut harness, finish).await;
+
+        harness.assert_mode(Mode::Insert);
+        harness.assert_cursor_at(cursor, 0);
+        harness.assert_buffer_contents(after_finish);
+        harness.type_text("X").await.unwrap();
+        execute_unmodified_key(&mut harness, KeyCode::Esc).await;
+        harness.assert_buffer_contents(after_typing);
+
+        type_normal_keys(&mut harness, "u").await;
+        harness.assert_buffer_contents(after_finish);
+        if finish == KeyCode::Char('d') {
+            type_normal_keys(&mut harness, "u").await;
+            harness.assert_buffer_contents("abcdef");
+        }
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_moving_inside_one_tab_selects_the_tab_but_an_unmoved_click_does_not() {
+    let mut harness = mouse_selection_harness("\tabc");
+    select_with_mouse(&mut harness, (5, 0), (5, 0)).await;
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.selection(), None);
+
+    let mut harness = mouse_selection_harness("\tabc");
+    let clipboard = MemoryClipboardProvider::default();
+    let clipboard_text = clipboard.shared_text();
+    harness.editor.test_set_clipboard(Box::new(clipboard));
+    select_with_mouse(&mut harness, (5, 0), (6, 0)).await;
+    harness.assert_mode(Mode::Visual);
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.selection(), Some((0, 0, 0, 0)));
+    type_normal_keys(&mut harness, "y").await;
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("\t"));
+}
+
+#[tokio::test]
+async fn mouse_selection_maps_tabs_graphemes_wrapping_and_breakindent_to_source_text() {
+    for (content, width, start, end, selection, expected) in [
+        (
+            "\t界e\u{301}🙂Z",
+            40,
+            (6, 0),
+            (12, 0),
+            (0, 0, 3, 0),
+            "\t界e\u{301}🙂",
+        ),
+        (
+            "abcdefghijklmnopqrst",
+            12,
+            (10, 0),
+            (6, 1),
+            (6, 0, 10, 0),
+            "ghijk",
+        ),
+        (
+            "    abcdefghijklmnopqrstuvwxyz012345",
+            32,
+            (5, 1),
+            (10, 1),
+            (28, 0, 30, 0),
+            "yz0",
+        ),
+    ] {
+        let mut harness = EditorHarness::with_config_and_size(
+            Buffer::new(None, content.to_string()),
+            mouse_selection_config(),
+            width,
+            8,
+        );
+        let clipboard = MemoryClipboardProvider::default();
+        let clipboard_text = clipboard.shared_text();
+        harness.editor.test_set_clipboard(Box::new(clipboard));
+
+        select_with_mouse(&mut harness, start, end).await;
+
+        harness.assert_mode(Mode::Visual);
+        assert_eq!(harness.selection(), Some(selection), "{content:?}");
+        type_normal_keys(&mut harness, "y").await;
+        assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_uses_the_horizontal_viewport_offset() {
+    let mut config = mouse_selection_config();
+    config.wrap = Some(false);
+    let mut harness = EditorHarness::with_config_and_size(
+        Buffer::new(None, "abcdefghijklmnopqrstuvwxyz".to_string()),
+        config,
+        12,
+        8,
+    );
+    harness
+        .execute_action(Action::SetCursor(16, 0))
+        .await
+        .unwrap();
+    assert_eq!(harness.viewport_left(), 9);
+
+    select_with_mouse(&mut harness, (5, 0), (7, 0)).await;
+
+    harness.assert_mode(Mode::Visual);
+    assert_eq!(harness.selection(), Some((10, 0, 12, 0)));
+    assert_eq!(harness.viewport_left(), 9);
+}
+
+#[tokio::test]
+async fn mouse_selection_clamps_blank_space_below_eof_to_the_source_line_end() {
+    let mut harness = mouse_selection_harness("abc\n\nxy");
+    let clipboard = MemoryClipboardProvider::default();
+    let clipboard_text = clipboard.shared_text();
+    harness.editor.test_set_clipboard(Box::new(clipboard));
+
+    select_with_mouse(&mut harness, (5, 0), (70, 10)).await;
+
+    assert_eq!(harness.selection(), Some((1, 0, 2, 2)));
+    type_normal_keys(&mut harness, "y").await;
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("bc\n\nxy"));
+}
+
+#[tokio::test]
+async fn mouse_selection_drag_past_a_line_end_includes_its_newline() {
+    let mut harness = mouse_selection_harness("abc\nxyz");
+    let unselected_background = harness.render_cell_bg(7, 0).unwrap();
+    let clipboard = MemoryClipboardProvider::default();
+    let clipboard_text = clipboard.shared_text();
+    harness.editor.test_set_clipboard(Box::new(clipboard));
+
+    select_with_mouse(&mut harness, (5, 0), (70, 0)).await;
+
+    assert_eq!(harness.selection(), Some((1, 0, 3, 0)));
+    let selected_background = harness.render_cell_bg(5, 0).unwrap();
+    assert_ne!(selected_background, unselected_background);
+    assert_eq!(harness.render_cell_bg(7, 0).unwrap(), selected_background);
+    assert_ne!(harness.render_cell_bg(8, 0).unwrap(), selected_background);
+    type_normal_keys(&mut harness, "y").await;
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("bc\n"));
+}
+
+#[tokio::test]
+async fn mouse_selection_press_past_line_end_uses_the_normal_or_insert_cursor_boundary() {
+    for (mode, anchor_x, expected) in [(Mode::Normal, 2, "c\nxy"), (Mode::Insert, 3, "\nxy")] {
+        let mut harness = mouse_selection_harness("abc\nxyz");
+        let clipboard = MemoryClipboardProvider::default();
+        let clipboard_text = clipboard.shared_text();
+        harness.editor.test_set_clipboard(Box::new(clipboard));
+        harness
+            .execute_action(Action::EnterMode(mode))
+            .await
+            .unwrap();
+
+        mouse_selection_event(
+            &mut harness,
+            MouseEventKind::Down(MouseButton::Left),
+            (70, 0),
+        )
+        .await;
+        harness.assert_mode(mode);
+        harness.assert_cursor_at(anchor_x, 0);
+        mouse_selection_event(
+            &mut harness,
+            MouseEventKind::Drag(MouseButton::Left),
+            (5, 1),
+        )
+        .await;
+        mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), (5, 1)).await;
+
+        assert_eq!(harness.selection(), Some((anchor_x, 0, 1, 1)));
+        type_normal_keys(&mut harness, "y").await;
+        assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_stays_in_its_originating_split_when_dragged_over_another_window() {
+    let mut harness = mouse_selection_harness("abcdefghij");
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    let right_window_id = harness.active_window_id();
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Down(MouseButton::Left),
+        (5, 0),
+    )
+    .await;
+    let source_window_id = harness.active_window_id();
+    let source_bounds = harness.editor.test_active_window_bounds();
+    assert_ne!(source_window_id, right_window_id);
+
+    for kind in [
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        mouse_selection_event(&mut harness, kind, (60, 0)).await;
+        assert_eq!(harness.active_window_id(), source_window_id);
+        assert_eq!(harness.editor.test_active_window_bounds(), source_bounds);
+        assert_eq!(harness.selection(), Some((1, 0, 10, 0)));
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_cancels_capture_on_escape_focus_loss_and_resize() {
+    for cancellation in [
+        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        Event::FocusLost,
+        Event::Resize(81, 24),
+    ] {
+        let mut harness = mouse_selection_harness("abcdefghij");
+        mouse_selection_event(
+            &mut harness,
+            MouseEventKind::Down(MouseButton::Left),
+            (5, 0),
+        )
+        .await;
+        mouse_selection_event(
+            &mut harness,
+            MouseEventKind::Drag(MouseButton::Left),
+            (7, 0),
+        )
+        .await;
+        harness.execute_event(cancellation).await.unwrap();
+        let mode = harness.mode();
+        let cursor = harness.cursor_position();
+        let selection = harness.selection();
+
+        for kind in [
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            mouse_selection_event(&mut harness, kind, (9, 0)).await;
+            assert_eq!(harness.mode(), mode);
+            assert_eq!(harness.cursor_position(), cursor);
+            assert_eq!(harness.selection(), selection);
+        }
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_autoscrolls_down_on_background_ticks_and_stops_on_release() {
+    let content = (0..40)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = EditorHarness::with_config_and_size(
+        Buffer::new(None, content),
+        mouse_selection_config(),
+        24,
+        8,
+    );
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Down(MouseButton::Left),
+        (6, 1),
+    )
+    .await;
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Drag(MouseButton::Left),
+        (8, 7),
+    )
+    .await;
+    let first_top = harness.viewport_top();
+    let first_end = harness.selection().unwrap().3;
+    assert!(first_top > 0);
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    harness.editor.test_service_background().await.unwrap();
+
+    assert!(harness.viewport_top() > first_top);
+    let (x0, y0, _, y1) = harness.selection().unwrap();
+    assert_eq!((x0, y0), (1, 1));
+    assert!(y1 > first_end);
+    mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), (8, 7)).await;
+    let released_top = harness.viewport_top();
+    let released_selection = harness.selection();
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    harness.editor.test_service_background().await.unwrap();
+
+    harness.assert_mode(Mode::Visual);
+    assert_eq!(harness.viewport_top(), released_top);
+    assert_eq!(harness.selection(), released_selection);
+}
+
+#[tokio::test]
+async fn mouse_selection_autoscrolls_up_without_transferring_capture_to_the_split_above() {
+    let content = (0..40)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = EditorHarness::with_config_and_size(
+        Buffer::new(None, content),
+        mouse_selection_config(),
+        24,
+        12,
+    );
+    harness
+        .execute_action(Action::SplitHorizontal)
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::SetCursor(1, 20))
+        .await
+        .unwrap();
+    let source_window_id = harness.active_window_id();
+    let (position, _) = harness.editor.test_active_window_bounds().unwrap();
+    let press = (5, (position.y + 1) as u16);
+    let above_source = (5, (position.y - 1) as u16);
+    let before_drag = harness.viewport_top();
+    assert!(before_drag > 1);
+    mouse_selection_event(&mut harness, MouseEventKind::Down(MouseButton::Left), press).await;
+    let anchor_line = harness.buffer_line();
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Drag(MouseButton::Left),
+        above_source,
+    )
+    .await;
+    let first_top = harness.viewport_top();
+    assert!(first_top < before_drag);
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    harness.editor.test_service_background().await.unwrap();
+
+    assert_eq!(harness.active_window_id(), source_window_id);
+    assert!(harness.viewport_top() < first_top);
+    let (_, y0, _, y1) = harness.selection().unwrap();
+    assert!(y0 < anchor_line);
+    assert_eq!(y1, anchor_line);
+}
+
+#[tokio::test]
+async fn mouse_selection_autoscrolls_horizontally_on_ticks_and_focus_loss_stops_it() {
+    let mut config = mouse_selection_config();
+    config.wrap = Some(false);
+    let mut harness = EditorHarness::with_config_and_size(
+        Buffer::new(None, "abcdefghijklmnopqrstuvwxyz0123456789".to_string()),
+        config,
+        12,
+        8,
+    );
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Down(MouseButton::Left),
+        (5, 0),
+    )
+    .await;
+    mouse_selection_event(
+        &mut harness,
+        MouseEventKind::Drag(MouseButton::Left),
+        (14, 0),
+    )
+    .await;
+    let first_left = harness.viewport_left();
+    let first_end = harness.selection().unwrap().2;
+    assert!(first_left > 0);
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    harness.editor.test_service_background().await.unwrap();
+
+    assert!(harness.viewport_left() > first_left);
+    let (x0, y0, x1, y1) = harness.selection().unwrap();
+    assert_eq!((x0, y0, y1), (1, 0, 0));
+    assert!(x1 > first_end);
+    harness.execute_event(Event::FocusLost).await.unwrap();
+    let stopped_left = harness.viewport_left();
+    let stopped_selection = harness.selection();
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    harness.editor.test_service_background().await.unwrap();
+
+    assert_eq!(harness.viewport_left(), stopped_left);
+    assert_eq!(harness.selection(), stopped_selection);
+}
+
+#[tokio::test]
+async fn mouse_selection_double_and_triple_click_select_a_word_and_a_whole_line() {
+    for (clicks, mode, expected) in [
+        (2, Mode::Visual, "beta"),
+        (3, Mode::VisualLine, "alpha beta gamma\n"),
+    ] {
+        let mut harness = mouse_selection_harness("alpha beta gamma\nsecond line");
+        let clipboard = MemoryClipboardProvider::default();
+        let clipboard_text = clipboard.shared_text();
+        harness.editor.test_set_clipboard(Box::new(clipboard));
+        for _ in 0..clicks {
+            mouse_selection_event(
+                &mut harness,
+                MouseEventKind::Down(MouseButton::Left),
+                (11, 0),
+            )
+            .await;
+            mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), (11, 0))
+                .await;
+        }
+
+        harness.assert_mode(mode);
+        type_normal_keys(&mut harness, "y").await;
+        assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_double_click_drag_extends_by_whole_words_in_both_directions() {
+    for (end, expected_selection, expected_text) in [
+        ((5, 0), (0, 0, 9, 0), "alpha beta"),
+        ((17, 0), (6, 0, 15, 0), "beta gamma"),
+    ] {
+        let mut harness = mouse_selection_harness("alpha beta gamma");
+        let clipboard = MemoryClipboardProvider::default();
+        let clipboard_text = clipboard.shared_text();
+        harness.editor.test_set_clipboard(Box::new(clipboard));
+        mouse_selection_event(
+            &mut harness,
+            MouseEventKind::Down(MouseButton::Left),
+            (11, 0),
+        )
+        .await;
+        mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), (11, 0)).await;
+        mouse_selection_event(
+            &mut harness,
+            MouseEventKind::Down(MouseButton::Left),
+            (11, 0),
+        )
+        .await;
+        mouse_selection_event(&mut harness, MouseEventKind::Drag(MouseButton::Left), end).await;
+        mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), end).await;
+
+        harness.assert_mode(Mode::Visual);
+        assert_eq!(harness.selection(), Some(expected_selection));
+        type_normal_keys(&mut harness, "y").await;
+        assert_eq!(
+            clipboard_text.lock().unwrap().as_deref(),
+            Some(expected_text)
+        );
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_double_click_on_a_closing_delimiter_keeps_the_live_endpoint_at_its_opening(
+) {
+    let mut harness = mouse_selection_harness("x (a + b) y");
+    let clipboard = MemoryClipboardProvider::default();
+    let clipboard_text = clipboard.shared_text();
+    harness.editor.test_set_clipboard(Box::new(clipboard));
+    for _ in 0..2 {
+        mouse_selection_event(
+            &mut harness,
+            MouseEventKind::Down(MouseButton::Left),
+            (12, 0),
+        )
+        .await;
+        mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), (12, 0)).await;
+    }
+
+    harness.assert_mode(Mode::Visual);
+    harness.assert_cursor_at(2, 0);
+    assert_eq!(harness.selection(), Some((2, 0, 8, 0)));
+    type_normal_keys(&mut harness, "h").await;
+    harness.assert_cursor_at(1, 0);
+    assert_eq!(harness.selection(), Some((1, 0, 8, 0)));
+    type_normal_keys(&mut harness, "y").await;
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some(" (a + b)"));
+}
+
+#[tokio::test]
+async fn mouse_selection_four_clicks_and_alt_drag_create_visual_blocks() {
+    for alt in [false, true] {
+        let mut harness =
+            mouse_selection_harness("alpha beta gamma\nABCDEFGHIJKLMNO\n0123456789ABCDE");
+        let clipboard = MemoryClipboardProvider::default();
+        let clipboard_text = clipboard.shared_text();
+        harness.editor.test_set_clipboard(Box::new(clipboard));
+        let modifiers = if alt {
+            KeyModifiers::ALT
+        } else {
+            KeyModifiers::NONE
+        };
+        if !alt {
+            for _ in 0..3 {
+                mouse_selection_event(
+                    &mut harness,
+                    MouseEventKind::Down(MouseButton::Left),
+                    (11, 0),
+                )
+                .await;
+                mouse_selection_event(&mut harness, MouseEventKind::Up(MouseButton::Left), (11, 0))
+                    .await;
+            }
+        }
+        modified_mouse_selection_event(
+            &mut harness,
+            MouseEventKind::Down(MouseButton::Left),
+            (11, 0),
+            modifiers,
+        )
+        .await;
+        for kind in [
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            modified_mouse_selection_event(&mut harness, kind, (13, 2), modifiers).await;
+        }
+
+        harness.assert_mode(Mode::VisualBlock);
+        // Blockwise register text ends each selected row with a newline,
+        // matching the existing keyboard VisualBlock representation.
+        let (selection, expected) = if alt {
+            ((0, 0, 9, 2), "alpha beta\nABCDEFGHIJ\n0123456789\n")
+        } else {
+            ((7, 0, 9, 2), "eta\nHIJ\n789\n")
+        };
+        assert_eq!(harness.selection(), Some(selection));
+        type_normal_keys(&mut harness, "y").await;
+        assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn mouse_selection_reverse_alt_block_highlights_and_yanks_the_same_rectangle() {
+    let mut harness = mouse_selection_harness("abcdefghij\nklmnopqrst");
+    let unselected_backgrounds = [
+        harness.render_cell_bg(8, 0).unwrap(),
+        harness.render_cell_bg(8, 1).unwrap(),
+    ];
+    let clipboard = MemoryClipboardProvider::default();
+    let clipboard_text = clipboard.shared_text();
+    harness.editor.test_set_clipboard(Box::new(clipboard));
+    harness
+        .execute_action(Action::SetCursor(6, 0))
+        .await
+        .unwrap();
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        modified_mouse_selection_event(&mut harness, kind, (6, 1), KeyModifiers::ALT).await;
+    }
+
+    harness.assert_mode(Mode::VisualBlock);
+    for (row, unselected_background) in unselected_backgrounds.into_iter().enumerate() {
+        assert_ne!(
+            harness.render_cell_bg(8, row).unwrap(),
+            unselected_background
+        );
+        assert_eq!(
+            harness.render_cell_bg(5, row).unwrap(),
+            unselected_background
+        );
+        assert_eq!(
+            harness.render_cell_bg(11, row).unwrap(),
+            unselected_background
+        );
+    }
+    type_normal_keys(&mut harness, "y").await;
+    assert_eq!(
+        clipboard_text.lock().unwrap().as_deref(),
+        Some("cdefg\nmnopq\n")
+    );
+}
+
+#[tokio::test]
+async fn mouse_selection_shift_click_extends_from_the_existing_cursor() {
+    let mut harness = mouse_selection_harness("abcdefghij");
+    harness
+        .execute_action(Action::SetCursor(3, 0))
+        .await
+        .unwrap();
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        modified_mouse_selection_event(&mut harness, kind, (5, 0), KeyModifiers::SHIFT).await;
+    }
+
+    harness.assert_mode(Mode::Visual);
+    harness.assert_cursor_at(1, 0);
+    assert_eq!(harness.selection(), Some((1, 0, 3, 0)));
+}
+
+#[tokio::test]
+async fn mouse_selection_shift_click_adjusts_the_nearest_endpoint_with_a_start_tie_break() {
+    for (column, expected_cursor, expected_selection) in [
+        (6, 2, (2, 0, 7, 0)),
+        (10, 6, (1, 0, 6, 0)),
+        (8, 4, (4, 0, 7, 0)),
+    ] {
+        let mut harness = mouse_selection_harness("abcdefghij");
+        select_with_mouse(&mut harness, (5, 0), (11, 0)).await;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            modified_mouse_selection_event(&mut harness, kind, (column, 0), KeyModifiers::SHIFT)
+                .await;
+        }
+
+        harness.assert_mode(Mode::Visual);
+        harness.assert_cursor_at(expected_cursor, 0);
+        assert_eq!(harness.selection(), Some(expected_selection));
+    }
+}
+
+fn line_end_delete_key_config() -> Config {
+    let mut config = default_key_config();
+    config.keys.normal.insert(
+        "D".to_string(),
+        KeyAction::Single(Action::DeleteToLineEnd(1)),
+    );
+    config
+}
+
+fn comment_harness(file: &str, contents: &str) -> EditorHarness {
+    let buffer = Buffer::new(Some(file.to_string()), contents.to_string());
+    EditorHarness::with_config(buffer, default_key_config())
+}
+
+fn python_pack_config() -> Config {
+    let mut config = default_key_config();
+    config.languages.insert(
+        "python".to_string(),
+        LanguageConfig {
+            extensions: vec!["py".to_string(), "pyw".to_string(), "pyi".to_string()],
+            aliases: vec!["py".to_string(), "py3".to_string(), "python3".to_string()],
+            indent_width: Some(4),
+            ..LanguageConfig::default()
+        },
+    );
+    config
+}
+
+fn python_harness(contents: &str) -> EditorHarness {
+    let buffer = Buffer::new(Some("sample.py".to_string()), contents.to_string());
+    EditorHarness::with_config(buffer, python_pack_config())
+}
+
+#[tokio::test]
+async fn rust_syntax_indentation_open_lines_closer_and_undo() {
+    let source = "fn wrap() {\n    if pos.x > 0 {\n}\n";
+    let mut harness = comment_harness("main.rs", source);
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(8, 2);
+    harness.type_text("pos.x += SCREEN_WIDTH;").await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(8, 3);
+    harness.type_text("}").await.unwrap();
+    harness.assert_cursor_at(5, 3);
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents(
+        "fn wrap() {\n    if pos.x > 0 {\n        pos.x += SCREEN_WIDTH;\n    }\n}\n",
+    );
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(
+        "fn wrap() {\n    if pos.x > 0 {\n        pos.x += SCREEN_WIDTH;\n}\n",
+    );
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents(
+        "fn wrap() {\n    if pos.x > 0 {\n        pos.x += SCREEN_WIDTH;\n    }\n}\n",
+    );
+}
+
+#[tokio::test]
+async fn rust_syntax_indentation_enter_splits_empty_pair() {
+    let mut harness = comment_harness("main.rs", "fn f() {}");
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::SetCursor(8, 0))
+        .await
+        .unwrap();
+    harness.execute_action(Action::InsertNewLine).await.unwrap();
+    harness.assert_cursor_at(4, 1);
+    harness.assert_buffer_contents("fn f() {\n    \n}");
+    harness.type_text("work();").await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("fn f() {}");
+}
+
+#[tokio::test]
+async fn rust_syntax_indentation_open_above_closer() {
+    let mut harness = comment_harness("main.rs", "fn f() {\n}");
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::InsertLineAtCursor)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(4, 1);
+    harness.type_text("work();").await.unwrap();
+    harness.assert_buffer_contents("fn f() {\n    work();\n}");
+}
+
+#[tokio::test]
+async fn rust_syntax_indentation_open_below_compound_closers() {
+    let source = "        let isolated_client = Self {\n            state: Arc::new(ModelClientState {\n            }),\n        };";
+    let mut harness = comment_harness("main.rs", source);
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(12, 3);
+    harness.assert_buffer_contents(
+        "        let isolated_client = Self {\n            state: Arc::new(ModelClientState {\n            }),\n            \n        };",
+    );
+    harness.type_text("next: true,").await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(source);
+}
+
+#[tokio::test]
+async fn rust_syntax_indentation_enter_after_compound_closers() {
+    let mut harness = comment_harness(
+        "main.rs",
+        "        let isolated_client = Self {\n            state: Arc::new(ModelClientState {\n            }),\n        };",
+    );
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::SetCursor(15, 2))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::InsertNewLine).await.unwrap();
+
+    harness.assert_cursor_at(12, 3);
+    harness.assert_buffer_contents(
+        "        let isolated_client = Self {\n            state: Arc::new(ModelClientState {\n            }),\n            \n        };",
+    );
+}
+
+#[tokio::test]
+async fn rust_syntax_indentation_open_above_after_compound_closers() {
+    let mut harness = comment_harness(
+        "main.rs",
+        "        let isolated_client = Self {\n            state: Arc::new(ModelClientState {\n            }),\n        };",
+    );
+    for _ in 0..3 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+
+    harness
+        .execute_action(Action::InsertLineAtCursor)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(12, 3);
+    harness.assert_buffer_contents(
+        "        let isolated_client = Self {\n            state: Arc::new(ModelClientState {\n            }),\n            \n        };",
+    );
+}
+
+#[tokio::test]
+async fn comment_gcc_toggles_the_current_line() {
+    let mut harness = comment_harness("main.rs", "    let value = 1;");
+
+    type_normal_keys(&mut harness, "gcc").await;
+    harness.assert_buffer_contents("    // let value = 1;");
+
+    type_normal_keys(&mut harness, "gcc").await;
+    harness.assert_buffer_contents("    let value = 1;");
+}
+
+#[tokio::test]
+async fn comment_gcc_honors_a_line_count() {
+    let mut harness = comment_harness("main.rs", "alpha\nbeta\ngamma\ndelta");
+
+    type_normal_keys(&mut harness, "3gcc").await;
+
+    harness.assert_buffer_contents("// alpha\n// beta\n// gamma\ndelta");
+}
+
+#[tokio::test]
+async fn comment_operator_covers_vertical_motions() {
+    let mut harness = comment_harness("main.rs", "alpha\nbeta\ngamma");
+
+    type_normal_keys(&mut harness, "gcj").await;
+
+    harness.assert_buffer_contents("// alpha\n// beta\ngamma");
+}
+
+#[tokio::test]
+async fn comment_operator_honors_a_motion_count() {
+    let mut harness = comment_harness("main.rs", "alpha\nbeta\ngamma\ndelta");
+
+    type_normal_keys(&mut harness, "gc2j").await;
+
+    harness.assert_buffer_contents("// alpha\n// beta\n// gamma\ndelta");
+}
+
+#[tokio::test]
+async fn comment_operator_covers_a_word_text_object_linewise() {
+    let mut harness = comment_harness("main.rs", "alpha beta\ngamma");
+
+    type_normal_keys(&mut harness, "gciw").await;
+
+    harness.assert_buffer_contents("// alpha beta\ngamma");
+}
+
+#[tokio::test]
+async fn comment_range_aligns_at_the_least_indented_nonblank_line() {
+    let mut harness = comment_harness("main.rs", "    alpha\n      beta\n\n    gamma");
+
+    type_normal_keys(&mut harness, "4gcc").await;
+
+    harness.assert_buffer_contents("    // alpha\n    //   beta\n    //\n    // gamma");
+}
+
+#[tokio::test]
+async fn comment_range_uncomments_only_when_every_nonblank_line_is_commented() {
+    let mut harness = comment_harness("main.rs", "    // alpha\n    // beta");
+
+    type_normal_keys(&mut harness, "2gcc").await;
+
+    harness.assert_buffer_contents("    alpha\n    beta");
+}
+
+#[tokio::test]
+async fn comment_range_comments_mixed_comment_states_together() {
+    let mut harness = comment_harness("main.rs", "    // alpha\n    beta");
+
+    type_normal_keys(&mut harness, "2gcc").await;
+
+    harness.assert_buffer_contents("    // // alpha\n    // beta");
+}
+
+#[tokio::test]
+async fn comment_characterwise_visual_selection_toggles_whole_lines() {
+    let mut harness = comment_harness("main.rs", "alpha\n  beta\ngamma");
+
+    type_normal_keys(&mut harness, "vjgc").await;
+
+    harness.assert_buffer_contents("// alpha\n//   beta\ngamma");
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn comment_linewise_visual_selection_toggles_whole_lines() {
+    let mut harness = comment_harness("main.rs", "alpha\n  beta\ngamma");
+
+    type_normal_keys(&mut harness, "Vjgc").await;
+
+    harness.assert_buffer_contents("// alpha\n//   beta\ngamma");
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn comment_blockwise_visual_selection_toggles_whole_lines() {
+    let mut harness = comment_harness("main.rs", "alpha\n  beta\ngamma");
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "jgc").await;
+
+    harness.assert_buffer_contents("// alpha\n//   beta\ngamma");
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn comment_templates_follow_the_active_language() {
+    for (file, contents, commented) in [
+        ("config.fish", "    set name fish", "    # set name fish"),
+        ("main.lua", "    local value = 1", "    -- local value = 1"),
+        (
+            "index.html",
+            "    <div>hello</div>",
+            "    <!-- <div>hello</div> -->",
+        ),
+        ("site.css", "    color: red;", "    /* color: red; */"),
+        ("plugin.hk", "    let value = 1;", "    // let value = 1;"),
+    ] {
+        let mut harness = comment_harness(file, contents);
+
+        type_normal_keys(&mut harness, "gcc").await;
+        harness.assert_buffer_contents(commented);
+
+        type_normal_keys(&mut harness, "gcc").await;
+        harness.assert_buffer_contents(contents);
+    }
+}
+
+#[tokio::test]
+async fn comment_configuration_supports_language_overrides() {
+    let mut config = default_key_config();
+    config
+        .commenting
+        .languages
+        .insert("rust".to_string(), "/* %s */".to_string());
+    let buffer = Buffer::new(Some("main.rs".to_string()), "alpha".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "gcc").await;
+
+    harness.assert_buffer_contents("/* alpha */");
+}
+
+#[tokio::test]
+async fn comment_configuration_prefers_extension_specific_overrides() {
+    let mut config = default_key_config();
+    config
+        .commenting
+        .languages
+        .insert("rs".to_string(), "/* %s */".to_string());
+    let buffer = Buffer::new(Some("main.rs".to_string()), "alpha".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "gcc").await;
+
+    harness.assert_buffer_contents("/* alpha */");
+}
+
+#[tokio::test]
+async fn comment_operation_is_one_undoable_and_redoable_transaction() {
+    let mut harness = comment_harness("main.rs", "alpha\nbeta\ngamma");
+
+    type_normal_keys(&mut harness, "3gcc").await;
+    harness.assert_buffer_contents("// alpha\n// beta\n// gamma");
+
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("alpha\nbeta\ngamma");
+
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("// alpha\n// beta\n// gamma");
+}
+
+#[tokio::test]
+async fn comment_gcc_is_repeatable_at_the_current_cursor() {
+    let mut harness = comment_harness("main.rs", "alpha\nbeta\ngamma");
+
+    type_normal_keys(&mut harness, "gccj.").await;
+
+    harness.assert_buffer_contents("// alpha\n// beta\ngamma");
+}
+
+#[tokio::test]
+async fn comment_text_object_uncomments_the_contiguous_comment_block() {
+    let mut harness = comment_harness("main.rs", "// alpha\n// beta\ngamma");
+
+    type_normal_keys(&mut harness, "gcgc").await;
+
+    harness.assert_buffer_contents("alpha\nbeta\ngamma");
+}
+
+#[tokio::test]
+async fn comment_text_object_can_be_deleted() {
+    let mut harness = comment_harness("main.rs", "// alpha\n// beta\ngamma");
+
+    type_normal_keys(&mut harness, "dgc").await;
+
+    harness.assert_buffer_contents("gamma");
+}
+
+#[tokio::test]
+async fn comment_operation_preserves_windows_line_endings() {
+    let mut harness = comment_harness("main.rs", "alpha\r\nbeta\r\n");
+
+    type_normal_keys(&mut harness, "2gcc").await;
+
+    harness.assert_buffer_contents("// alpha\r\n// beta\r\n");
+}
+
+#[tokio::test]
+async fn format_gqq_reflows_comments_to_the_configured_width() {
+    let mut config = default_key_config();
+    config.commenting.text_width = 24;
+    let buffer = Buffer::new(
+        Some("main.rs".to_string()),
+        "// alpha beta gamma delta epsilon zeta".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "gqq").await;
+
+    harness.assert_buffer_contents("// alpha beta gamma\n// delta epsilon zeta");
+    harness.assert_cursor_at(0, 1);
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("// alpha beta gamma delta epsilon zeta");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("// alpha beta gamma\n// delta epsilon zeta");
+}
+
+#[tokio::test]
+async fn format_operator_honors_motions_visual_ranges_and_crlf() {
+    let mut config = default_key_config();
+    config.commenting.text_width = 20;
+    let buffer = Buffer::new(
+        Some("main.rs".to_string()),
+        "// alpha beta\r\n// gamma delta\r\n// epsilon zeta\r\nlast".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "gqj").await;
+    harness.assert_buffer_contents("// alpha beta gamma\r\n// delta\r\n// epsilon zeta\r\nlast");
+
+    type_normal_keys(&mut harness, "Vjgq").await;
+    harness.assert_buffer_contents("// alpha beta gamma\r\n// delta epsilon\r\n// zeta\r\nlast");
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn format_gqgq_honors_a_line_count() {
+    let mut config = default_key_config();
+    config.commenting.text_width = 20;
+    let buffer = Buffer::new(
+        Some("main.rs".to_string()),
+        "// alpha beta\n// gamma delta\nlast".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "2gqgq").await;
+
+    harness.assert_buffer_contents("// alpha beta gamma\n// delta\nlast");
+}
+
+#[tokio::test]
+async fn format_gqq_reflows_plain_text_without_a_comment_language() {
+    let mut config = default_key_config();
+    config.commenting.text_width = 16;
+    let buffer = Buffer::new(None, "alpha beta gamma delta epsilon".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "gqq").await;
+
+    harness.assert_buffer_contents("alpha beta gamma\ndelta epsilon");
+}
+
+#[tokio::test]
+async fn format_gqq_centers_a_distant_reflow_endpoint() {
+    let mut config = default_key_config();
+    config.commenting.text_width = 10;
+    config.scrolloff = Some(3);
+    config.wrap = Some(true);
+    let mut lines = (0..19)
+        .map(|line| format!("prefix-{line:02}"))
+        .collect::<Vec<_>>();
+    lines.push(vec!["word"; 80].join(" "));
+    lines.extend((0..30).map(|line| format!("suffix-{line:02}")));
+    let buffer = Buffer::new(None, lines.join("\n"));
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 80, 24);
+    harness.set_viewport_cursor(9, 0, 10);
+
+    type_normal_keys(&mut harness, "gqq").await;
+
+    assert_eq!(harness.buffer_line(), 58);
+    assert_eq!(harness.viewport_top(), 48);
+    assert_eq!(harness.buffer_line() - harness.viewport_top(), 10);
+}
+
+#[tokio::test]
+async fn insert_mode_wraps_line_comments_and_undoes_the_session_atomically() {
+    let mut config = default_key_config();
+    config.commenting.text_width = 24;
+    let original = "// alpha beta gamma delta epsilon";
+    let buffer = Buffer::new(Some("main.rs".to_string()), original.to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "A").await;
+    harness.type_text(" zeta").await.unwrap();
+
+    harness.assert_buffer_contents("// alpha beta gamma\n// delta epsilon zeta");
+    harness.assert_cursor_at(21, 1);
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents(original);
+}
+
+#[tokio::test]
+async fn enter_continues_documentation_comment_leaders() {
+    let original = "    /// alpha beta";
+    let mut harness = comment_harness("main.rs", original);
+
+    type_normal_keys(&mut harness, "A").await;
+    command_key(&mut harness, KeyCode::Enter).await;
+    harness.type_text("gamma").await.unwrap();
+
+    harness.assert_buffer_contents("    /// alpha beta\n    /// gamma");
+    harness.assert_cursor_at(13, 1);
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents(original);
+}
+
+#[tokio::test]
+async fn open_line_commands_continue_comment_leaders() {
+    let mut below = comment_harness("main.rs", "    //! parent\nnext");
+
+    type_normal_keys(&mut below, "o").await;
+    below.type_text("child").await.unwrap();
+    command_key(&mut below, KeyCode::Esc).await;
+    below.assert_buffer_contents("    //! parent\n    //! child\nnext");
+
+    let mut above = comment_harness("main.rs", "    // parent\nnext");
+    type_normal_keys(&mut above, "O").await;
+    above.type_text("before").await.unwrap();
+    command_key(&mut above, KeyCode::Esc).await;
+    above.assert_buffer_contents("    // before\n    // parent\nnext");
+}
+
+#[tokio::test]
+async fn automatic_comment_formatting_respects_language_width_and_opt_outs() {
+    let mut language_width = default_key_config();
+    language_width.commenting.text_width = 12;
+    language_width.languages.insert(
+        "rust".to_string(),
+        LanguageConfig {
+            text_width: Some(40),
+            ..LanguageConfig::default()
+        },
+    );
+    let buffer = Buffer::new(
+        Some("main.rs".to_string()),
+        "// alpha beta gamma".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, language_width);
+    type_normal_keys(&mut harness, "A").await;
+    harness.type_text(" delta").await.unwrap();
+    harness.assert_buffer_contents("// alpha beta gamma delta");
+
+    let mut disabled = default_key_config();
+    disabled.commenting.text_width = 12;
+    disabled.commenting.auto_wrap = false;
+    disabled.commenting.continue_on_enter = false;
+    disabled.commenting.continue_on_open_line = false;
+    let buffer = Buffer::new(Some("main.rs".to_string()), "    // alpha beta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, disabled);
+    type_normal_keys(&mut harness, "A").await;
+    harness.type_text(" gamma").await.unwrap();
+    command_key(&mut harness, KeyCode::Enter).await;
+    harness.type_text("plain").await.unwrap();
+    command_key(&mut harness, KeyCode::Esc).await;
+    harness.assert_buffer_contents("    // alpha beta gamma\n    plain");
+
+    type_normal_keys(&mut harness, "O").await;
+    harness.type_text("above").await.unwrap();
+    command_key(&mut harness, KeyCode::Esc).await;
+    harness.assert_buffer_contents("    // alpha beta gamma\n    above\n    plain");
+}
+
+#[tokio::test]
+async fn comment_unknown_language_leaves_the_buffer_unchanged() {
+    let mut harness = comment_harness("data.json", "{\"value\": 1}");
+
+    type_normal_keys(&mut harness, "gcc").await;
+
+    harness.assert_buffer_contents("{\"value\": 1}");
+    assert_eq!(
+        harness.last_error(),
+        Some("no comment syntax configured for json")
+    );
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn comment_unnamed_buffer_fails_without_changing_the_buffer() {
+    let buffer = Buffer::new(None, "alpha".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "gcc").await;
+
+    harness.assert_buffer_contents("alpha");
+    assert_eq!(
+        harness.last_error(),
+        Some("no comment syntax configured for unnamed buffer")
+    );
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn forced_syntax_controls_commenting_for_the_current_buffer() {
+    let mut config = default_key_config();
+    config
+        .commenting
+        .languages
+        .insert("txt".to_string(), "; %s".to_string());
+    let buffer = Buffer::new(Some("notes.txt".to_string()), "alpha".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    let revision = harness.editor.test_current_buffer().revision();
+
+    harness
+        .execute_action(Action::Command("syntax rs".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.editor.test_current_buffer().syntax_selection(),
+        &SyntaxSelection::Language("rust".to_string())
+    );
+    assert_eq!(harness.editor.test_current_buffer().revision(), revision);
+    assert!(!harness.is_dirty());
+    assert_eq!(harness.last_error(), Some("syntax: rust"));
+
+    type_normal_keys(&mut harness, "gcc").await;
+
+    harness.assert_buffer_contents("// alpha");
+}
+
+#[tokio::test]
+async fn forced_syntax_controls_language_specific_matchit_groups() {
+    let mut config = default_key_config();
+    config.matchit.languages.insert(
+        "rust".to_string(),
+        MatchitLanguageConfig {
+            groups: vec![vec!["\\bbegin\\b".to_string(), "\\bend\\b".to_string()]],
+        },
+    );
+    let buffer = Buffer::new(Some("notes.txt".to_string()), "begin value end".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    harness
+        .execute_action(Action::Command("syntax rust".to_string()))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+
+    assert_eq!(harness.cursor_position(), (12, 0));
+}
+
+#[tokio::test]
+async fn comment_invalid_template_fails_without_changing_the_buffer() {
+    let mut config = default_key_config();
+    config
+        .commenting
+        .languages
+        .insert("rust".to_string(), "// missing placeholder".to_string());
+    let buffer = Buffer::new(Some("main.rs".to_string()), "alpha".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "gcc").await;
+
+    harness.assert_buffer_contents("alpha");
+    assert_eq!(
+        harness.last_error(),
+        Some("invalid comment syntax configured for rust: expected exactly one %s placeholder")
+    );
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn dot_repeats_a_direct_change_at_the_current_cursor() {
+    let buffer = Buffer::new(None, "abc\ndef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "xj.").await;
+
+    harness.assert_buffer_contents("bc\nef");
+}
+
+#[tokio::test]
+async fn dot_repeats_an_insert_session_as_one_semantic_change() {
+    let buffer = Buffer::new(None, "one\ntwo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "iX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "j.").await;
+
+    harness.assert_buffer_contents("Xone\nXtwo");
+    assert!(harness.is_normal());
+}
+
+#[tokio::test]
+async fn dot_repeats_inserted_and_replaced_literal_periods() {
+    let buffer = Buffer::new(None, "one\ntwo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "i.foo").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "j.").await;
+
+    harness.assert_buffer_contents(".fooone\ntw.fooo");
+
+    let buffer = Buffer::new(None, "ab\ncd".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "r.j.").await;
+
+    harness.assert_buffer_contents(".b\n.d");
+
+    let buffer = Buffer::new(None, "a.b\nc.d".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "df.j.").await;
+
+    harness.assert_buffer_contents("b\nd");
+}
+
+#[tokio::test]
+async fn dot_recomputes_operator_motion_at_the_new_location() {
+    let buffer = Buffer::new(None, "alpha beta\ngamma delta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "dwj.").await;
+
+    harness.assert_buffer_contents("beta\ndelta");
+}
+
+#[tokio::test]
+async fn count_before_dot_replays_the_completed_change_multiple_times() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "x2.").await;
+
+    harness.assert_buffer_contents("def");
+}
+
+#[tokio::test]
+async fn failed_change_does_not_replace_the_last_repeatable_change() {
+    let buffer = Buffer::new(None, "a\n\nbc".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "xjxj.").await;
+
+    harness.assert_buffer_contents("\n\nc");
+}
+
+#[tokio::test]
+async fn dot_covers_text_objects_replace_indent_and_open_line_changes() {
+    let buffer = Buffer::new(None, "alpha beta\ngamma delta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "diwj.").await;
+    harness.assert_buffer_contents(" beta\n delta");
+
+    let buffer = Buffer::new(None, "ab\ncd".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "rXj.").await;
+    harness.assert_buffer_contents("Xb\nXd");
+
+    let buffer = Buffer::new(None, "one\ntwo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, ">>j.").await;
+    harness.assert_buffer_contents("    one\n    two");
+
+    let buffer = Buffer::new(None, "one\ntwo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "oX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "j.").await;
+    harness.assert_buffer_contents("one\nX\ntwo\nX");
+}
+
+#[tokio::test]
+async fn counted_replace_and_dot_recompute_at_the_new_cursor() {
+    let buffer = Buffer::new(None, "abcd\nefgh".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "3rXj.").await;
+
+    harness.assert_buffer_contents("XXXd\nXXXh");
+}
+
+#[test]
+fn dot_repeats_linewise_paste_and_visual_block_insert() {
+    // Pin the normal test-thread budget even when RUST_MIN_STACK is larger.
+    // Dot-repeat nests action dispatch while completing visual-block replay.
+    std::thread::Builder::new()
+        .name("dot-repeat-stack-regression".into())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(assert_dot_repeats_linewise_paste_and_visual_block_insert());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn assert_dot_repeats_linewise_paste_and_visual_block_insert() {
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "yyjpj.").await;
+    harness.assert_buffer_contents("one\ntwo\none\nthree\none\nfour");
+    harness.assert_cursor_at(0, 4);
+
+    let buffer = Buffer::new(None, "a\nb\nc\nd".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "jIX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    harness.assert_cursor_at(0, 0);
+    type_normal_keys(&mut harness, "jj.").await;
+    harness.assert_buffer_contents("Xa\nXb\nXc\nXd");
+}
+
+#[tokio::test]
+async fn macro_records_and_replays_normal_insert_and_motion_events() {
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "qaiX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "jq@a@@").await;
+
+    harness.assert_buffer_contents("Xone\nXtwo\nXthree");
+}
+
+#[tokio::test]
+async fn macro_records_literal_q_input_before_the_normal_mode_stop() {
+    let buffer = Buffer::new(None, "one\ntwo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "qaiq").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "jq@a").await;
+
+    harness.assert_buffer_contents("qone\nqtwo");
+
+    let buffer = Buffer::new(None, "ab\ncd".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "qarqjq@a").await;
+
+    harness.assert_buffer_contents("qb\nqd");
+}
+
+#[tokio::test]
+async fn counted_macro_playback_runs_the_register_repeatedly() {
+    let buffer = Buffer::new(None, "abc\ndef\nghi".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "qaxjq2@a").await;
+
+    harness.assert_buffer_contents("bc\nef\nhi");
+}
+
+#[tokio::test]
+async fn macro_register_notation_can_be_inspected_and_edited() {
+    let buffer = Buffer::new(None, "one\ntwo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    harness
+        .execute_action(Action::SetMacroRegister {
+            register: 'a',
+            keys: "i!<Esc>j".to_string(),
+        })
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "@a@a").await;
+    harness
+        .execute_action(Action::PrintRegisters)
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("!one\n!two");
+    assert!(harness
+        .last_error()
+        .is_some_and(|message| message.contains("a: i!<Esc>j")));
+}
+
+#[tokio::test]
+async fn recursive_macro_stops_at_the_deterministic_depth_limit() {
+    let buffer = Buffer::new(None, "text".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .execute_action(Action::SetMacroRegister {
+            register: 'a',
+            keys: "@a".to_string(),
+        })
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "@a").await;
+
+    assert!(harness
+        .last_error()
+        .is_some_and(|message| message.contains("macro recursion limit")));
+    harness.assert_buffer_contents("text");
+}
+
+#[tokio::test]
+async fn named_mark_tracks_insertions_with_right_affinity_and_undo_redo() {
+    let buffer = Buffer::new(None, "alpha\nbeta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "maiX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "`a").await;
+    harness.assert_cursor_at(1, 0);
+
+    type_normal_keys(&mut harness, "u`a").await;
+    harness.assert_cursor_at(0, 0);
+
+    harness.execute_action(Action::Redo).await.unwrap();
+    type_normal_keys(&mut harness, "`a").await;
+    harness.assert_cursor_at(1, 0);
+}
+
+#[tokio::test]
+async fn mark_jumps_participate_in_the_jumplist_and_support_linewise_motion() {
+    let buffer = Buffer::new(None, "  alpha\nbeta\ngamma".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "maG'a").await;
+    harness.assert_cursor_at(2, 0);
+
+    type_normal_keys(&mut harness, "''").await;
+    harness.assert_cursor_at(0, 2);
+
+    type_normal_keys(&mut harness, "''").await;
+    harness.assert_cursor_at(2, 0);
+}
+
+#[tokio::test]
+async fn last_change_and_last_visual_marks_are_available() {
+    let buffer = Buffer::new(None, "alpha\nbeta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "xG`.").await;
+    harness.assert_cursor_at(0, 0);
+
+    type_normal_keys(&mut harness, "vl").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "G`<").await;
+    harness.assert_cursor_at(0, 0);
+    type_normal_keys(&mut harness, "`>").await;
+    harness.assert_cursor_at(1, 0);
+}
+
+#[tokio::test]
+async fn gv_restores_the_last_visual_area_mode_and_direction() {
+    let buffer = Buffer::new(None, "abcdef\nsecond".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "llvh").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "Ggv").await;
+
+    harness.assert_mode(Mode::Visual);
+    assert_eq!(harness.selection(), Some((1, 0, 2, 0)));
+    harness.assert_cursor_at(1, 0);
+
+    harness.execute_action(Action::MoveLeft).await.unwrap();
+    assert_eq!(harness.selection(), Some((0, 0, 2, 0)));
+}
+
+#[tokio::test]
+async fn gv_in_visual_mode_exchanges_current_and_previous_areas() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "vl").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "llvl").await;
+    assert_eq!(harness.selection(), Some((3, 0, 4, 0)));
+
+    type_normal_keys(&mut harness, "gv").await;
+    assert_eq!(harness.selection(), Some((0, 0, 1, 0)));
+
+    type_normal_keys(&mut harness, "gv").await;
+    assert_eq!(harness.selection(), Some((3, 0, 4, 0)));
+}
+
+#[tokio::test]
+async fn gv_restores_line_and_block_modes_after_session_recovery() {
+    for mode in [Mode::VisualLine, Mode::VisualBlock] {
+        let contents = "one\ntwo\nthree";
+        let buffer = Buffer::new(None, contents.to_string());
+        let mut source = EditorHarness::with_config(buffer, default_key_config());
+        source
+            .execute_action(Action::EnterMode(mode))
+            .await
+            .unwrap();
+        source.execute_action(Action::MoveDown).await.unwrap();
+        source
+            .execute_action(Action::EnterMode(Mode::Normal))
+            .await
+            .unwrap();
+        let snapshot = source.editor.test_session_snapshot();
+
+        let buffer = Buffer::new(None, contents.to_string());
+        let mut restored = EditorHarness::with_config(buffer, default_key_config());
+        restored.editor.restore_session_snapshot(&snapshot).unwrap();
+        restored
+            .execute_action(Action::RestoreLastVisualSelection)
+            .await
+            .unwrap();
+
+        restored.assert_mode(mode);
+        assert_eq!(
+            restored.selection().map(|(_, y0, _, y1)| (y0, y1)),
+            Some((0, 1))
+        );
+    }
+}
+
+#[tokio::test]
+async fn global_mark_reopens_a_closed_file_buffer() {
+    let marked_path = temp_file_path("global-mark");
+    let other_path = temp_file_path("global-mark-other");
+    fs::write(&marked_path, "alpha\nbeta").unwrap();
+    fs::write(&other_path, "other").unwrap();
+    let buffer = Buffer::new(Some(marked_path.clone()), "alpha\nbeta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "jmA").await;
+    harness
+        .execute_action(Action::OpenFile(other_path.clone()))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::OpenFile(marked_path.clone()))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::DeleteBuffer(/*force*/ true))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "`A").await;
+
+    harness.assert_buffer_contents("alpha\nbeta");
+    harness.assert_cursor_at(0, 1);
+    fs::remove_file(marked_path).unwrap();
+    fs::remove_file(other_path).unwrap();
+}
+
+#[tokio::test]
+async fn opening_file_survives_an_lsp_did_open_failure() {
+    let path = temp_file_path("open-with-failed-lsp");
+    fs::write(&path, "fn main() {}\n").unwrap();
+    let lsp = RecordingLsp::failing_next_did_open();
+    let mut editor = Editor::test_with_size(
+        Box::new(lsp),
+        80,
+        24,
+        Config::default(),
+        Theme::default(),
+        vec![Buffer::new(None, String::new())],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+
+    editor
+        .test_execute_production_action(Action::OpenFile(path.clone()))
+        .await
+        .expect("an unavailable language server should not abort file navigation");
+
+    assert_eq!(
+        editor.test_current_buffer().file.as_deref(),
+        Some(path.as_str())
+    );
+    assert!(editor.test_last_error().is_some_and(|error| {
+        error.contains("Language server unavailable") && error.contains("injected didOpen failure")
+    }));
+
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn jumplist_switches_buffers_but_forgets_a_deleted_buffer() {
+    let first_path = temp_file_path("jumplist-first");
+    let second_path = temp_file_path("jumplist-second");
+    fs::write(&first_path, "one\ntwo\nthree").unwrap();
+    fs::write(&second_path, "alpha\nbeta").unwrap();
+    let buffer = Buffer::new(Some(first_path.clone()), "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::OpenFile(second_path.clone()))
+        .await
+        .unwrap();
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_buffer_contents("one\ntwo\nthree");
+    harness.assert_cursor_at(0, 1);
+    harness.execute_action(Action::JumpForward).await.unwrap();
+    harness.assert_buffer_contents("alpha\nbeta");
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness
+        .execute_action(Action::DeleteBuffer(/*force*/ true))
+        .await
+        .unwrap();
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_buffer_contents("alpha\nbeta");
+    assert!(harness.commandline_row().contains("at start of jump list"));
+
+    fs::remove_file(first_path).unwrap();
+    fs::remove_file(second_path).unwrap();
+}
+
+#[tokio::test]
+async fn mark_tracks_a_visual_block_multi_edit_transaction() {
+    let mut harness = EditorHarness::with_content("a\nb\nc");
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.execute_action(Action::SetMark('a')).await.unwrap();
+    harness.execute_action(Action::MoveUp).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualBlock))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.execute_action(Action::InsertBlock).await.unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('X'))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "`a").await;
+    harness.assert_cursor_at(1, 1);
+    harness.execute_action(Action::Undo).await.unwrap();
+    type_normal_keys(&mut harness, "`a").await;
+    harness.assert_cursor_at(0, 1);
+    harness.execute_action(Action::Redo).await.unwrap();
+    type_normal_keys(&mut harness, "`a").await;
+    harness.assert_cursor_at(1, 1);
+}
+
+#[tokio::test]
+async fn substitute_supports_current_whole_numeric_and_visual_ranges() {
+    let mut harness = EditorHarness::with_content("foo foo\nFoo foo\nfoo foo");
+    harness
+        .execute_action(Action::Command("s/foo/one/".to_string()))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("one foo\nFoo foo\nfoo foo");
+
+    harness
+        .execute_action(Action::Command("2,3s/foo/two/gi".to_string()))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("one foo\ntwo two\ntwo two");
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("one foo\nFoo foo\nfoo foo");
+
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualLine))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::Command("'<,'>s/o/O/g".to_string()))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("One fOO\nFOO fOO\nfoo foo");
+
+    harness
+        .execute_action(Action::Command("%s/foo/end/g".to_string()))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("One fOO\nFOO fOO\nend end");
+}
+
+#[tokio::test]
+async fn visual_colon_prefills_last_visual_range_and_can_be_cancelled() {
+    for mode in [Mode::Visual, Mode::VisualLine, Mode::VisualBlock] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "one\ntwo\nthree".to_string()),
+            default_key_config(),
+        );
+        harness
+            .execute_action(Action::EnterMode(mode))
+            .await
+            .unwrap();
+        harness.execute_action(Action::MoveDown).await.unwrap();
+
+        command_key(&mut harness, KeyCode::Char(':')).await;
+
+        harness.assert_mode(Mode::Command);
+        assert_eq!(harness.commandline_text(), "'<,'>");
+
+        command_key(&mut harness, KeyCode::Backspace).await;
+        assert_eq!(harness.commandline_text(), "'<,'");
+        command_key(&mut harness, KeyCode::Esc).await;
+        harness.assert_mode(Mode::Normal);
+        assert_eq!(harness.commandline_text(), "");
+    }
+}
+
+#[tokio::test]
+async fn visual_colon_substitute_is_line_scoped_for_every_visual_mode() {
+    for mode in [Mode::Visual, Mode::VisualLine, Mode::VisualBlock] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "foo foo\nFoo foo\nfoo foo".to_string()),
+            default_key_config(),
+        );
+        harness
+            .execute_action(Action::EnterMode(mode))
+            .await
+            .unwrap();
+        harness.execute_action(Action::MoveDown).await.unwrap();
+
+        command_key(&mut harness, KeyCode::Char(':')).await;
+        type_normal_keys(&mut harness, "s/foo/bar/gi").await;
+        command_key(&mut harness, KeyCode::Enter).await;
+
+        harness.assert_mode(Mode::Normal);
+        harness.assert_buffer_contents("bar bar\nbar bar\nfoo foo");
+        harness.execute_action(Action::Undo).await.unwrap();
+        harness.assert_buffer_contents("foo foo\nFoo foo\nfoo foo");
+    }
+}
+
+#[tokio::test]
+async fn confirmed_substitute_tracks_each_match_and_is_one_undo_transaction() {
+    let mut harness = EditorHarness::with_content("foo foo\nalpha beta\nfoo gamma");
+    harness
+        .execute_action(Action::Command("%s/foo/bar/gc".to_string()))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("foo foo\nalpha beta\nfoo gamma");
+    harness.assert_cursor_at(0, 0);
+    let first_match = harness.render_cursor_position().unwrap();
+
+    type_normal_keys(&mut harness, "y").await;
+    harness.assert_cursor_at(4, 0);
+    assert_eq!(
+        harness.render_cursor_position(),
+        Some((first_match.0 + 4, first_match.1))
+    );
+
+    type_normal_keys(&mut harness, "n").await;
+    harness.assert_cursor_at(0, 2);
+    assert_eq!(
+        harness.render_cursor_position(),
+        Some((first_match.0, first_match.1 + 2))
+    );
+
+    type_normal_keys(&mut harness, "a").await;
+    harness.assert_buffer_contents("bar foo\nalpha beta\nbar gamma");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("foo foo\nalpha beta\nfoo gamma");
+}
+
+#[tokio::test]
+async fn confirmed_substitute_scrolls_to_an_offscreen_match() {
+    let content = (0..10)
+        .map(|line| {
+            if matches!(line, 0 | 9) {
+                "foo".to_string()
+            } else {
+                format!("line {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config_and_size(
+        buffer,
+        Config::default(),
+        /*width*/ 40,
+        /*height*/ 5,
+    );
+    harness
+        .execute_action(Action::Command("%s/foo/bar/gc".to_string()))
+        .await
+        .unwrap();
+    let first_match = harness.render_cursor_position().unwrap();
+
+    type_normal_keys(&mut harness, "y").await;
+
+    assert_eq!(harness.buffer_line(), 9);
+    assert_eq!(harness.viewport_top(), 7);
+    assert_eq!(
+        harness.render_cursor_position(),
+        Some((first_match.0, first_match.1 + 2))
+    );
+}
+
+#[tokio::test]
+async fn substitute_uses_rust_regex_captures_and_escaped_delimiters() {
+    let mut harness = EditorHarness::with_content("path/a-12 path/b-34");
+    harness
+        .execute_action(Action::Command(
+            r"s/path\/([a-z])-(\d+)/$1:$2/g".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("a:12 b:34");
+}
+
+#[tokio::test]
+async fn visual_substitute_replacement_supports_vim_line_breaks() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "one two\nthree four\nkeep same".to_string()),
+        default_key_config(),
+    );
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualLine))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    command_key(&mut harness, KeyCode::Char(':')).await;
+    type_normal_keys(&mut harness, r"s/ /\r/g").await;
+    command_key(&mut harness, KeyCode::Enter).await;
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_buffer_contents("one\ntwo\nthree\nfour\nkeep same");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("one two\nthree four\nkeep same");
+}
+
+#[tokio::test]
+async fn substitute_line_break_replacement_preserves_crlf() {
+    let buffer = Buffer::new(None, "one two\r\nthree four\r\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    harness
+        .execute_action(Action::Command(r"%s/ /\r/g".to_string()))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("one\r\ntwo\r\nthree\r\nfour\r\n");
+}
+
+#[tokio::test]
+async fn substitute_replacement_preserves_non_newline_escapes() {
+    let mut harness = EditorHarness::with_content("value");
+    harness
+        .execute_action(Action::Command(r"s/value/\n/".to_string()))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents(r"\n");
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness
+        .execute_action(Action::Command(r"s/value/\\r/".to_string()))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents(r"\r");
+}
+
+#[tokio::test]
+async fn substitute_does_not_match_the_carriage_return_in_crlf_buffers() {
+    let buffer = Buffer::new(None, "abc\r\ndef\r\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    harness
+        .execute_action(Action::Command("%s/.$/X/".to_string()))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("abX\r\ndeX\r\n");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abc\r\ndef\r\n");
+}
+
+#[tokio::test]
+async fn substitute_preserves_unicode_marks_across_undo_and_redo() {
+    let source = "😀 value one\r\n😀 value two\r\n😀 value three\r\n";
+    let replacement = "longer_value";
+    let mut harness =
+        EditorHarness::with_config(Buffer::new(None, source.to_string()), default_key_config());
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    for _ in 0..8 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    harness.execute_action(Action::SetMark('a')).await.unwrap();
+    harness
+        .execute_action(Action::Command(format!("%s/value/{replacement}/g")))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents(&source.replace("value", replacement));
+    type_normal_keys(&mut harness, "`a").await;
+    harness.assert_cursor_at(8 + replacement.len() - "value".len(), 1);
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(source);
+    type_normal_keys(&mut harness, "`a").await;
+    harness.assert_cursor_at(8, 1);
+
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents(&source.replace("value", replacement));
+    type_normal_keys(&mut harness, "`a").await;
+    harness.assert_cursor_at(8 + replacement.len() - "value".len(), 1);
+}
+
+#[tokio::test]
+async fn format_on_save_restores_save_as_identity_and_insert_transaction_after_sync_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.rs");
+    let target = temp.path().join("target.py");
+    fs::write(&source, "disk source\n").unwrap();
+    let source_file = source.to_string_lossy().into_owned();
+    let target_file = target.to_string_lossy().into_owned();
+    let lsp = RecordingLsp::failing_next_did_open();
+    let events = lsp.events();
+    let config = Config::default();
+    let mut editor = Editor::test_with_size(
+        Box::new(lsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        config,
+        Theme::default(),
+        vec![Buffer::new(
+            Some(source_file.clone()),
+            "unsaved source\n".to_string(),
+        )],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    editor
+        .test_execute_production_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    assert!(editor
+        .test_current_buffer()
+        .undo_history
+        .is_transaction_active());
+
+    let error = editor
+        .test_execute_production_action(Action::SaveAs(target_file.clone()))
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("injected didOpen failure"));
+    assert!(editor.test_is_insert());
+    assert!(editor
+        .test_current_buffer()
+        .undo_history
+        .is_transaction_active());
+    assert_eq!(
+        editor.test_current_buffer().file.as_deref(),
+        Some(source_file.as_str())
+    );
+    assert_eq!(editor.test_current_buffer().contents(), "unsaved source\n");
+    assert_eq!(fs::read_to_string(&source).unwrap(), "disk source\n");
+    assert!(!target.exists());
+    let events = events.lock().unwrap();
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, LspEvent::DidOpen(file) if file == &target_file)));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, LspEvent::DidOpen(file) if file == &source_file)));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn crash_recovery_keeps_transcript_in_memory_when_preferences_are_unsafe() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside = temp.path().join("outside-preferences.json");
+    let preferences_path = temp.path().join("preferences.json");
+    let recovered_path = temp.path().join("recovered.txt");
+    fs::write(&outside, "outside secret").unwrap();
+    fs::write(&recovered_path, "disk base\n").unwrap();
+    std::os::unix::fs::symlink(&outside, &preferences_path).unwrap();
+    let buffer = Buffer::new(
+        Some(recovered_path.to_string_lossy().into_owned()),
+        "recovered text\n".to_string(),
+    );
+    let mut source = EditorHarness::with_config(buffer, default_key_config());
+    let mut snapshot = source.editor.test_session_snapshot();
+    snapshot.agent_transcript = Some("You: recover me\nAgent: retained\n".to_string());
+    let mut conversation = red::agent_conversation::AgentConversationSnapshot::new(
+        "thread-recoverable",
+        temp.path().to_string_lossy(),
+    );
+    conversation.append_user("turn-1", "recover me");
+    conversation.append_agent_delta("turn-1", "retained");
+    snapshot.agent_conversation = Some(conversation.clone());
+    snapshot.agent_session_resumable = true;
+    let restored_buffers = Editor::buffers_from_session_snapshot(&snapshot);
+    let preferences = PreferencesStore::load(&preferences_path);
+    let mut editor = Editor::test_with_size_and_preferences(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        default_key_config(),
+        Theme::default(),
+        restored_buffers,
+        preferences,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+
+    fs::write(&recovered_path, "external change\n").unwrap();
+    let divergences = editor.restore_session_snapshot(&snapshot).unwrap();
+
+    let recovered = editor.test_session_snapshot();
+    assert_eq!(divergences.len(), 1);
+    assert_eq!(
+        recovered.agent_transcript.as_deref(),
+        Some("You: recover me\nAgent: retained\n")
+    );
+    assert_eq!(recovered.agent_conversation, Some(conversation));
+    assert_eq!(recovered.buffers[0].contents, "recovered text\n");
+    assert_eq!(fs::read_to_string(outside).unwrap(), "outside secret");
+    let restored = EditorHarness { editor };
+    assert!(restored.last_error().is_some_and(|message| {
+        message.contains("changed on disk") && message.contains("could not be persisted")
+    }));
+}
+
+#[tokio::test]
+async fn crash_session_finalizes_an_active_insert_transaction_in_the_snapshot() {
+    let buffer = Buffer::new(None, "base\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "iuser ").await;
+    assert!(harness.is_insert());
+
+    let snapshot = harness.editor.test_session_snapshot();
+    let mut restored_buffers = Editor::buffers_from_session_snapshot(&snapshot);
+    let mut restored = EditorHarness::with_config(restored_buffers.remove(0), default_key_config());
+
+    restored.assert_buffer_contents("user base\n");
+    restored.execute_action(Action::Undo).await.unwrap();
+    restored.assert_buffer_contents("base\n");
+    assert!(harness.is_insert());
+}
+
+#[tokio::test]
+async fn unchanged_recovery_snapshots_are_skipped_and_failures_back_off() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = red::session::SessionStore::for_owner(directory.path(), "editor-one").unwrap();
+    let buffer = Buffer::new(None, "base\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.set_session_store(store.clone());
+
+    harness
+        .editor
+        .test_persist_session_snapshot(/*force*/ true, /*due*/ true);
+    let generation = store.load().unwrap().generation;
+    harness
+        .editor
+        .test_persist_session_snapshot(/*force*/ false, /*due*/ true);
+    assert_eq!(store.load().unwrap().generation, generation);
+
+    let blocked_root = directory.path().join("not-a-directory");
+    fs::write(&blocked_root, "blocked").unwrap();
+    let blocked = red::session::SessionStore::for_owner(&blocked_root, "editor-two").unwrap();
+    harness.editor.set_session_store(blocked);
+    harness
+        .editor
+        .test_persist_session_snapshot(/*force*/ false, /*due*/ true);
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    harness
+        .editor
+        .test_persist_session_snapshot(/*force*/ false, /*due*/ false);
+    assert!(harness.editor.test_session_snapshot_is_backing_off());
+
+    let warning = harness.commandline_row();
+    assert!(warning.contains("Crash recovery is not being saved"));
+    let warning_id = harness
+        .editor
+        .notifications()
+        .primary(Instant::now())
+        .unwrap()
+        .id;
+
+    let error_id = harness
+        .editor
+        .publish_notification(Notice::new(
+            NotificationSource::Editor,
+            Severity::Error,
+            "a newer LSP error",
+        ))
+        .unwrap();
+    let status = harness.commandline_row();
+    assert!(status.contains("a newer LSP error"));
+    assert!(status.contains("2 need attention"));
+    assert!(harness
+        .editor
+        .notifications()
+        .get(warning_id)
+        .unwrap()
+        .is_active(Instant::now()));
+    harness.editor.test_set_size(/*width*/ 8, /*height*/ 4);
+    assert_eq!(harness.commandline_row(), "× a  [2]");
+    harness.editor.test_set_size(/*width*/ 120, /*height*/ 24);
+
+    harness.execute_action(Action::OpenMessages).await.unwrap();
+    harness
+        .execute_action(Action::MessageHistory(MessageAction::Acknowledge))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::MessageHistory(MessageAction::Close))
+        .await
+        .unwrap();
+    assert!(!harness
+        .editor
+        .notifications()
+        .get(error_id)
+        .unwrap()
+        .is_active(Instant::now()));
+
+    harness
+        .execute_action(Action::Command("1".to_string()))
+        .await
+        .unwrap();
+    harness.editor.test_set_size(/*width*/ 120, /*height*/ 24);
+    assert!(harness
+        .commandline_row()
+        .contains("Crash recovery is not being saved"));
+
+    harness.editor.set_session_store(store);
+    harness
+        .editor
+        .test_persist_session_snapshot(/*force*/ true, /*due*/ true);
+    assert!(!harness
+        .commandline_row()
+        .contains("Crash recovery is not being saved"));
+}
+
+#[tokio::test]
+async fn periodic_recovery_snapshot_materializes_shared_buffer_contents() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = red::session::SessionStore::for_owner(directory.path(), "editor-one").unwrap();
+    let expected = format!("prefix 👋 {}\n", "text ".repeat(64 * 1024));
+    let buffer = Buffer::new(None, expected.clone());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.set_session_store(store.clone());
+
+    harness
+        .editor
+        .test_persist_session_snapshot(/*force*/ false, /*due*/ true);
+    harness.editor.test_finish_session_snapshot();
+
+    assert_eq!(store.load().unwrap().buffers[0].contents, expected);
+}
+
+fn tree_rows() -> Vec<PanelRow> {
+    ["root", "src", "main.rs"]
+        .into_iter()
+        .map(|id| PanelRow {
+            id: id.to_string(),
+            path: Some(id.to_string()),
+            expanded: Some(false),
+            kind: if id.ends_with(".rs") {
+                PanelRowKind::File
+            } else {
+                PanelRowKind::Directory
+            },
+            segments: vec![PanelSegment {
+                text: id.to_string(),
+                style: None,
+                semantic: None,
+            }],
+            right_segments: vec![],
+        })
+        .collect()
+}
+
+fn numbered_tree_rows(count: usize) -> Vec<PanelRow> {
+    (0..count)
+        .map(|index| {
+            let id = format!("row-{index:02}.rs");
+            PanelRow {
+                id: id.clone(),
+                path: Some(id.clone()),
+                expanded: Some(false),
+                kind: PanelRowKind::File,
+                segments: vec![PanelSegment {
+                    text: id,
+                    style: None,
+                    semantic: None,
+                }],
+                right_segments: vec![],
+            }
+        })
+        .collect()
+}
+
+fn add_tree_panel(harness: &mut EditorHarness) {
+    harness.editor.test_create_panel(
+        "tree",
+        PanelConfig {
+            side: PanelSide::Left,
+            width: 20,
+            title: None,
+            composer: None,
+            surface: None,
+            border: None,
+            header_actions: Vec::new(),
+        },
+    );
+    harness.editor.test_update_panel("tree", tree_rows());
+}
+
+async fn command_key(harness: &mut EditorHarness, code: KeyCode) {
+    harness
+        .execute_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn command_backspace_exits_an_empty_prompt() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "unchanged".to_string()),
+        default_key_config(),
+    );
+    command_key(&mut harness, KeyCode::Char(':')).await;
+    harness.assert_mode(Mode::Command);
+    assert_eq!(harness.commandline_row().trim_end(), ":");
+
+    command_key(&mut harness, KeyCode::Backspace).await;
+
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(harness.commandline_text(), "");
+    assert_eq!(harness.commandline_row().trim_end(), "");
+    harness.assert_buffer_contents("unchanged");
+}
+
+#[tokio::test]
+async fn command_backspace_deletes_text_before_exiting() {
+    for character in ['x', 'é', ' '] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "unchanged".to_string()),
+            default_key_config(),
+        );
+        command_key(&mut harness, KeyCode::Char(':')).await;
+        command_key(&mut harness, KeyCode::Char(character)).await;
+
+        command_key(&mut harness, KeyCode::Backspace).await;
+
+        harness.assert_mode(Mode::Command);
+        assert_eq!(harness.commandline_text(), "");
+        assert_eq!(harness.commandline_row().trim_end(), ":");
+
+        command_key(&mut harness, KeyCode::Backspace).await;
+        harness.assert_mode(Mode::Normal);
+        assert_eq!(harness.commandline_row().trim_end(), "");
+        harness.assert_buffer_contents("unchanged");
+    }
+}
+
+struct CurrentDirGuard {
+    original: PathBuf,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl Drop for CurrentDirGuard {
+    fn drop(&mut self) {
+        env::set_current_dir(&self.original).unwrap();
+    }
+}
+
+fn protected_current_dir() -> CurrentDirGuard {
+    let lock = COMMAND_COMPLETION_CWD_LOCK.lock().unwrap();
+    CurrentDirGuard {
+        original: env::current_dir().unwrap(),
+        _lock: lock,
+    }
+}
+
+fn command_completion_temp_dir(name: &str) -> (PathBuf, CurrentDirGuard) {
+    let guard = protected_current_dir();
+    let root = env::temp_dir().join(format!(
+        "red-command-completion-{name}-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    env::set_current_dir(&root).unwrap();
+    (root, guard)
+}
+
+async fn wait_for_shell_command(harness: &mut EditorHarness) -> Notification {
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            harness.editor.test_service_background().await.unwrap();
+            if let Some(record) = harness
+                .editor
+                .notifications()
+                .records()
+                .rfind(|record| record.content.summary.starts_with("Shell "))
+                .filter(|record| !record.is_running())
+            {
+                return record.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    match result {
+        Ok(record) => record,
+        Err(_) => panic!(
+            "shell command did not complete; error: {:?}; notifications: {:?}",
+            harness.last_error(),
+            harness
+                .editor
+                .notifications()
+                .records()
+                .map(|record| (&record.content.summary, record.state))
+                .collect::<Vec<_>>()
+        ),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_streams_pipeline_output_into_message_history() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("unchanged");
+    harness
+        .execute_action(Action::Command(
+            "!printf 'hello world' | tr a-z A-Z".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Succeeded)
+    );
+    assert!(record
+        .content
+        .details
+        .as_deref()
+        .unwrap()
+        .contains("HELLO WORLD"));
+    harness.assert_buffer_contents("unchanged");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_reports_stdout_stderr_and_exit_status() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("");
+    harness
+        .execute_action(Action::Command(
+            "!sh -c 'printf standard; printf problem >&2; exit 7'".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+    let details = record.content.details.as_deref().unwrap();
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Failed)
+    );
+    assert!(record.content.summary.contains('7'));
+    assert!(details.contains("standard"), "{details}");
+    assert!(details.contains("problem"), "{details}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_repeats_previous_command_with_double_bang() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("");
+    harness
+        .execute_action(Action::Command("!printf repeated".to_string()))
+        .await
+        .unwrap();
+    let first = wait_for_shell_command(&mut harness).await;
+
+    harness
+        .execute_action(Action::Command("!!".to_string()))
+        .await
+        .unwrap();
+    let second = wait_for_shell_command(&mut harness).await;
+
+    assert_ne!(first.id, second.id);
+    assert_eq!(
+        second.state,
+        NotificationState::Finished(ProgressOutcome::Succeeded)
+    );
+    assert!(second
+        .content
+        .details
+        .as_deref()
+        .unwrap()
+        .contains("repeated"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_expands_current_and_alternate_file_names() {
+    let _cwd_guard = protected_current_dir();
+    let lsp = Box::new(MockLsp) as Box<dyn LspClient + Send>;
+    let mut editor = Editor::test_with_size(
+        lsp,
+        /*width*/ 100,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        vec![
+            Buffer::new(Some("first file.rs".to_string()), "first".to_string()),
+            Buffer::new(Some("second file.rs".to_string()), "second".to_string()),
+        ],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+    harness.execute_action(Action::NextBuffer).await.unwrap();
+
+    harness
+        .execute_action(Action::Command("!echo '%' '#'".to_string()))
+        .await
+        .unwrap();
+    let record = wait_for_shell_command(&mut harness).await;
+    let details = record.content.details.as_deref().unwrap();
+
+    assert!(
+        details.contains("second file.rs first file.rs"),
+        "{details}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_uses_the_editor_working_directory() {
+    let (root, _guard) = command_completion_temp_dir("shell-command");
+    let mut harness = EditorHarness::with_content("");
+    harness
+        .execute_action(Action::Command("!pwd".to_string()))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    let reported = record
+        .content
+        .details
+        .as_deref()
+        .unwrap()
+        .lines()
+        .last()
+        .unwrap();
+    assert_eq!(
+        fs::canonicalize(reported).unwrap(),
+        fs::canonicalize(root).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_bounds_output_and_repairs_invalid_utf8() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("");
+    harness
+        .execute_action(Action::Command(
+            "!python3 -c 'import sys; sys.stdout.buffer.write(b\"x\"*70000+b\"TAIL\"+bytes([255]))'"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+    let details = record.content.details.as_deref().unwrap();
+
+    assert!(details.len() <= 64 * 1024);
+    assert!(details.contains("[Earlier output truncated by Red]"));
+    assert!(details.ends_with("TAIL�"), "{}", details.len());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_does_not_inherit_interactive_stdin() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("");
+    harness
+        .execute_action(Action::Command(
+            "!sh -c 'if read value; then printf unexpected; else printf stdin-closed; fi'"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert!(record
+        .content
+        .details
+        .as_deref()
+        .unwrap()
+        .ends_with("stdin-closed"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_reconciles_external_edits_without_overwriting_dirty_buffers() {
+    let _cwd_guard = protected_current_dir();
+    for dirty in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("watched.txt");
+        fs::write(&path, "before\n").unwrap();
+        let source = Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "before\n".to_string(),
+        );
+        let mut harness = EditorHarness::with_buffer(source);
+        harness.editor.test_service_background().await.unwrap();
+        if dirty {
+            harness
+                .execute_action(Action::InsertCharAtCursorPos('!'))
+                .await
+                .unwrap();
+        }
+        harness
+            .execute_action(Action::Command(
+                "!sh -c 'printf outside > \"%\"'".to_string(),
+            ))
+            .await
+            .unwrap();
+        let record = wait_for_shell_command(&mut harness).await;
+        assert_eq!(
+            record.state,
+            NotificationState::Finished(ProgressOutcome::Succeeded)
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                harness.editor.test_service_background().await.unwrap();
+                if dirty {
+                    if harness
+                        .editor
+                        .test_current_buffer()
+                        .has_external_file_conflict()
+                    {
+                        break;
+                    }
+                } else if harness.buffer_contents() == "outside" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shell-written file was not reconciled");
+
+        if dirty {
+            assert_eq!(harness.buffer_contents(), "!before\n");
+            assert_eq!(fs::read_to_string(&path).unwrap(), "outside");
+        } else {
+            harness.assert_buffer_contents("outside");
+            assert!(!harness.is_dirty());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_command_ctrl_c_cancels_the_selected_running_process() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("still here");
+    harness
+        .execute_action(Action::Command("!sleep 30".to_string()))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Cancelled)
+    );
+    harness.assert_buffer_contents("still here");
+}
+
+#[tokio::test]
+async fn shell_command_rejects_missing_context_and_unsafe_bufdo_execution() {
+    let mut harness = EditorHarness::with_content("");
+    for (command, expected) in [
+        ("!", "usage: !{shell command}"),
+        ("!!", "No previous shell command"),
+        ("!echo %", "No current file name"),
+        ("!echo #", "No alternate file name"),
+    ] {
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+        assert!(
+            harness.last_error().unwrap().contains(expected),
+            "{command}: {:?}",
+            harness.last_error()
+        );
+    }
+    harness
+        .execute_action(Action::Command("bufdo !echo forbidden".to_string()))
+        .await
+        .unwrap();
+
+    assert!(harness
+        .last_error()
+        .unwrap()
+        .contains("outside its supported non-interactive subset"));
+    assert!(harness
+        .editor
+        .notifications()
+        .records()
+        .all(|record| !record.content.summary.starts_with("Shell running:")));
+}
+
+#[test]
+fn shell_actions_cannot_be_deserialized_from_external_action_configuration() {
+    assert!(serde_json::from_str::<Action>(r#"{"RunShell":"echo unsafe"}"#).is_err());
+    assert!(serde_json::from_str::<Action>(
+        r#"{"RunShellFilter":{"command":"cat","start_line":0,"end_line":0}}"#
+    )
+    .is_err());
+    assert!(serde_json::from_str::<Action>(r#""CancelShellCommand""#).is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_replaces_the_whole_buffer_as_one_undoable_transaction() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("charlie\nbravo\nalpha\n");
+    harness
+        .execute_action(Action::Command("%!sort".to_string()))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Succeeded)
+    );
+    harness.assert_buffer_contents("alpha\nbravo\ncharlie\n");
+    harness.assert_cursor_at(0, 0);
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("charlie\nbravo\nalpha\n");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("alpha\nbravo\ncharlie\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_limits_numeric_ranges_and_adds_required_line_boundaries() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("before\nbravo\nalpha\nafter");
+    harness
+        .execute_action(Action::Command("2,3!sort".to_string()))
+        .await
+        .unwrap();
+    wait_for_shell_command(&mut harness).await;
+    harness.assert_buffer_contents("before\nalpha\nbravo\nafter");
+    harness.assert_cursor_at(0, 1);
+
+    harness
+        .execute_action(Action::Command("2!printf replaced".to_string()))
+        .await
+        .unwrap();
+    wait_for_shell_command(&mut harness).await;
+    harness.assert_buffer_contents("before\nreplaced\nbravo\nafter");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filters_share_previous_command_history_with_ordinary_shell_commands() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("bravo\nalpha\n");
+    harness
+        .execute_action(Action::Command("!sort".to_string()))
+        .await
+        .unwrap();
+    wait_for_shell_command(&mut harness).await;
+    harness.assert_buffer_contents("bravo\nalpha\n");
+
+    harness
+        .execute_action(Action::Command("%!!".to_string()))
+        .await
+        .unwrap();
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Succeeded)
+    );
+    harness.assert_buffer_contents("alpha\nbravo\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_uses_visual_ranges_from_every_selection_mode() {
+    let _cwd_guard = protected_current_dir();
+    for mode in [Mode::Visual, Mode::VisualLine, Mode::VisualBlock] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "before\nbravo\nalpha\nafter".to_string()),
+            default_key_config(),
+        );
+        harness.execute_action(Action::MoveDown).await.unwrap();
+        harness
+            .execute_action(Action::EnterMode(mode))
+            .await
+            .unwrap();
+        harness.execute_action(Action::MoveDown).await.unwrap();
+        command_key(&mut harness, KeyCode::Char(':')).await;
+        type_normal_keys(&mut harness, "!sort").await;
+        command_key(&mut harness, KeyCode::Enter).await;
+
+        wait_for_shell_command(&mut harness).await;
+
+        harness.assert_buffer_contents("before\nalpha\nbravo\nafter");
+        harness.execute_action(Action::Undo).await.unwrap();
+        harness.assert_buffer_contents("before\nbravo\nalpha\nafter");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_preserves_exact_stdin_and_document_line_endings() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("first\nlast");
+    harness
+        .execute_action(Action::Command(
+            "%!python3 -c 'import sys; print(repr(sys.stdin.read()), end=\"\")'".to_string(),
+        ))
+        .await
+        .unwrap();
+    wait_for_shell_command(&mut harness).await;
+    harness.assert_buffer_contents("'first\\nlast'");
+
+    let mut harness = EditorHarness::with_content("before\r\nmiddle\r\nafter\r\n");
+    harness
+        .execute_action(Action::Command("2!tr a-z A-Z".to_string()))
+        .await
+        .unwrap();
+    wait_for_shell_command(&mut harness).await;
+    harness.assert_buffer_contents("before\r\nMIDDLE\r\nafter\r\n");
+
+    let mut harness = EditorHarness::with_content("préface\n😀 café\nfin");
+    harness
+        .execute_action(Action::Command(
+            "2!python3 -c 'import sys; print(sys.stdin.read().replace(\"café\", \"λ\"), end=\"\")'"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    wait_for_shell_command(&mut harness).await;
+    harness.assert_buffer_contents("préface\n😀 λ\nfin");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_publishes_one_lsp_document_change() {
+    let _cwd_guard = protected_current_dir();
+    let path = temp_file_path("shell-filter-lsp");
+    let lsp = RecordingLsp::default();
+    let events = lsp.events();
+    let mut editor = Editor::test_with_size(
+        Box::new(lsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        vec![Buffer::new(
+            Some(path.clone()),
+            "bravo\nalpha\n".to_string(),
+        )],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+    harness
+        .execute_action(Action::Command("%!sort".to_string()))
+        .await
+        .unwrap();
+
+    wait_for_shell_command(&mut harness).await;
+
+    let changes = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, LspEvent::DidChange(file) if file == &path))
+        .count();
+    assert_eq!(changes, 1, "a filter must publish one document change");
+    harness.assert_buffer_contents("alpha\nbravo\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_empty_output_removes_only_selected_lines() {
+    let _cwd_guard = protected_current_dir();
+    for (original, command, expected) in [
+        ("before\nremove\nafter", "2!true", "before\nafter"),
+        ("before\nremove", "2!true", "before"),
+        ("before\nremove\n", "2!true", "before\n"),
+        ("remove\nall", "%!true", ""),
+    ] {
+        let mut harness = EditorHarness::with_content(original);
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+
+        wait_for_shell_command(&mut harness).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.execute_action(Action::Undo).await.unwrap();
+        harness.assert_buffer_contents(original);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_retains_complete_raw_output_while_bounding_message_history() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("input");
+    harness
+        .execute_action(Action::Command(
+            "%!python3 -c 'import sys; sys.stdout.write(\"x\"*70000+\"\\x1b[31mRAW\\x1b[0m\")'"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(harness.buffer_contents().len(), 70_012);
+    assert!(harness
+        .buffer_contents()
+        .ends_with("\u{1b}[31mRAW\u{1b}[0m"));
+    let details = record.content.details.as_deref().unwrap();
+    assert!(details.len() < 64 * 1024);
+    assert!(details.contains("[Earlier output truncated by Red]"));
+    assert!(!details.contains("\u{1b}"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_rejects_invalid_utf8_without_changing_the_buffer() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("keep me");
+    harness
+        .execute_action(Action::Command(
+            "%!python3 -c 'import sys; sys.stdout.buffer.write(bytes([255]))'".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Failed)
+    );
+    assert!(record.content.summary.contains("not valid UTF-8"));
+    harness.assert_buffer_contents("keep me");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_failed_process_preserves_input_and_reports_stderr() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("keep me\n");
+    harness
+        .execute_action(Action::Command(
+            "%!sh -c 'cat; printf problem >&2; exit 7'".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Failed)
+    );
+    assert!(record.content.summary.contains('7'));
+    assert!(record
+        .content
+        .details
+        .as_deref()
+        .unwrap()
+        .contains("problem"));
+    harness.assert_buffer_contents("keep me\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_cancellation_preserves_the_original_buffer() {
+    let _cwd_guard = protected_current_dir();
+    let mut harness = EditorHarness::with_content("still here\n");
+    harness
+        .execute_action(Action::Command("%!sleep 30".to_string()))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Cancelled)
+    );
+    harness.assert_buffer_contents("still here\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_rejects_results_when_the_target_buffer_changes() {
+    let _cwd_guard = protected_current_dir();
+    let directory = tempfile::tempdir().unwrap();
+    let gate = directory.path().join("filter-gate");
+    fs::write(&gate, "waiting").unwrap();
+    let mut harness = EditorHarness::with_content("original\n");
+    harness
+        .execute_action(Action::Command(format!(
+            "%!sh -c 'while test -f \"{}\"; do sleep 0.01; done; tr a-z A-Z'",
+            gate.display()
+        )))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('!'))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    fs::remove_file(&gate).unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Failed)
+    );
+    assert!(record.content.summary.contains("buffer changed"));
+    harness.assert_buffer_contents("!original\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_updates_its_original_buffer_without_switching_the_active_buffer() {
+    let _cwd_guard = protected_current_dir();
+    let directory = tempfile::tempdir().unwrap();
+    let gate = directory.path().join("filter-gate");
+    fs::write(&gate, "waiting").unwrap();
+    let lsp = Box::new(MockLsp) as Box<dyn LspClient + Send>;
+    let mut editor = Editor::test_with_size(
+        lsp,
+        /*width*/ 100,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        vec![
+            Buffer::new(Some("filter.rs".to_string()), "bravo\nalpha\n".to_string()),
+            Buffer::new(Some("visible.rs".to_string()), "stay visible\n".to_string()),
+        ],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+    harness
+        .execute_action(Action::Command(format!(
+            "%!sh -c 'while test -f \"{}\"; do sleep 0.01; done; sort'",
+            gate.display()
+        )))
+        .await
+        .unwrap();
+    harness.execute_action(Action::NextBuffer).await.unwrap();
+    fs::remove_file(&gate).unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Succeeded)
+    );
+    harness.assert_buffer_contents("stay visible\n");
+    assert_eq!(
+        harness.editor.test_current_buffer().file.as_deref(),
+        Some("visible.rs")
+    );
+    harness
+        .execute_action(Action::PreviousBuffer)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("alpha\nbravo\n");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("bravo\nalpha\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_filter_rejects_results_after_its_target_buffer_is_closed() {
+    let _cwd_guard = protected_current_dir();
+    let directory = tempfile::tempdir().unwrap();
+    let gate = directory.path().join("filter-gate");
+    fs::write(&gate, "waiting").unwrap();
+    let mut harness = EditorHarness::with_content("discarded\n");
+    harness
+        .execute_action(Action::Command(format!(
+            "%!sh -c 'while test -f \"{}\"; do sleep 0.01; done; cat'",
+            gate.display()
+        )))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::DeleteBuffer(/*force*/ false))
+        .await
+        .unwrap();
+    fs::remove_file(&gate).unwrap();
+
+    let record = wait_for_shell_command(&mut harness).await;
+
+    assert_eq!(
+        record.state,
+        NotificationState::Finished(ProgressOutcome::Failed)
+    );
+    assert!(record.content.summary.contains("no longer open"));
+    assert!(harness.editor.test_current_buffer().is_blank());
+}
+
+#[tokio::test]
+async fn shell_filter_rejects_invalid_ranges_and_untrusted_action_paths() {
+    let mut harness = EditorHarness::with_content("one\ntwo");
+    for (command, expected) in [
+        ("%!", "usage: !{shell command}"),
+        ("3!cat", "starts past the end"),
+        ("2,1!cat", "range start exceeds its end"),
+        ("'<,'>!cat", "last visual range is not set"),
+    ] {
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+        assert!(
+            harness.last_error().unwrap().contains(expected),
+            "{command}: {:?}",
+            harness.last_error()
+        );
+    }
+    harness
+        .execute_action(Action::Command("bufdo %!cat".to_string()))
+        .await
+        .unwrap();
+    assert!(harness
+        .last_error()
+        .unwrap()
+        .contains("outside its supported non-interactive subset"));
+}
+
+#[tokio::test]
+async fn command_history_recalls_previous_commands_with_up_and_down() {
+    let mut harness = EditorHarness::with_content("");
+    harness
+        .execute_action(Action::Command("alpha-one".to_string()))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::Command("beta-two".to_string()))
+        .await
+        .unwrap();
+    harness.set_commandline(Mode::Command, "");
+
+    command_key(&mut harness, KeyCode::Up).await;
+    assert_eq!(harness.commandline_text(), "beta-two");
+
+    command_key(&mut harness, KeyCode::Up).await;
+    assert_eq!(harness.commandline_text(), "alpha-one");
+
+    command_key(&mut harness, KeyCode::Up).await;
+    assert_eq!(harness.commandline_text(), "alpha-one");
+
+    command_key(&mut harness, KeyCode::Down).await;
+    assert_eq!(harness.commandline_text(), "beta-two");
+
+    command_key(&mut harness, KeyCode::Down).await;
+    assert_eq!(harness.commandline_text(), "");
+}
+
+#[tokio::test]
+async fn command_history_filters_by_typed_prefix() {
+    let mut harness = EditorHarness::with_content("");
+    for command in ["buffer-next", "write", "buffer-delete"] {
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+    }
+    harness.set_commandline(Mode::Command, "b");
+
+    command_key(&mut harness, KeyCode::Up).await;
+    assert_eq!(harness.commandline_text(), "buffer-delete");
+
+    command_key(&mut harness, KeyCode::Up).await;
+    assert_eq!(harness.commandline_text(), "buffer-next");
+
+    command_key(&mut harness, KeyCode::Down).await;
+    assert_eq!(harness.commandline_text(), "buffer-delete");
+
+    command_key(&mut harness, KeyCode::Down).await;
+    assert_eq!(harness.commandline_text(), "b");
+}
+
+#[tokio::test]
+async fn command_history_editing_recalled_command_resets_prefix_session() {
+    let mut harness = EditorHarness::with_content("");
+    harness
+        .execute_action(Action::Command("buffer-delete".to_string()))
+        .await
+        .unwrap();
+    harness.set_commandline(Mode::Command, "b");
+
+    command_key(&mut harness, KeyCode::Up).await;
+    assert_eq!(harness.commandline_text(), "buffer-delete");
+
+    command_key(&mut harness, KeyCode::Char('x')).await;
+    assert_eq!(harness.commandline_text(), "buffer-deletex");
+
+    command_key(&mut harness, KeyCode::Up).await;
+    assert_eq!(harness.commandline_text(), "buffer-deletex");
+}
+
+#[tokio::test]
+async fn whitespace_only_commands_are_not_saved_to_history() {
+    let mut harness = EditorHarness::with_content("");
+    harness
+        .execute_action(Action::Command("   ".to_string()))
+        .await
+        .unwrap();
+    harness.set_commandline(Mode::Command, "");
+
+    command_key(&mut harness, KeyCode::Up).await;
+
+    assert_eq!(harness.commandline_text(), "");
+}
+
+#[tokio::test]
+async fn enew_opens_an_unnamed_buffer_without_saving_the_previous_buffer() {
+    let path = temp_file_path("enew-dirty-buffer");
+    fs::write(&path, "saved contents\n").unwrap();
+    let buffer = Buffer::new(Some(path.clone()), "saved contents\n".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command("enew".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.buffer_names(),
+        vec![path.clone(), "[No Name]".into()]
+    );
+    assert_eq!(harness.current_buffer_index(), 1);
+    assert!(harness.editor.test_current_buffer().is_unnamed());
+    assert!(harness.editor.test_current_buffer().is_blank());
+    assert!(!harness.is_dirty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "saved contents\n");
+
+    harness
+        .execute_action(Action::PreviousBuffer)
+        .await
+        .unwrap();
+    assert_eq!(harness.buffer_contents(), "xsaved contents\n");
+    assert!(harness.is_dirty());
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn enew_reuses_a_clean_unnamed_empty_buffer() {
+    let mut harness = EditorHarness::new();
+    let original_id = harness.editor.test_current_buffer().id();
+
+    for command in ["ene", "ene!", "enew", "enew!"] {
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(harness.buffer_names(), vec!["[No Name]"]);
+        assert_eq!(harness.editor.test_current_buffer().id(), original_id);
+    }
+}
+
+#[tokio::test]
+async fn enew_abbreviation_requires_its_vim_compatible_minimum_prefix() {
+    let mut harness = EditorHarness::with_content("original contents\n");
+
+    harness
+        .execute_action(Action::Command("en".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["[No Name]"]);
+    assert_eq!(harness.buffer_contents(), "original contents\n");
+    assert_eq!(harness.last_error(), Some("unknown command \"en\""));
+
+    harness
+        .execute_action(Action::Command("ene".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["[No Name]", "[No Name]"]);
+    assert!(harness.editor.test_current_buffer().is_blank());
+}
+
+#[tokio::test]
+async fn enew_changes_only_the_active_split() {
+    let mut harness = EditorHarness::with_content("original contents\n");
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+
+    harness
+        .execute_action(Action::Command("enew".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.window_count(), 2);
+    assert_eq!(harness.current_buffer_index(), 1);
+    assert!(harness.editor.test_current_buffer().is_blank());
+
+    harness.execute_action(Action::NextWindow).await.unwrap();
+
+    assert_eq!(harness.current_buffer_index(), 0);
+    assert_eq!(harness.buffer_contents(), "original contents\n");
+}
+
+#[tokio::test]
+async fn enew_rejects_file_arguments_without_changing_buffers() {
+    let mut harness = EditorHarness::with_content("original contents\n");
+
+    harness
+        .execute_action(Action::Command("enew unexpected.txt".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["[No Name]"]);
+    assert_eq!(harness.buffer_contents(), "original contents\n");
+    assert_eq!(harness.last_error(), Some("usage: enew"));
+}
+
+#[tokio::test]
+async fn new_and_vnew_create_fresh_unnamed_buffers_in_new_splits() {
+    for command in ["new", "vnew"] {
+        let mut harness = EditorHarness::new();
+        let original_id = harness.editor.test_current_buffer().id();
+
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(harness.window_count(), 2, "{command}");
+        assert_eq!(harness.buffer_names(), vec!["[No Name]", "[No Name]"]);
+        assert_eq!(harness.current_buffer_index(), 1);
+        assert_ne!(harness.editor.test_current_buffer().id(), original_id);
+        assert!(harness.editor.test_current_buffer().is_blank());
+
+        harness.execute_action(Action::NextWindow).await.unwrap();
+        assert_eq!(harness.editor.test_current_buffer().id(), original_id);
+    }
+}
+
+#[tokio::test]
+async fn new_and_vnew_accept_paths_without_writing_missing_files() {
+    let directory = tempfile::tempdir().unwrap();
+
+    for (command, name) in [("new", "horizontal.rs"), ("vnew", "vertical.rs")] {
+        let path = directory.path().join(name);
+        let mut harness = EditorHarness::with_content("original contents\n");
+
+        harness
+            .execute_action(Action::Command(format!("{command} {}", path.display())))
+            .await
+            .unwrap();
+
+        assert_eq!(harness.window_count(), 2, "{command}");
+        assert_eq!(
+            harness.editor.test_current_buffer().file.as_deref(),
+            path.to_str()
+        );
+        assert!(!path.exists(), "{command} should not create a disk file");
+
+        harness.execute_action(Action::NextWindow).await.unwrap();
+        assert_eq!(harness.buffer_contents(), "original contents\n");
+    }
+}
+
+#[tokio::test]
+async fn buffer_commands_select_names_stable_numbers_and_the_alternate() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("one.rs");
+    let second = directory.path().join("two.rs");
+    let third = directory.path().join("three.rs");
+    let buffers = [(&first, "one\n"), (&second, "two\n"), (&third, "three\n")]
+        .into_iter()
+        .map(|(path, contents)| {
+            Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                contents.to_string(),
+            )
+        })
+        .collect();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::Command("b two.rs".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 1);
+    let second_id = harness.editor.test_current_buffer().id().as_u64();
+
+    harness
+        .execute_action(Action::Command("buffer #".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 0);
+
+    harness
+        .execute_action(Action::Command(format!("buffer {second_id}")))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 1);
+
+    harness
+        .execute_action(Action::Command("b#".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 0);
+    assert_eq!(harness.buffer_names().len(), 3);
+
+    harness
+        .execute_action(Action::Command("b thre".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 2);
+}
+
+#[tokio::test]
+async fn buffer_selection_rejects_ambiguous_names_and_supports_stable_ids() {
+    let buffers = vec![
+        Buffer::new(/*file*/ None, "first\n".to_string()),
+        Buffer::new(/*file*/ None, "second\n".to_string()),
+    ];
+    let second_id = buffers[1].id().as_u64();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::Command("b [No Name]".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 0);
+    assert!(harness
+        .last_error()
+        .is_some_and(|message| message.contains("Multiple buffers match")));
+
+    harness
+        .execute_action(Action::OpenBufferById(second_id))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 1);
+    assert_eq!(harness.buffer_contents(), "second\n");
+}
+
+#[tokio::test]
+async fn bufdo_substitutes_all_buffers_and_finishes_on_the_last() {
+    let buffers = vec![
+        Buffer::new(/*file*/ None, "foo one\n".to_string()),
+        Buffer::new(/*file*/ None, "foo two\n".to_string()),
+        Buffer::new(/*file*/ None, "foo three\n".to_string()),
+    ];
+    let ids = buffers
+        .iter()
+        .map(|buffer| buffer.id().as_u64())
+        .collect::<Vec<_>>();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::Command("bufd! %s/foo/bar/g".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.current_buffer_index(), 2);
+    harness.assert_buffer_contents("bar three\n");
+    harness
+        .execute_action(Action::OpenBufferById(ids[0]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("bar one\n");
+    harness
+        .execute_action(Action::OpenBufferById(ids[1]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("bar two\n");
+}
+
+#[tokio::test]
+async fn bufdo_stops_on_substitute_error_unless_e_suppresses_it() {
+    let make_harness = || {
+        let buffers = vec![
+            Buffer::new(/*file*/ None, "foo one\n".to_string()),
+            Buffer::new(/*file*/ None, "no match\n".to_string()),
+            Buffer::new(/*file*/ None, "foo three\n".to_string()),
+        ];
+        let ids = buffers
+            .iter()
+            .map(|buffer| buffer.id().as_u64())
+            .collect::<Vec<_>>();
+        let mut editor = Editor::test_with_size(
+            Box::new(MockLsp),
+            /*width*/ 80,
+            /*height*/ 24,
+            Config::default(),
+            Theme::default(),
+            buffers,
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        (EditorHarness { editor }, ids)
+    };
+    let (mut harness, ids) = make_harness();
+
+    harness
+        .execute_action(Action::Command("bufdo %s/foo/bar/g".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.current_buffer_index(), 1);
+    assert_eq!(harness.last_error(), Some("pattern not found"));
+    harness
+        .execute_action(Action::OpenBufferById(ids[0]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("bar one\n");
+    harness
+        .execute_action(Action::OpenBufferById(ids[2]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("foo three\n");
+
+    let (mut harness, ids) = make_harness();
+    harness
+        .execute_action(Action::Command("bufdo %s/foo/bar/ge".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.current_buffer_index(), 2);
+    harness.assert_buffer_contents("bar three\n");
+    harness
+        .execute_action(Action::OpenBufferById(ids[0]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("bar one\n");
+    harness
+        .execute_action(Action::OpenBufferById(ids[1]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("no match\n");
+}
+
+#[tokio::test]
+async fn bufdo_deletes_each_snapshotted_buffer_and_leaves_a_blank_buffer() {
+    let buffers = vec![
+        Buffer::new(Some("one.rs".to_string()), "one\n".to_string()),
+        Buffer::new(Some("two.rs".to_string()), "two\n".to_string()),
+        Buffer::new(Some("three.rs".to_string()), "three\n".to_string()),
+    ];
+    let original_ids = buffers.iter().map(Buffer::id).collect::<Vec<_>>();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::Command("bufdo bd".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["[No Name]"]);
+    assert!(harness.editor.test_current_buffer().is_blank());
+    assert!(!original_ids.contains(&harness.editor.test_current_buffer().id()));
+}
+
+#[tokio::test]
+async fn bufdo_delete_stops_at_a_dirty_buffer_unless_forced() {
+    let buffers = vec![
+        Buffer::new(Some("one.rs".to_string()), "one\n".to_string()),
+        Buffer::new(Some("two.rs".to_string()), "two\n".to_string()),
+        Buffer::new(Some("three.rs".to_string()), "three\n".to_string()),
+    ];
+    let second_id = buffers[1].id().as_u64();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+    harness
+        .execute_action(Action::OpenBufferById(second_id))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command("bufdo bd".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["two.rs", "three.rs"]);
+    assert_eq!(harness.buffer_contents(), "xtwo\n");
+    assert_eq!(
+        harness.last_error(),
+        Some("No write since last change (add ! to override)")
+    );
+
+    harness
+        .execute_action(Action::Command("bufdo bd!".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["[No Name]"]);
+    assert!(harness.editor.test_current_buffer().is_blank());
+}
+
+#[tokio::test]
+async fn bufdo_uses_stable_buffer_id_ranges_and_rejects_interactive_commands() {
+    let buffers = vec![
+        Buffer::new(/*file*/ None, "foo one\n".to_string()),
+        Buffer::new(/*file*/ None, "foo two\n".to_string()),
+        Buffer::new(/*file*/ None, "foo three\n".to_string()),
+    ];
+    let ids = buffers
+        .iter()
+        .map(|buffer| buffer.id().as_u64())
+        .collect::<Vec<_>>();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::Command(format!(
+            "{},{}bufdo %s/foo/bar/g",
+            ids[1], ids[2]
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.current_buffer_index(), 2);
+    harness
+        .execute_action(Action::OpenBufferById(ids[0]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("foo one\n");
+    harness
+        .execute_action(Action::OpenBufferById(ids[1]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("bar two\n");
+    harness
+        .execute_action(Action::OpenBufferById(ids[2]))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("bar three\n");
+
+    harness
+        .execute_action(Action::Command("bufdo enew".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names().len(), 3);
+    assert_eq!(harness.current_buffer_index(), 0);
+    assert!(harness
+        .last_error()
+        .is_some_and(|message| message.contains("supported non-interactive subset")));
+
+    harness
+        .execute_action(Action::Command(
+            "bufdo syntax definitely-missing".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.current_buffer_index(), 0);
+    assert!(harness
+        .last_error()
+        .is_some_and(|message| message.contains("unknown syntax")));
+}
+
+#[tokio::test]
+async fn wall_saves_modified_file_buffers_and_preserves_the_active_buffer() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_path = directory.path().join("first.txt");
+    let second_path = directory.path().join("second.txt");
+    let clean_path = directory.path().join("clean.txt");
+    fs::write(&first_path, "first old\n").unwrap();
+    fs::write(&second_path, "second old\n").unwrap();
+    let buffers = vec![
+        Buffer::new(
+            Some(first_path.to_string_lossy().into_owned()),
+            "first old\n".to_string(),
+        ),
+        Buffer::new(
+            Some(second_path.to_string_lossy().into_owned()),
+            "second old\n".to_string(),
+        ),
+        Buffer::new(
+            Some(clean_path.to_string_lossy().into_owned()),
+            "clean\n".to_string(),
+        ),
+    ];
+    let ids = buffers.iter().map(Buffer::id).collect::<Vec<_>>();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('1'))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::OpenBufferById(ids[1].as_u64()))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('2'))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::OpenBufferById(ids[0].as_u64()))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command("wa".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.editor.test_current_buffer().id(), ids[0]);
+    assert_eq!(fs::read_to_string(&first_path).unwrap(), "1first old\n");
+    assert_eq!(fs::read_to_string(&second_path).unwrap(), "2second old\n");
+    assert!(!clean_path.exists());
+    assert!(!harness.is_dirty());
+    assert_eq!(harness.last_error(), Some(":wa — wrote 2 buffers"));
+    harness
+        .execute_action(Action::OpenBufferById(ids[1].as_u64()))
+        .await
+        .unwrap();
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn wall_preserves_external_changes_while_saving_other_modified_buffers() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_path = directory.path().join("first.txt");
+    let second_path = directory.path().join("second.txt");
+    fs::write(&first_path, "first old\n").unwrap();
+    fs::write(&second_path, "second old\n").unwrap();
+    let buffers = vec![
+        Buffer::new(
+            Some(first_path.to_string_lossy().into_owned()),
+            "first old\n".to_string(),
+        ),
+        Buffer::new(
+            Some(second_path.to_string_lossy().into_owned()),
+            "second old\n".to_string(),
+        ),
+    ];
+    let ids = buffers.iter().map(Buffer::id).collect::<Vec<_>>();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    for (id, character) in [(ids[0], '1'), (ids[1], '2')] {
+        harness
+            .execute_action(Action::OpenBufferById(id.as_u64()))
+            .await
+            .unwrap();
+        harness
+            .execute_action(Action::InsertCharAtCursorPos(character))
+            .await
+            .unwrap();
+    }
+    harness
+        .execute_action(Action::OpenBufferById(ids[0].as_u64()))
+        .await
+        .unwrap();
+    fs::write(&first_path, "external\n").unwrap();
+
+    harness
+        .execute_action(Action::Command("wall".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(&first_path).unwrap(), "external\n");
+    assert_eq!(fs::read_to_string(&second_path).unwrap(), "2second old\n");
+    assert_eq!(harness.buffer_contents(), "1first old\n");
+    assert!(harness.is_dirty());
+    assert!(harness
+        .last_error()
+        .is_some_and(|error| error.contains("changed on disk")));
+}
+
+#[tokio::test]
+async fn forced_write_explicitly_resolves_an_external_file_conflict() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("document.txt");
+    fs::write(&path, "original\n").unwrap();
+    let source = Buffer::new(
+        Some(path.to_string_lossy().into_owned()),
+        "original\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_buffer(source);
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('!'))
+        .await
+        .unwrap();
+    fs::write(&path, "external\n").unwrap();
+
+    harness
+        .execute_action(Action::Command("w".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
+    assert!(harness
+        .editor
+        .test_current_buffer()
+        .has_external_file_conflict());
+
+    harness
+        .execute_action(Action::Command("w!".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), "!original\n");
+    assert!(!harness.is_dirty());
+    assert!(!harness
+        .editor
+        .test_current_buffer()
+        .has_external_file_conflict());
+}
+
+#[tokio::test]
+async fn forced_write_with_a_filename_overwrites_only_the_requested_destination() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("source.txt");
+    let destination = directory.path().join("destination.txt");
+    fs::write(&source_path, "original\n").unwrap();
+    fs::write(&destination, "destination\n").unwrap();
+    let source = Buffer::new(
+        Some(source_path.to_string_lossy().into_owned()),
+        "original\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_buffer(source);
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('!'))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command(format!("w {}", destination.display())))
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(&destination).unwrap(), "destination\n");
+
+    harness
+        .execute_action(Action::Command(format!("w! {}", destination.display())))
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(&source_path).unwrap(), "original\n");
+    assert_eq!(fs::read_to_string(&destination).unwrap(), "!original\n");
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn disk_conflict_comparison_defaults_to_preserving_both_versions() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("document.txt");
+    fs::write(&path, "original\n").unwrap();
+    let source = Buffer::new(
+        Some(path.to_string_lossy().into_owned()),
+        "original\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_buffer(source);
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('!'))
+        .await
+        .unwrap();
+    fs::write(&path, "external\n").unwrap();
+
+    harness
+        .execute_action(Action::Command("diffdisk".to_string()))
+        .await
+        .unwrap();
+    let rows = (0..24)
+        .map(|row| harness.editor.test_render_row(row).unwrap())
+        .collect::<Vec<_>>();
+    assert!(rows.iter().any(|row| row.contains("File changed on disk")));
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
+    assert_eq!(harness.buffer_contents(), "!original\n");
+    assert!(harness.is_dirty());
+
+    harness
+        .execute_action(Action::Command("diffdisk".to_string()))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "!original\n");
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn wall_saves_named_buffers_before_reporting_a_dirty_unnamed_buffer() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_path = directory.path().join("first.txt");
+    let second_path = directory.path().join("second.txt");
+    fs::write(&first_path, "first old\n").unwrap();
+    fs::write(&second_path, "second old\n").unwrap();
+    let buffers = vec![
+        Buffer::new(
+            Some(first_path.to_string_lossy().into_owned()),
+            "first old\n".to_string(),
+        ),
+        Buffer::new(/*file*/ None, "unnamed\n".to_string()),
+        Buffer::new(
+            Some(second_path.to_string_lossy().into_owned()),
+            "second old\n".to_string(),
+        ),
+    ];
+    let ids = buffers.iter().map(Buffer::id).collect::<Vec<_>>();
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    for (id, character) in [(ids[0], '1'), (ids[1], 'u'), (ids[2], '2')] {
+        harness
+            .execute_action(Action::OpenBufferById(id.as_u64()))
+            .await
+            .unwrap();
+        harness
+            .execute_action(Action::InsertCharAtCursorPos(character))
+            .await
+            .unwrap();
+    }
+    harness
+        .execute_action(Action::OpenBufferById(ids[0].as_u64()))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command("wall".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.editor.test_current_buffer().id(), ids[0]);
+    assert_eq!(fs::read_to_string(&first_path).unwrap(), "1first old\n");
+    assert_eq!(fs::read_to_string(&second_path).unwrap(), "2second old\n");
+    let expected_error = format!(
+        ":wa — wrote 2 of 3 buffers; No file name for buffer {}",
+        ids[1].as_u64()
+    );
+    assert_eq!(harness.last_error(), Some(expected_error.as_str()));
+    harness
+        .execute_action(Action::OpenBufferById(ids[1].as_u64()))
+        .await
+        .unwrap();
+    assert!(harness.is_dirty());
+}
+
+#[tokio::test]
+async fn wall_reports_when_there_are_no_modified_buffers() {
+    let mut harness = EditorHarness::with_content("clean\n");
+
+    harness
+        .execute_action(Action::Command("wa".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.last_error(), Some(":wa — no modified buffers"));
+}
+
+#[tokio::test]
+async fn wall_rejects_file_arguments_without_writing() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("notes.txt");
+    fs::write(&path, "old\n").unwrap();
+    let buffer = Buffer::new(
+        Some(path.to_string_lossy().into_owned()),
+        "old\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command("wall elsewhere".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
+    assert!(harness.is_dirty());
+    assert_eq!(harness.last_error(), Some("usage: wall"));
+}
+
+#[tokio::test]
+async fn buffer_listing_aliases_show_stable_numbers_without_opening_splits() {
+    for command in ["ls", "buffers", "files", "b", "buffer"] {
+        let mut harness = EditorHarness::with_content("contents\n");
+        harness
+            .execute_action(Action::InsertCharAtCursorPos('x'))
+            .await
+            .unwrap();
+        let id = harness.editor.test_current_buffer().id().as_u64();
+
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+
+        let listing = harness.last_error().unwrap();
+        assert!(listing.contains(&id.to_string()), "{command}: {listing}");
+        assert!(listing.contains("[No Name]"), "{command}: {listing}");
+        assert!(listing.contains("[+]"), "{command}: {listing}");
+        assert_eq!(harness.window_count(), 1, "{command}");
+    }
+}
+
+#[tokio::test]
+async fn standard_buffer_navigation_aliases_switch_existing_buffers() {
+    let mut harness = EditorHarness::with_content("first\n");
+    harness
+        .execute_action(Action::Command("enew".to_string()))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command("bprevious".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 0);
+
+    harness
+        .execute_action(Action::Command("bnext".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(harness.current_buffer_index(), 1);
+}
+
+#[tokio::test]
+async fn saveas_writes_the_current_buffer_to_its_new_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("saved notes.txt");
+    let mut harness = EditorHarness::with_content("draft contents\n");
+
+    harness
+        .execute_action(Action::Command(format!("saveas {}", path.display())))
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), "draft contents\n");
+    assert_eq!(
+        harness.editor.test_current_buffer().file.as_deref(),
+        path.to_str()
+    );
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn file_assigns_a_buffer_name_without_writing_or_clearing_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unsaved notes.txt");
+    let mut harness = EditorHarness::with_content("draft contents\n");
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command(format!("file {}", path.display())))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.editor.test_current_buffer().file.as_deref(),
+        path.to_str()
+    );
+    assert_eq!(harness.buffer_contents(), "xdraft contents\n");
+    assert!(harness.is_dirty());
+    assert!(!path.exists());
+
+    harness
+        .execute_action(Action::Command("file".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(harness.last_error(), path.to_str());
+}
+
+#[tokio::test]
+async fn file_rejects_paths_already_open_in_another_buffer() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("open.rs");
+    let buffers = vec![
+        Buffer::new(/*file*/ None, "draft\n".to_string()),
+        Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "existing\n".to_string(),
+        ),
+    ];
+    let mut editor = Editor::test_with_size(
+        Box::new(MockLsp),
+        /*width*/ 80,
+        /*height*/ 24,
+        Config::default(),
+        Theme::default(),
+        buffers,
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::Command(format!("file {}", path.display())))
+        .await
+        .unwrap();
+
+    assert!(harness.editor.test_current_buffer().is_unnamed());
+    assert!(harness
+        .last_error()
+        .is_some_and(|message| message.contains("already exists")));
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn saveas_requires_a_file_argument() {
+    let mut harness = EditorHarness::with_content("draft contents\n");
+
+    harness
+        .execute_action(Action::Command("saveas".to_string()))
+        .await
+        .unwrap();
+
+    assert!(harness.editor.test_current_buffer().is_unnamed());
+    assert_eq!(harness.last_error(), Some("usage: saveas <file>"));
+}
+
+#[tokio::test]
+async fn unknown_command_does_not_expand_into_reload_write_or_split_actions() {
+    let path = temp_file_path("unknown-buffer-command");
+    fs::write(&path, "disk contents\n").unwrap();
+    let buffer = Buffer::new(Some(path.clone()), "disk contents\n".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+
+    for command in ["eneww", "nwe", "lss"] {
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(harness.buffer_contents(), "xdisk contents\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "disk contents\n");
+        assert_eq!(harness.window_count(), 1);
+        assert!(harness
+            .last_error()
+            .is_some_and(|message| message.contains("unknown command")));
+    }
+
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn edit_without_file_argument_reloads_current_file() {
+    let path = temp_file_path("edit-reload");
+    fs::write(&path, "one\ntwo\nthree\n").unwrap();
+    let buffer = Buffer::new(Some(path.clone()), "one\ntwo\nthree\n".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    fs::write(&path, "one\nchanged\nthree\n").unwrap();
+
+    harness
+        .execute_action(Action::Command("e".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_contents(), "one\nchanged\nthree\n");
+    assert_eq!(harness.cursor_position(), (0, 1));
+    assert!(!harness.is_dirty());
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn edit_without_force_refuses_to_reload_dirty_current_file() {
+    let path = temp_file_path("edit-reload-dirty");
+    fs::write(&path, "one\ntwo\n").unwrap();
+    let buffer = Buffer::new(Some(path.clone()), "one\ntwo\n".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+    fs::write(&path, "one\nchanged\n").unwrap();
+
+    harness
+        .execute_action(Action::Command("e".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_contents(), "xone\ntwo\n");
+    assert_eq!(
+        harness.last_error(),
+        Some("E37: No write since last change (add ! to override)")
+    );
+    assert!(harness.is_dirty());
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn edit_with_force_reloads_dirty_current_file() {
+    let path = temp_file_path("edit-reload-force");
+    fs::write(&path, "one\ntwo\n").unwrap();
+    let buffer = Buffer::new(Some(path.clone()), "one\ntwo\n".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+    fs::write(&path, "one\nchanged\n").unwrap();
+
+    harness
+        .execute_action(Action::Command("e!".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_contents(), "one\nchanged\n");
+    assert_eq!(harness.cursor_position(), (1, 1));
+    assert!(!harness.is_dirty());
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    assert_eq!(harness.buffer_contents(), "one\nxtwo\n");
+    assert_eq!(harness.cursor_position(), (1, 1));
+    assert!(harness.is_dirty());
+
+    harness.execute_action(Action::Redo).await.unwrap();
+    assert_eq!(harness.buffer_contents(), "one\nchanged\n");
+    assert_eq!(harness.cursor_position(), (1, 1));
+    assert!(!harness.is_dirty());
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn command_tab_completes_edit_file_argument() {
+    let (root, _guard) = command_completion_temp_dir("edit");
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("sample.txt"), "").unwrap();
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "e sr");
+
+    harness.editor.test_complete_command_path_next();
+
+    assert_eq!(harness.commandline_text(), "e src/");
+    drop(_guard);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn command_tab_opens_completed_paths_with_spaces() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("name  with spaces.txt!");
+    let command_directory = directory.path().to_string_lossy().replace('\\', "/");
+    let command_path = format!("{command_directory}/name  with spaces.txt!");
+    fs::write(&path, "completed file contents\n").unwrap();
+
+    for command in [
+        "e", "ed", "edit", "e!", "new", "vne", "vnew", "spl", "split", "sp", "vsp", "vsplit", "vs",
+    ] {
+        let mut harness = EditorHarness::with_content("");
+        harness.set_commandline(
+            Mode::Command,
+            &format!("{command} {command_directory}/name"),
+        );
+
+        command_key(&mut harness, KeyCode::Tab).await;
+        assert_eq!(
+            harness.commandline_text(),
+            format!("{command} {command_path}")
+        );
+        command_key(&mut harness, KeyCode::Enter).await;
+
+        assert_eq!(
+            harness.buffer_contents(),
+            "completed file contents\n",
+            "{command} did not open the completed path"
+        );
+    }
+}
+
+#[tokio::test]
+async fn command_tab_writes_completed_paths_with_spaces() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("name  with spaces.txt!");
+    let command_directory = directory.path().to_string_lossy().replace('\\', "/");
+    let command_path = format!("{command_directory}/name  with spaces.txt!");
+
+    for command in ["w", "wr", "wri", "write", "w!", "write!"] {
+        fs::write(&path, "contents\n").unwrap();
+        let mut buffer = Buffer::load_or_create(Some(path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        buffer.insert_str(/*x*/ 0, /*y*/ 0, "saved ");
+        let mut harness = EditorHarness::with_buffer(buffer);
+        harness.set_commandline(
+            Mode::Command,
+            &format!("{command} {command_directory}/name"),
+        );
+
+        command_key(&mut harness, KeyCode::Tab).await;
+        assert_eq!(
+            harness.commandline_text(),
+            format!("{command} {command_path}")
+        );
+        command_key(&mut harness, KeyCode::Enter).await;
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "saved contents\n",
+            "{command} did not write the completed path"
+        );
+        assert!(!directory.path().join("name").exists());
+    }
+}
+
+#[test]
+fn command_tab_preserves_relative_path_prefix() {
+    let (root, _guard) = command_completion_temp_dir("relative-prefix");
+    fs::create_dir(root.join("src")).unwrap();
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "e ./sr");
+
+    harness.editor.test_complete_command_path_next();
+
+    assert_eq!(harness.commandline_text(), "e ./src/");
+    drop(_guard);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn command_tab_completes_dot_to_current_directory_prefix() {
+    let (root, _guard) = command_completion_temp_dir("dot");
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "e .");
+
+    harness.editor.test_complete_command_path_next();
+
+    assert_eq!(harness.commandline_text(), "e ./");
+    drop(_guard);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn command_tab_cycles_file_matches_and_backtab_reverses() {
+    let (root, _guard) = command_completion_temp_dir("cycle");
+    fs::write(root.join("src_a.rs"), "").unwrap();
+    fs::write(root.join("src_b.rs"), "").unwrap();
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "e src");
+
+    harness.editor.test_complete_command_path_next();
+    assert_eq!(harness.commandline_text(), "e src_a.rs");
+
+    harness.editor.test_complete_command_path_next();
+    assert_eq!(harness.commandline_text(), "e src_b.rs");
+
+    harness.editor.test_complete_command_path_previous();
+    assert_eq!(harness.commandline_text(), "e src_a.rs");
+    drop(_guard);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn command_tab_sorts_directories_before_files() {
+    let (root, _guard) = command_completion_temp_dir("directories-first");
+    fs::create_dir(root.join("app")).unwrap();
+    fs::write(root.join("alpha.txt"), "").unwrap();
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "e a");
+
+    harness.editor.test_complete_command_path_next();
+
+    assert_eq!(harness.commandline_text(), "e app/");
+    drop(_guard);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn command_tab_completes_file_arguments_for_split_vsplit_and_write() {
+    let (root, _guard) = command_completion_temp_dir("file-commands");
+    fs::create_dir(root.join("target")).unwrap();
+
+    for command in [
+        "sp ta",
+        "vs ta",
+        "w ta",
+        "write ta",
+        "split ta",
+        "vsplit ta",
+    ] {
+        let mut harness = EditorHarness::with_content("");
+        harness.set_commandline(Mode::Command, command);
+
+        harness.editor.test_complete_command_path_next();
+
+        let command_name = command.split_once(' ').unwrap().0;
+        assert_eq!(
+            harness.commandline_text(),
+            format!("{command_name} target/")
+        );
+    }
+    drop(_guard);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn command_tab_ignores_non_file_commands() {
+    let (root, _guard) = command_completion_temp_dir("non-file");
+    fs::create_dir(root.join("src")).unwrap();
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "q sr");
+
+    harness.editor.test_complete_command_path_next();
+
+    assert_eq!(harness.commandline_text(), "q sr");
+    drop(_guard);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn command_tab_completes_syntax_names_and_aliases() {
+    for (command, expected) in [
+        ("syntax ru", "syntax rust"),
+        ("syn ym", "syn yaml"),
+        ("ft rs", "ft rust"),
+        ("syntax ", "syntax auto"),
+    ] {
+        let mut harness = EditorHarness::with_content("");
+        harness.set_commandline(Mode::Command, command);
+
+        harness.editor.test_complete_command_path_next();
+
+        assert_eq!(harness.commandline_text(), expected);
+    }
+}
+
+#[test]
+fn command_tab_does_not_complete_a_second_syntax_argument() {
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "syntax rust extra");
+
+    harness.editor.test_complete_command_path_next();
+
+    assert_eq!(harness.commandline_text(), "syntax rust extra");
+}
+
+#[tokio::test]
+async fn command_tab_key_event_completes_file_argument() {
+    let root = env::temp_dir().join(format!(
+        "red-command-completion-event-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(root.join("target")).unwrap();
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, &format!("e {}/ta", root.display()));
+
+    command_key(&mut harness, KeyCode::Tab).await;
+
+    assert_eq!(
+        harness.commandline_text(),
+        format!("e {}/target/", root.display())
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn command_tab_completes_builtin_names_and_cycles_matches() {
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "wr");
+
+    command_key(&mut harness, KeyCode::Tab).await;
+    assert_eq!(harness.commandline_text(), "wrap");
+
+    command_key(&mut harness, KeyCode::Tab).await;
+    assert_eq!(harness.commandline_text(), "write");
+
+    command_key(&mut harness, KeyCode::BackTab).await;
+    assert_eq!(harness.commandline_text(), "wrap");
+}
+
+#[tokio::test]
+async fn command_tab_completes_arguments_without_executing_them() {
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "Copilot sign");
+    command_key(&mut harness, KeyCode::Tab).await;
+    assert_eq!(harness.commandline_text(), "Copilot signin");
+    command_key(&mut harness, KeyCode::Tab).await;
+    assert_eq!(harness.commandline_text(), "Copilot signout");
+    command_key(&mut harness, KeyCode::BackTab).await;
+    assert_eq!(harness.commandline_text(), "Copilot signin");
+    command_key(&mut harness, KeyCode::Char('x')).await;
+    command_key(&mut harness, KeyCode::Tab).await;
+    assert_eq!(harness.commandline_text(), "Copilot signinx");
+    assert_eq!(harness.last_error(), None);
+}
+
+#[tokio::test]
+async fn command_tab_completion_remains_case_sensitive() {
+    let mut harness = EditorHarness::with_content("");
+    harness.set_commandline(Mode::Command, "Wr");
+
+    command_key(&mut harness, KeyCode::Tab).await;
+
+    assert_eq!(harness.commandline_text(), "Wr");
+}
+
+#[tokio::test]
+async fn wrap_commands_toggle_line_wrapping() {
+    let mut harness = EditorHarness::with_content("short");
+    assert!(harness.wrap());
+
+    harness
+        .execute_action(Action::Command("nowrap".to_string()))
+        .await
+        .unwrap();
+    assert!(!harness.wrap());
+
+    harness
+        .execute_action(Action::Command("wrap".to_string()))
+        .await
+        .unwrap();
+    assert!(harness.wrap());
+}
+
+#[tokio::test]
+async fn vim_parity_gw_toggles_wrapping_without_overriding_big_word_motion() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "foo.bar baz".to_string()),
+        default_key_config(),
+    );
+    let initial_wrap = harness.wrap();
+
+    type_normal_keys(&mut harness, "gW").await;
+
+    assert_eq!(harness.wrap(), !initial_wrap);
+    harness.assert_cursor_at(0, 0);
+
+    type_normal_keys(&mut harness, "gW").await;
+
+    assert_eq!(harness.wrap(), initial_wrap);
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn syntax_commands_set_reset_and_disable_buffer_local_syntax() {
+    let buffer = Buffer::new(Some("notes.txt".to_string()), "fn main() {}".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+
+    harness
+        .execute_action(Action::Command("ft RS".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.editor.test_current_buffer().syntax_selection(),
+        &SyntaxSelection::Language("rust".to_string())
+    );
+    assert_eq!(harness.last_error(), Some("syntax: rust"));
+    assert!(!harness.is_dirty());
+
+    harness
+        .execute_action(Action::Command("syn off".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.editor.test_current_buffer().syntax_selection(),
+        &SyntaxSelection::Off
+    );
+    assert_eq!(harness.last_error(), Some("syntax: off"));
+
+    harness
+        .execute_action(Action::Command("sy rust".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.editor.test_current_buffer().syntax_selection(),
+        &SyntaxSelection::Language("rust".to_string())
+    );
+
+    harness
+        .execute_action(Action::Command("syntax auto".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.editor.test_current_buffer().syntax_selection(),
+        &SyntaxSelection::Auto
+    );
+    assert_eq!(harness.last_error(), Some("syntax: auto"));
+}
+
+#[tokio::test]
+async fn invalid_syntax_commands_leave_the_existing_selection_unchanged() {
+    let buffer = Buffer::new(Some("notes.txt".to_string()), "fn main() {}".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+    harness
+        .execute_action(Action::Command("syntax rust".to_string()))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::Command("syntax madeup".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.editor.test_current_buffer().syntax_selection(),
+        &SyntaxSelection::Language("rust".to_string())
+    );
+    assert_eq!(
+        harness.last_error(),
+        Some("unknown syntax \"madeup\" (try :syntax)")
+    );
+
+    harness
+        .execute_action(Action::Command("syntax rust yaml".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.editor.test_current_buffer().syntax_selection(),
+        &SyntaxSelection::Language("rust".to_string())
+    );
+    assert_eq!(
+        harness.last_error(),
+        Some("usage: syntax [language|auto|off]")
+    );
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn submitted_commands_are_persisted_to_preferences() {
+    let dir = std::env::temp_dir().join(format!("red-command-history-{}", uuid::Uuid::new_v4()));
+    let path = dir.join("preferences.json");
+    let lsp = Box::new(MockLsp) as Box<dyn LspClient>;
+    let config = Config::default();
+    let buffer = Buffer::new(None, String::new());
+    let mut editor = Editor::test_with_size_and_preferences(
+        lsp,
+        80,
+        24,
+        config,
+        Theme::default(),
+        vec![buffer],
+        PreferencesStore::load(&path),
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+
+    editor
+        .test_execute_production_action(Action::Command("persist-me".to_string()))
+        .await
+        .unwrap();
+
+    let store = PreferencesStore::load(&path);
+    assert_eq!(store.command_history(), ["persist-me"]);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn test_insert_mode() {
+    let mut harness = EditorHarness::with_content("Hello World");
+
+    // Debug: Check initial cursor position and buffer state
+    println!("Initial cursor position: {:?}", harness.cursor_position());
+    println!("Number of lines: {}", harness.line_count());
+    if let Some(line) = harness.line_contents(0) {
+        println!("Line 0 content: {:?}", line);
+    }
+
+    // Enter insert mode with 'i'
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.assert_mode(Mode::Insert);
+
+    // Debug: Check cursor position after entering insert mode
+    println!(
+        "Cursor position after entering insert mode: {:?}",
+        harness.cursor_position()
+    );
+
+    // Type some text
+    harness.type_text("Hi ").await.unwrap();
+
+    // Debug: Check actual buffer contents
+    let contents = harness.buffer_contents();
+    println!("Actual buffer contents: {:?}", contents);
+    println!("Buffer length: {}", contents.len());
+    println!("Ends with newline: {}", contents.ends_with('\n'));
+
+    harness.assert_buffer_contents("Hi Hello World");
+
+    // Exit insert mode (ESC)
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn test_append_mode() {
+    let mut harness = EditorHarness::with_content("Hello World");
+
+    // Move cursor to 'o' in 'Hello' (position 4)
+    for _ in 0..4 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    // Enter append mode with 'a' - should insert after current character
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.assert_mode(Mode::Insert);
+
+    // Type text
+    harness.type_text(" there").await.unwrap();
+    harness.assert_buffer_contents("Hello there World");
+
+    // Exit insert mode
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_open_line_below() {
+    let mut harness = EditorHarness::with_content("Line 1\nLine 2");
+
+    // Open line below with 'o' - InsertLineBelowCursor
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    harness.assert_mode(Mode::Insert);
+
+    // Should have created a new line and moved cursor there
+    harness.assert_cursor_at(0, 1);
+
+    // Type on the new line
+    harness.type_text("New line").await.unwrap();
+    harness.assert_buffer_contents("Line 1\nNew line\nLine 2");
+
+    // Exit insert mode
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_enter_on_opened_indented_blank_line_moves_generated_indentation() {
+    let mut harness = EditorHarness::with_content("fn name() {\n    let a = 1;\n}");
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(4, 2);
+
+    harness.execute_action(Action::InsertNewLine).await.unwrap();
+
+    harness.assert_cursor_at(4, 3);
+    harness.assert_buffer_contents("fn name() {\n    let a = 1;\n\n    \n}");
+}
+
+#[tokio::test]
+async fn python_autoindent_requires_the_language_pack() {
+    let buffer = Buffer::new(
+        Some("sample.py".to_string()),
+        "def something(x):".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(0, 1);
+    harness.assert_buffer_contents("def something(x):\n");
+}
+
+#[tokio::test]
+async fn python_enter_indents_a_suite_and_dedents_after_return() {
+    let mut harness = python_harness("");
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.type_text("def something(x):").await.unwrap();
+    harness.execute_action(Action::InsertNewLine).await.unwrap();
+    harness.assert_cursor_at(4, 1);
+    harness.type_text("return x").await.unwrap();
+    harness.execute_action(Action::InsertNewLine).await.unwrap();
+
+    harness.assert_cursor_at(0, 2);
+    harness.assert_buffer_contents("def something(x):\n    return x\n");
+}
+
+#[tokio::test]
+async fn python_ignores_colons_in_comments_and_strings() {
+    for source in ["value = 1  # note:", "value = \"note:\""] {
+        let mut harness = python_harness(source);
+        harness
+            .execute_action(Action::EnterMode(Mode::Insert))
+            .await
+            .unwrap();
+        harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+        harness.execute_action(Action::MoveRight).await.unwrap();
+        harness.execute_action(Action::InsertNewLine).await.unwrap();
+        harness.assert_cursor_at(0, 1);
+    }
+}
+
+#[tokio::test]
+async fn python_continuations_align_and_use_hanging_indent() {
+    let mut aligned = python_harness("call(first,");
+    aligned
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    aligned.assert_cursor_at(5, 1);
+    aligned.type_text("second").await.unwrap();
+    aligned.assert_buffer_contents("call(first,\n     second");
+
+    let mut hanging = python_harness("values = [");
+    hanging
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    hanging.assert_cursor_at(8, 1);
+}
+
+#[tokio::test]
+async fn python_typing_else_and_except_reindents_the_current_line() {
+    let mut else_harness = python_harness("if ready:\n    work()\n    ");
+    else_harness
+        .execute_action(Action::MoveToBottom)
+        .await
+        .unwrap();
+    else_harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    else_harness
+        .execute_action(Action::MoveToLineEnd)
+        .await
+        .unwrap();
+    else_harness
+        .execute_action(Action::MoveRight)
+        .await
+        .unwrap();
+    else_harness.type_text("else:").await.unwrap();
+    else_harness.assert_buffer_contents("if ready:\n    work()\nelse:");
+    else_harness.assert_cursor_at(5, 2);
+
+    let mut except_harness = python_harness("try:\n    work()\n    ");
+    except_harness
+        .execute_action(Action::MoveToBottom)
+        .await
+        .unwrap();
+    except_harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    except_harness
+        .execute_action(Action::MoveToLineEnd)
+        .await
+        .unwrap();
+    except_harness
+        .execute_action(Action::MoveRight)
+        .await
+        .unwrap();
+    except_harness.type_text("except:").await.unwrap();
+    except_harness.assert_buffer_contents("try:\n    work()\nexcept:");
+}
+
+#[tokio::test]
+async fn backspace_uses_soft_tab_stops_inside_leading_indentation() {
+    let mut harness = python_harness("values = [");
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(8, 1);
+
+    harness
+        .execute_action(Action::DeletePreviousChar)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(4, 1);
+    harness
+        .execute_action(Action::DeletePreviousChar)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 1);
+    harness.type_text("value").await.unwrap();
+    harness.assert_buffer_contents("values = [\nvalue");
+}
+
+#[tokio::test]
+async fn tab_advances_to_the_next_soft_tab_stop() {
+    let mut harness = python_harness("  value");
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::SetCursor(2, 0))
+        .await
+        .unwrap();
+    harness.execute_action(Action::InsertTab).await.unwrap();
+
+    harness.assert_cursor_at(4, 0);
+    harness.assert_buffer_contents("    value");
+}
+
+#[tokio::test]
+async fn untouched_generated_indent_is_removed_on_escape_and_carried_across_enter() {
+    let mut escaped = python_harness("def something(x):");
+    escaped
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    escaped
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    escaped.assert_buffer_contents("def something(x):\n");
+
+    let mut carried = python_harness("def something(x):");
+    carried
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    carried.execute_action(Action::InsertNewLine).await.unwrap();
+    carried.type_text("value").await.unwrap();
+    carried.assert_buffer_contents("def something(x):\n\n    value");
+}
+
+#[tokio::test]
+async fn python_open_above_and_forced_syntax_use_the_same_provider() {
+    let mut above = python_harness("def something(x):\n    value");
+    above.execute_action(Action::MoveDown).await.unwrap();
+    above
+        .execute_action(Action::InsertLineAtCursor)
+        .await
+        .unwrap();
+    above.assert_cursor_at(4, 1);
+    above.type_text("other").await.unwrap();
+    above.assert_buffer_contents("def something(x):\n    other\n    value");
+
+    let buffer = Buffer::new(
+        Some("notes.txt".to_string()),
+        "def something(x):".to_string(),
+    );
+    let mut forced = EditorHarness::with_config(buffer, python_pack_config());
+    forced
+        .execute_action(Action::SetSyntax("python".to_string()))
+        .await
+        .unwrap();
+    forced
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    forced.assert_cursor_at(4, 1);
+}
+
+#[tokio::test]
+async fn generated_indent_cleans_up_when_insert_mode_moves_to_another_line() {
+    let mut harness = python_harness("def something(x):\nnext");
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("def something(x):\n    \nnext");
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_buffer_contents("def something(x):\n\nnext");
+}
+
+#[tokio::test]
+async fn python_autoindent_and_inserted_text_undo_as_one_change() {
+    let mut harness = python_harness("def something(x):\nnext");
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    harness.type_text("value").await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("def something(x):\n    value\nnext");
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("def something(x):\nnext");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("def something(x):\n    value\nnext");
+}
+
+#[tokio::test]
+async fn test_enter_on_existing_whitespace_only_line_preserves_indentation() {
+    let mut harness = EditorHarness::with_content("    \nnext");
+
+    harness
+        .execute_action(Action::SetCursor(3, 0))
+        .await
+        .unwrap();
+    harness.execute_action(Action::InsertNewLine).await.unwrap();
+
+    harness.assert_cursor_at(4, 1);
+    harness.assert_buffer_contents("   \n     \nnext");
+}
+
+#[tokio::test]
+async fn test_open_line_above() {
+    let mut harness = EditorHarness::with_content("Line 1\nLine 2");
+
+    // Move to second line
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    println!(
+        "After MoveDown - cursor at: {:?}",
+        harness.cursor_position()
+    );
+
+    // Open line above with 'O' - InsertLineAtCursor
+    harness
+        .execute_action(Action::InsertLineAtCursor)
+        .await
+        .unwrap();
+    println!(
+        "After InsertLineAtCursor - cursor at: {:?}",
+        harness.cursor_position()
+    );
+    println!("Buffer contents: {:?}", harness.buffer_contents());
+    harness.assert_mode(Mode::Insert);
+
+    // Should have created a new line above and moved cursor there
+    harness.assert_cursor_at(0, 1);
+
+    // Type on the new line
+    harness.type_text("Middle line").await.unwrap();
+    harness.assert_buffer_contents("Line 1\nMiddle line\nLine 2");
+
+    // Exit insert mode
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_delete_char() {
+    let mut harness = EditorHarness::with_content("Hello World");
+
+    // Delete character under cursor with 'x'
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("ello World");
+
+    // Move to space and delete
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveLeft).await.unwrap();
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("elloWorld");
+}
+
+#[tokio::test]
+async fn test_delete_line() {
+    let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3");
+
+    // Move to second line
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    // Delete line with 'dd'
+    println!("Before delete: {:?}", harness.buffer_contents());
+    println!("Cursor at: {:?}", harness.cursor_position());
+    println!("Line under cursor: {:?}", harness.current_line());
+    harness
+        .execute_action(Action::DeleteCurrentLine)
+        .await
+        .unwrap();
+    println!("After delete: {:?}", harness.buffer_contents());
+    println!("Cursor at after: {:?}", harness.cursor_position());
+    println!("Line under cursor after: {:?}", harness.current_line());
+    harness.assert_buffer_contents("Line 1\nLine 3");
+
+    // Cursor should be on what was line 3
+    harness.assert_cursor_at(0, 1);
+}
+
+#[tokio::test]
+async fn test_delete_to_end_of_line() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "Hello World Test".to_string()),
+        line_end_delete_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "wD").await;
+
+    harness.assert_buffer_contents("Hello ");
+}
+
+#[tokio::test]
+async fn test_change_word() {
+    let mut harness = EditorHarness::with_content("Hello World Test");
+
+    // Change word with 'cw' - delete word then enter insert mode
+    harness.execute_action(Action::DeleteWord).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.assert_mode(Mode::Insert);
+
+    // Type replacement
+    harness.type_text("Hi ").await.unwrap();
+    harness.assert_buffer_contents("Hi World Test");
+
+    // Exit insert mode
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn visual_change_replaces_selection_and_undoes_as_one_transaction() {
+    let clipboard_text = Arc::new(Mutex::new(None));
+    let buffer = Buffer::new(None, "alpha beta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+
+    type_normal_keys(&mut harness, "vwc").await;
+
+    harness.assert_mode(Mode::Insert);
+    harness.assert_buffer_contents("eta");
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("alpha b"));
+
+    type_normal_keys(&mut harness, "REPLACED").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_buffer_contents("REPLACEDeta");
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("alpha beta");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("REPLACEDeta");
+}
+
+#[tokio::test]
+async fn visual_line_change_leaves_one_replacement_line() {
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "Vjc").await;
+
+    harness.assert_mode(Mode::Insert);
+    harness.assert_buffer_contents("\nthree");
+    type_normal_keys(&mut harness, "X").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+
+    harness.assert_buffer_contents("X\nthree");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("one\ntwo\nthree");
+}
+
+#[tokio::test]
+async fn visual_block_change_replaces_each_selected_row() {
+    let buffer = Buffer::new(None, "abcd\nefgh\nijkl".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "jjlc").await;
+
+    harness.assert_mode(Mode::Insert);
+    harness.assert_buffer_contents("cd\ngh\nkl");
+    type_normal_keys(&mut harness, "X").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+
+    harness.assert_buffer_contents("Xcd\nXgh\nXkl");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abcd\nefgh\nijkl");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("Xcd\nXgh\nXkl");
+}
+
+#[tokio::test]
+async fn visual_block_change_uses_buffer_rows_after_scrolling() {
+    let content = (0..40)
+        .map(|line| format!("abcd-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffer = Buffer::new(None, content.clone());
+    let mut harness = EditorHarness::with_config_and_size(buffer, default_key_config(), 80, 10);
+    harness
+        .execute_action(Action::SetCursor(0, 30))
+        .await
+        .unwrap();
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "jlcX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+
+    assert_eq!(
+        harness.line_contents(30).unwrap().trim_end_matches('\n'),
+        "Xcd-30"
+    );
+    assert_eq!(
+        harness.line_contents(31).unwrap().trim_end_matches('\n'),
+        "Xcd-31"
+    );
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(&content);
+}
+
+#[tokio::test]
+async fn visual_change_inserts_after_multicodepoint_graphemes() {
+    let family = "👨‍👩‍👧‍👦";
+    let buffer = Buffer::new(None, format!("{family} alpha beta"));
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "ll").await;
+    harness.assert_cursor_at(2, 0);
+    type_normal_keys(&mut harness, "vwcX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+
+    harness.assert_buffer_contents(&format!("{family} Xeta"));
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(&format!("{family} alpha beta"));
+}
+
+#[tokio::test]
+async fn test_delete_inner_word_key_sequence() {
+    let mut harness = EditorHarness::with_content("alpha beta gamma");
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "diw").await;
+
+    harness.assert_buffer_contents("alpha  gamma");
+    harness.assert_cursor_at(6, 0);
+}
+
+#[tokio::test]
+async fn test_delete_inner_word_excludes_macro_bang_from_identifier() {
+    let mut harness = EditorHarness::with_content("println!(\"hi\");");
+
+    type_normal_keys(&mut harness, "diw").await;
+
+    harness.assert_buffer_contents("!(\"hi\");");
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn test_visual_inner_word_excludes_macro_bang_from_identifier() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "v".to_string(),
+        KeyAction::Single(Action::EnterMode(Mode::Visual)),
+    );
+    config.keys.visual.insert(
+        "x".to_string(),
+        KeyAction::Multiple(vec![Action::Delete, Action::EnterMode(Mode::Normal)]),
+    );
+    let buffer = Buffer::new(None, "println!(\"hi\");".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "viwx").await;
+
+    harness.assert_buffer_contents("!(\"hi\");");
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn test_delete_around_word_key_sequence() {
+    let mut harness = EditorHarness::with_content("alpha beta gamma");
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "daw").await;
+
+    harness.assert_buffer_contents("alpha gamma");
+    harness.assert_cursor_at(6, 0);
+}
+
+#[tokio::test]
+async fn test_change_inner_word_key_sequence() {
+    let mut harness = EditorHarness::with_content("alpha beta gamma");
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "ciw").await;
+
+    harness.assert_mode(Mode::Insert);
+    harness.type_text("BETA").await.unwrap();
+    harness.assert_buffer_contents("alpha BETA gamma");
+}
+
+#[tokio::test]
+async fn test_delete_inner_and_around_nested_parens() {
+    let mut harness = EditorHarness::with_content("foo(bar(baz), qux)");
+    for _ in 0..8 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    type_normal_keys(&mut harness, "di(").await;
+    harness.assert_buffer_contents("foo(bar(), qux)");
+
+    let mut harness = EditorHarness::with_content("foo(bar(baz), qux)");
+    for _ in 0..8 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    type_normal_keys(&mut harness, "da(").await;
+    harness.assert_buffer_contents("foo(bar, qux)");
+}
+
+#[tokio::test]
+async fn test_delete_inner_multiline_braces() {
+    let mut harness = EditorHarness::with_content("fn main() {\n    call(arg);\n}");
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::MoveToFirstLineChar)
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "di{").await;
+
+    harness.assert_buffer_contents("fn main() {}");
+    harness.assert_cursor_at(11, 0);
+}
+
+#[tokio::test]
+async fn test_delete_text_object_aliases() {
+    let mut harness = EditorHarness::with_content("items[alpha]");
+    for _ in 0..7 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    type_normal_keys(&mut harness, "di]").await;
+    harness.assert_buffer_contents("items[]");
+
+    let mut harness = EditorHarness::with_content("block{alpha}");
+    for _ in 0..7 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    type_normal_keys(&mut harness, "diB").await;
+    harness.assert_buffer_contents("block{}");
+
+    let mut harness = EditorHarness::with_content("Option<alpha>");
+    for _ in 0..8 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    type_normal_keys(&mut harness, "di>").await;
+    harness.assert_buffer_contents("Option<>");
+
+    let mut harness = EditorHarness::with_content("let c = 'x';");
+    for _ in 0..9 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    type_normal_keys(&mut harness, "di'").await;
+    harness.assert_buffer_contents("let c = '';");
+
+    let mut harness = EditorHarness::with_content("cmd `alpha`");
+    for _ in 0..6 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    type_normal_keys(&mut harness, "di`").await;
+    harness.assert_buffer_contents("cmd ``");
+}
+
+#[tokio::test]
+async fn test_q_text_object_alias_selects_double_quotes() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "v".to_string(),
+        KeyAction::Single(Action::EnterMode(Mode::Visual)),
+    );
+    config.keys.visual.insert(
+        "x".to_string(),
+        KeyAction::Multiple(vec![Action::Delete, Action::EnterMode(Mode::Normal)]),
+    );
+
+    let buffer = Buffer::new(None, "let s = \"hello\";".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    for _ in 0..10 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    type_normal_keys(&mut harness, "viqx").await;
+
+    harness.assert_buffer_contents("let s = \"\";");
+
+    let mut harness = EditorHarness::with_content("let s = \"hello\";");
+    for _ in 0..10 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    type_normal_keys(&mut harness, "diq").await;
+
+    harness.assert_buffer_contents("let s = \"\";");
+}
+
+#[tokio::test]
+async fn test_delete_inner_and_around_quotes() {
+    let mut harness = EditorHarness::with_content("let s = \"hello world\";");
+    for _ in 0..10 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    type_normal_keys(&mut harness, "di\"").await;
+    harness.assert_buffer_contents("let s = \"\";");
+
+    let mut harness = EditorHarness::with_content("let s = \"hello world\";");
+    for _ in 0..10 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    type_normal_keys(&mut harness, "da\"").await;
+    harness.assert_buffer_contents("let s = ;");
+}
+
+#[tokio::test]
+async fn test_invalid_operator_motion_does_not_edit() {
+    let mut harness = EditorHarness::with_content("alpha beta");
+
+    type_normal_keys(&mut harness, "diz").await;
+
+    harness.assert_buffer_contents("alpha beta");
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(harness.last_error(), Some("invalid operator motion"));
+}
+
+#[tokio::test]
+async fn operator_line_counts_delete_yank_and_change_as_one_edit() {
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "2dd").await;
+    harness.assert_buffer_contents("three\nfour");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("one\ntwo\nthree\nfour");
+
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "2yyGp").await;
+    harness.assert_buffer_contents("one\ntwo\nthree\nfour\none\ntwo");
+
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "d2d").await;
+    harness.assert_buffer_contents("three\nfour");
+
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "2ccX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    harness.assert_buffer_contents("X\nthree");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("one\ntwo\nthree");
+}
+
+#[tokio::test]
+async fn operator_and_motion_counts_multiply_for_words_and_character_motions() {
+    for keys in ["2dw", "d2w"] {
+        let buffer = Buffer::new(None, "one two three four five".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        type_normal_keys(&mut harness, keys).await;
+        harness.assert_buffer_contents("three four five");
+    }
+
+    let buffer = Buffer::new(None, "one two three four five six".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "2d2w").await;
+    harness.assert_buffer_contents("five six");
+
+    for keys in ["2df.", "d2f."] {
+        let buffer = Buffer::new(None, "a.b.c.d".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        type_normal_keys(&mut harness, keys).await;
+        harness.assert_buffer_contents("c.d");
+    }
+
+    let buffer = Buffer::new(None, "a.b.c.d".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "d2t.").await;
+    harness.assert_buffer_contents(".c.d");
+
+    let buffer = Buffer::new(None, "α β γ δ".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "c2wX").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    harness.assert_buffer_contents("X γ δ");
+
+    for (contents, keys, expected) in [
+        ("one two", "d2w", ""),
+        ("α β", "d2w", ""),
+        ("one x", "dw", "x"),
+    ] {
+        let buffer = Buffer::new(None, contents.to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        type_normal_keys(&mut harness, keys).await;
+        harness.assert_buffer_contents(expected);
+    }
+}
+
+#[tokio::test]
+async fn counted_operator_survives_dot_and_macro_replay() {
+    let buffer = Buffer::new(None, "one two three\nfour five six".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "d2wj.").await;
+    harness.assert_buffer_contents("three\nsix");
+
+    let buffer = Buffer::new(None, "one two three\nfour five six".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "qad2wjq@a").await;
+    harness.assert_buffer_contents("three\nsix");
+}
+
+#[tokio::test]
+async fn zz_centers_an_interior_line_and_clamps_at_file_edges() {
+    let content = (0..40)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let buffer = Buffer::new(None, content.clone());
+    let mut harness = EditorHarness::with_config_and_size(buffer, default_key_config(), 80, 10);
+    type_normal_keys(&mut harness, "jzz").await;
+    assert_eq!(harness.viewport_top(), 0);
+    assert_eq!(harness.buffer_line(), 1);
+
+    harness
+        .execute_action(Action::SetCursor(0, 20))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "zz").await;
+    assert_eq!(harness.viewport_top(), 16);
+    assert_eq!(harness.buffer_line(), 20);
+    assert_eq!(harness.render_cursor_position().unwrap().1, 4);
+
+    harness
+        .execute_action(Action::SetCursor(0, 39))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "zz").await;
+    assert_eq!(harness.viewport_top(), 32);
+    assert_eq!(harness.buffer_line(), 39);
+    assert_eq!(harness.render_cursor_position().unwrap().1, 7);
+}
+
+#[tokio::test]
+async fn test_delete_till_forward_accepts_any_target_character() {
+    for (content, keys, expected) in [
+        ("alpha.beta", "dt.", ".beta"),
+        ("alpha beta", "dtb", "beta"),
+        ("alpha¶beta", "dt¶", "¶beta"),
+    ] {
+        let mut harness = EditorHarness::with_content(content);
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(0, 0);
+    }
+}
+
+#[tokio::test]
+async fn test_delete_till_adjacent_target_deletes_current_character() {
+    let mut harness = EditorHarness::with_content("a.alpha");
+
+    type_normal_keys(&mut harness, "dt.").await;
+
+    harness.assert_buffer_contents(".alpha");
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.last_error(), None);
+}
+
+#[tokio::test]
+async fn test_delete_till_missing_target_does_not_edit() {
+    let mut harness = EditorHarness::with_content("alpha beta");
+
+    type_normal_keys(&mut harness, "dt.").await;
+
+    harness.assert_buffer_contents("alpha beta");
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.last_error(), Some("character not found"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
+}
+
+#[tokio::test]
+async fn find_and_till_forward_move_to_the_requested_character() {
+    let mut harness = EditorHarness::with_content("alpha.beta.gamma");
+
+    type_normal_keys(&mut harness, "f.").await;
+    harness.assert_cursor_at(5, 0);
+
+    let mut harness = EditorHarness::with_content("alpha.beta.gamma");
+    type_normal_keys(&mut harness, "t.").await;
+    harness.assert_cursor_at(4, 0);
+}
+
+#[tokio::test]
+async fn counted_find_and_till_forward_use_the_nth_match() {
+    let mut harness = EditorHarness::with_content("alpha.beta.gamma");
+
+    type_normal_keys(&mut harness, "2f.").await;
+    harness.assert_cursor_at(10, 0);
+
+    let mut harness = EditorHarness::with_content("alpha.beta.gamma");
+    type_normal_keys(&mut harness, "2t.").await;
+    harness.assert_cursor_at(9, 0);
+}
+
+#[tokio::test]
+async fn delete_and_change_accept_find_forward_suffixes() {
+    let mut harness = EditorHarness::with_content("alpha.beta");
+    type_normal_keys(&mut harness, "df.").await;
+    harness.assert_buffer_contents("beta");
+
+    let mut harness = EditorHarness::with_content("alpha.beta");
+    type_normal_keys(&mut harness, "cf.").await;
+    harness.assert_mode(Mode::Insert);
+    harness.type_text("X").await.unwrap();
+    harness.assert_buffer_contents("Xbeta");
+}
+
+#[tokio::test]
+async fn change_till_forward_keeps_the_target_character() {
+    let mut harness = EditorHarness::with_content("alpha.beta");
+
+    type_normal_keys(&mut harness, "ct.").await;
+    harness.assert_mode(Mode::Insert);
+    harness.type_text("X").await.unwrap();
+
+    harness.assert_buffer_contents("X.beta");
+}
+
+#[tokio::test]
+async fn yank_accepts_find_and_till_forward_suffixes() {
+    let mut harness = EditorHarness::with_content("alpha.beta");
+    let clipboard_text = Arc::new(Mutex::new(None));
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+
+    type_normal_keys(&mut harness, "yf.").await;
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("alpha."));
+    harness.assert_buffer_contents("alpha.beta");
+
+    let mut harness = EditorHarness::with_content("alpha.beta");
+    let clipboard_text = Arc::new(Mutex::new(None));
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+
+    type_normal_keys(&mut harness, "yt.").await;
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("alpha"));
+    harness.assert_buffer_contents("alpha.beta");
+}
+
+#[tokio::test]
+async fn visual_find_and_till_forward_extend_the_selection() {
+    let buffer = Buffer::new(None, "alpha.beta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "vf.").await;
+    harness.assert_mode(Mode::Visual);
+    harness.assert_cursor_at(5, 0);
+    type_normal_keys(&mut harness, "x").await;
+    harness.assert_buffer_contents("beta");
+
+    let buffer = Buffer::new(None, "alpha.beta".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "vt.").await;
+    harness.assert_mode(Mode::Visual);
+    harness.assert_cursor_at(4, 0);
+    type_normal_keys(&mut harness, "x").await;
+    harness.assert_buffer_contents(".beta");
+}
+
+#[tokio::test]
+async fn missing_find_forward_target_does_not_move_or_edit() {
+    let mut harness = EditorHarness::with_content("alpha beta");
+
+    type_normal_keys(&mut harness, "f.").await;
+
+    harness.assert_buffer_contents("alpha beta");
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.last_error(), Some("character not found"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
+}
+
+#[tokio::test]
+async fn test_delete_and_change_line_key_sequences() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    type_normal_keys(&mut harness, "dd").await;
+
+    harness.assert_buffer_contents("one\nthree");
+    harness.assert_cursor_at(0, 1);
+
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    type_normal_keys(&mut harness, "cc").await;
+
+    harness.assert_mode(Mode::Insert);
+    harness.type_text("changed").await.unwrap();
+    harness.assert_buffer_contents("one\nchanged\nthree");
+}
+
+#[tokio::test]
+async fn test_yank_line_key_sequence_pastes_linewise() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    type_normal_keys(&mut harness, "yy").await;
+
+    harness.assert_buffer_contents("one\ntwo\nthree");
+    assert!(!harness.is_dirty());
+    harness.assert_cursor_at(0, 1);
+
+    harness.execute_action(Action::Paste).await.unwrap();
+    harness.assert_buffer_contents("one\ntwo\ntwo\nthree");
+
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    type_normal_keys(&mut harness, "yy").await;
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents("one\ntwo\ntwo\nthree");
+}
+
+#[tokio::test]
+async fn yanking_default_register_writes_system_clipboard() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+    let clipboard_text = Arc::new(Mutex::new(None));
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    type_normal_keys(&mut harness, "yy").await;
+
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("two\n"));
+}
+
+#[tokio::test]
+async fn deleting_default_register_writes_system_clipboard() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+    let clipboard_text = Arc::new(Mutex::new(None));
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    harness
+        .execute_action(Action::DeleteCurrentLine)
+        .await
+        .unwrap();
+
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("two\n"));
+}
+
+#[tokio::test]
+async fn paste_reads_external_system_clipboard_text() {
+    let mut harness = EditorHarness::with_content("abc");
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::with_text("system")));
+
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents("systemabc");
+}
+
+#[tokio::test]
+async fn pending_key_sequences_use_waiting_cursor_state() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "g".to_string(),
+        KeyAction::Nested(
+            [("g".to_string(), KeyAction::Single(Action::MoveToTop))]
+                .into_iter()
+                .collect(),
+        ),
+    );
+    config
+        .keys
+        .normal
+        .insert("j".to_string(), KeyAction::Single(Action::MoveDown));
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "g").await;
+    assert!(harness.is_waiting_for_key_sequence());
+
+    type_normal_keys(&mut harness, "g").await;
+    assert!(!harness.is_waiting_for_key_sequence());
+
+    type_normal_keys(&mut harness, "d").await;
+    assert!(harness.is_waiting_for_key_sequence());
+
+    type_normal_keys(&mut harness, "d").await;
+    assert!(!harness.is_waiting_for_key_sequence());
+
+    type_normal_keys(&mut harness, "2").await;
+    assert!(harness.is_waiting_for_key_sequence());
+
+    type_normal_keys(&mut harness, "j").await;
+    assert!(!harness.is_waiting_for_key_sequence());
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "i").await;
+    assert!(harness.is_waiting_for_key_sequence());
+}
+
+#[tokio::test]
+async fn literal_space_key_starts_leader_sequence() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        " ".to_string(),
+        KeyAction::Nested(
+            [("t".to_string(), KeyAction::Single(Action::MoveToBottom))]
+                .into_iter()
+                .collect(),
+        ),
+    );
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, " ").await;
+    assert!(harness.is_waiting_for_key_sequence());
+
+    type_normal_keys(&mut harness, "t").await;
+
+    assert!(!harness.is_waiting_for_key_sequence());
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn named_space_key_still_starts_leader_sequence() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "Space".to_string(),
+        KeyAction::Nested(
+            [("t".to_string(), KeyAction::Single(Action::MoveToBottom))]
+                .into_iter()
+                .collect(),
+        ),
+    );
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, " ").await;
+    assert!(harness.is_waiting_for_key_sequence());
+
+    type_normal_keys(&mut harness, "t").await;
+
+    assert!(!harness.is_waiting_for_key_sequence());
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn ctrl_space_keeps_named_key_binding() {
+    let mut config = Config::default();
+    config.keys.insert.insert(
+        "Ctrl-Space".to_string(),
+        KeyAction::Single(Action::MoveToBottom),
+    );
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn test_change_line() {
+    let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3");
+
+    // Move to second line
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    // Change line with 'cc' - delete line content and enter insert mode
+    harness
+        .execute_action(Action::MoveToLineStart)
+        .await
+        .unwrap();
+    let line_len = harness.current_line().unwrap().trim_end().len();
+    for _ in 0..line_len {
+        harness
+            .execute_action(Action::DeleteCharAtCursorPos)
+            .await
+            .unwrap();
+    }
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.assert_mode(Mode::Insert);
+
+    // Type replacement
+    harness.type_text("Changed line").await.unwrap();
+    harness.assert_buffer_contents("Line 1\nChanged line\nLine 3");
+
+    // Exit insert mode
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_replace_char() {
+    let buffer = Buffer::new(None, "Hello World".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "rJ").await;
+
+    harness.assert_buffer_contents("Jello World");
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn replace_char_accepts_operator_and_character_motion_prefixes() {
+    for replacement in ['d', 'c', 'y', 'f', 't', 'F', 'T'] {
+        let buffer = Buffer::new(None, "abc".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+        type_normal_keys(&mut harness, &format!("r{replacement}")).await;
+
+        harness.assert_buffer_contents(&format!("{replacement}bc"));
+        harness.assert_mode(Mode::Normal);
+
+        type_normal_keys(&mut harness, "x").await;
+        harness.assert_buffer_contents("bc");
+    }
+}
+
+#[tokio::test]
+async fn visual_replace_accepts_operator_and_character_motion_prefixes() {
+    for replacement in ['d', 'c', 'y', 'f', 't', 'F', 'T'] {
+        let buffer = Buffer::new(None, "abc".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+        type_normal_keys(&mut harness, &format!("vlr{replacement}")).await;
+
+        harness.assert_buffer_contents(&format!("{replacement}{replacement}c"));
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn test_insert_at_line_start() {
+    let mut harness = EditorHarness::with_content("    Hello World");
+
+    // Move cursor to middle
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+
+    // Insert at start of line with 'I' - move to start and enter insert
+    harness
+        .execute_action(Action::MoveToLineStart)
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.assert_mode(Mode::Insert);
+    harness.assert_cursor_at(0, 0);
+
+    // Type text
+    harness.type_text("Start: ").await.unwrap();
+    harness.assert_buffer_contents("Start:     Hello World");
+
+    // Exit insert mode
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_insert_key_escape_without_insert_stays_on_original_character() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "i".to_string(),
+        KeyAction::Single(Action::EnterMode(Mode::Insert)),
+    );
+    config.keys.insert.insert(
+        "Esc".to_string(),
+        KeyAction::Single(Action::EnterMode(Mode::Normal)),
+    );
+    let buffer = Buffer::new(None, "abc".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    let start = harness.render_cursor_position().unwrap();
+
+    type_normal_keys(&mut harness, "i").await;
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(1, 0);
+    assert_eq!(harness.render_cursor_position(), Some(start));
+}
+
+#[tokio::test]
+async fn test_append_key_positions_cursor_after_current_character() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "a".to_string(),
+        KeyAction::Multiple(vec![Action::EnterMode(Mode::Insert), Action::MoveRight]),
+    );
+    config.keys.insert.insert(
+        "Esc".to_string(),
+        KeyAction::Single(Action::EnterMode(Mode::Normal)),
+    );
+    let buffer = Buffer::new(None, "abc".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    let start = harness.render_cursor_position().unwrap();
+
+    type_normal_keys(&mut harness, "a").await;
+
+    harness.assert_mode(Mode::Insert);
+    harness.assert_cursor_at(1, 0);
+    assert_eq!(
+        harness.render_cursor_position(),
+        Some((start.0 + 1, start.1))
+    );
+
+    harness.type_text("X").await.unwrap();
+    harness.assert_buffer_contents("aXbc");
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(1, 0);
+}
+
+#[tokio::test]
+async fn test_append_key_escape_without_insert_returns_to_original_character() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "a".to_string(),
+        KeyAction::Multiple(vec![Action::EnterMode(Mode::Insert), Action::MoveRight]),
+    );
+    config.keys.insert.insert(
+        "Esc".to_string(),
+        KeyAction::Single(Action::EnterMode(Mode::Normal)),
+    );
+    let buffer = Buffer::new(None, "abc".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    let start = harness.render_cursor_position().unwrap();
+
+    type_normal_keys(&mut harness, "a").await;
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.render_cursor_position(), Some(start));
+}
+
+#[tokio::test]
+async fn test_append_line_key_positions_cursor_after_line_end() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "A".to_string(),
+        KeyAction::Multiple(vec![
+            Action::MoveToLineEnd,
+            Action::EnterMode(Mode::Insert),
+            Action::MoveRight,
+        ]),
+    );
+    config.keys.insert.insert(
+        "Esc".to_string(),
+        KeyAction::Single(Action::EnterMode(Mode::Normal)),
+    );
+    let buffer = Buffer::new(None, "abc".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    let start = harness.render_cursor_position().unwrap();
+
+    type_normal_keys(&mut harness, "A").await;
+
+    harness.assert_mode(Mode::Insert);
+    harness.assert_cursor_at(3, 0);
+    assert_eq!(
+        harness.render_cursor_position(),
+        Some((start.0 + 3, start.1))
+    );
+
+    harness.type_text("X").await.unwrap();
+    harness.assert_buffer_contents("abcX");
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(3, 0);
+}
+
+#[tokio::test]
+async fn test_append_line_key_escape_without_insert_returns_to_last_character() {
+    let mut config = Config::default();
+    config.keys.normal.insert(
+        "A".to_string(),
+        KeyAction::Multiple(vec![
+            Action::MoveToLineEnd,
+            Action::EnterMode(Mode::Insert),
+            Action::MoveRight,
+        ]),
+    );
+    config.keys.insert.insert(
+        "Esc".to_string(),
+        KeyAction::Single(Action::EnterMode(Mode::Normal)),
+    );
+    let buffer = Buffer::new(None, "abc".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    let start = harness.render_cursor_position().unwrap();
+
+    type_normal_keys(&mut harness, "A").await;
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(2, 0);
+    assert_eq!(
+        harness.render_cursor_position(),
+        Some((start.0 + 2, start.1))
+    );
+}
+
+#[tokio::test]
+async fn test_append_at_line_end() {
+    let mut harness = EditorHarness::with_content("Hello World");
+
+    // Append at end of line with 'A' - move to end and enter insert
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness.assert_mode(Mode::Insert);
+
+    // Type text
+    harness.type_text(" Test").await.unwrap();
+    harness.assert_buffer_contents("Hello World Test");
+
+    // Exit insert mode
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_escape_from_insert_clamps_to_last_line_character() {
+    let mut harness = EditorHarness::with_content("Hello");
+
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness.assert_cursor_at(5, 0);
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.assert_cursor_at(4, 0);
+}
+
+#[tokio::test]
+async fn test_delete_word() {
+    let mut harness = EditorHarness::with_content("Hello World Test");
+
+    // Delete word with 'dw'
+    harness.execute_action(Action::DeleteWord).await.unwrap();
+    harness.assert_buffer_contents("World Test");
+
+    // Delete another word (including space)
+    harness.execute_action(Action::DeleteWord).await.unwrap();
+    harness.assert_buffer_contents("Test");
+}
+
+#[tokio::test]
+async fn delete_word_at_line_end_preserves_the_line_break() {
+    for (contents, keys, expected) in [
+        ("alpha beta\nnext line", "wdw", "alpha \nnext line"),
+        (
+            "alpha beta   \n    next line",
+            "wdw",
+            "alpha \n    next line",
+        ),
+        ("alpha !!!\nnext line", "wdw", "alpha \nnext line"),
+        ("alpha βeta\n    δelta", "wdw", "alpha \n    δelta"),
+        ("alpha beta\r\nnext line", "wdw", "alpha \r\nnext line"),
+        ("alpha beta   \nnext line", "weldw", "alpha beta\nnext line"),
+        ("   \nnext line", "dw", "\nnext line"),
+        ("\n    next line", "dw", "    next line"),
+        ("\n\nnext line", "dw", "\nnext line"),
+    ] {
+        let buffer = Buffer::new(None, contents.to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+    }
+}
+
+#[tokio::test]
+async fn counted_delete_word_can_cross_a_line_break() {
+    for keys in ["wd2w", "w2dw"] {
+        let buffer = Buffer::new(None, "alpha beta\n    next line".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents("alpha line");
+    }
+}
+
+#[tokio::test]
+async fn delete_word_action_preserves_line_breaks_and_deletes_through_eof() {
+    for (contents, expected) in [
+        ("alpha beta\nnext line", "alpha \nnext line"),
+        ("alpha beta   \n    next line", "alpha \n    next line"),
+        ("alpha beta\r\nnext line", "alpha \r\nnext line"),
+        ("alpha βeta\n    δelta", "alpha \n    δelta"),
+        ("alpha beta", "alpha "),
+        ("alpha βeta", "alpha "),
+    ] {
+        let mut harness = EditorHarness::with_content(contents);
+        harness
+            .execute_action(Action::MoveToNextWord)
+            .await
+            .unwrap();
+
+        harness.execute_action(Action::DeleteWord).await.unwrap();
+
+        harness.assert_buffer_contents(expected);
+    }
+}
+
+#[tokio::test]
+async fn test_join_lines() {
+    for (contents, keys, expected, cursor) in [
+        ("alpha\n    beta", "J", "alpha beta", (5, 0)),
+        ("alpha\n    ) tail", "J", "alpha) tail", (5, 0)),
+        ("alpha \n    beta", "J", "alpha beta", (6, 0)),
+        ("α\u{0301}\r\n    β", "J", "α\u{0301} β", (1, 0)),
+        (
+            "one\n  two\n    three\nfour",
+            "3J",
+            "one two three\nfour",
+            (7, 0),
+        ),
+        ("alpha \n    beta", "gJ", "alpha     beta", (6, 0)),
+        (
+            "one\n  two\n    three\nfour",
+            "VjjJ",
+            "one two three\nfour",
+            (7, 0),
+        ),
+        (
+            "one \n  two\n    three\nfour",
+            "VjjgJ",
+            "one   two    three\nfour",
+            (9, 0),
+        ),
+        (
+            "one \n  two\n    three\nfour",
+            "3gJ",
+            "one   two    three\nfour",
+            (9, 0),
+        ),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn join_lines_is_one_undoable_repeatable_change() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "one\n  two\nthree\n  four".to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "Jj.").await;
+    harness.assert_buffer_contents("one two\nthree four");
+
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("one two\nthree\n  four");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents("one\n  two\nthree\n  four");
+}
+
+#[tokio::test]
+async fn join_lines_survives_macro_replay_and_eof() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "one\n  two\nthree\n  four".to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "qaJjq@a").await;
+    harness.assert_buffer_contents("one two\nthree four");
+
+    type_normal_keys(&mut harness, "GJ").await;
+    harness.assert_buffer_contents("one two\nthree four");
+}
+
+#[tokio::test]
+async fn join_ex_command_supports_count_and_bang() {
+    for (contents, command, expected) in [
+        ("one\n  two\nthree", "join", "one two\nthree"),
+        ("one\n  two\nthree\nfour", "j 3", "one two three\nfour"),
+        ("one \n  two\nthree", "join!", "one   two\nthree"),
+        ("one \n  two\nthree\nfour", "j! 3", "one   twothree\nfour"),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+
+        harness.assert_buffer_contents(expected);
+    }
+}
+
+#[tokio::test]
+async fn join_ex_command_supports_numeric_and_visual_ranges() {
+    for (contents, command, expected) in [
+        ("one\ntwo\nthree\nfour", "2join", "one\ntwo three\nfour"),
+        (
+            "one\ntwo\n  three\nfour",
+            "2,3join!",
+            "one\ntwo  three\nfour",
+        ),
+        ("one\n  two\nthree", "%join", "one two three"),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        harness
+            .execute_action(Action::Command(command.to_string()))
+            .await
+            .unwrap();
+
+        harness.assert_buffer_contents(expected);
+    }
+
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "one\n  two\nthree".to_string()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "Vj:join").await;
+    command_key(&mut harness, KeyCode::Enter).await;
+    harness.assert_buffer_contents("one two\nthree");
+}
+
+#[tokio::test]
+async fn unsupported_ranged_command_reports_a_specific_error() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "one\ntwo".to_string()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "Vj:w").await;
+    command_key(&mut harness, KeyCode::Enter).await;
+
+    assert_eq!(
+        harness.last_error(),
+        Some("command \"w\" does not support a line range")
+    );
+    harness.assert_buffer_contents("one\ntwo");
+}
+
+#[tokio::test]
+async fn test_undo_redo() {
+    let mut harness = EditorHarness::with_content("Hello World");
+
+    // Make a change
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("ello World");
+
+    // Undo with 'u'
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("Hello World");
+
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("ello World");
+}
+
+#[tokio::test]
+async fn undo_and_redo_boundaries_report_no_op() {
+    let mut harness = EditorHarness::with_content("Hello World");
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    assert!(harness
+        .commandline_row()
+        .contains("already at oldest change"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
+
+    harness.execute_action(Action::Redo).await.unwrap();
+    assert!(harness
+        .commandline_row()
+        .contains("already at newest change"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
+}
+
+#[tokio::test]
+async fn test_undo_multi_character_insert_session() {
+    let mut harness = EditorHarness::with_content("");
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.type_text("hello").await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("hello\n");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("\n");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("hello\n");
+}
+
+#[tokio::test]
+async fn test_undo_insert_backspace_session() {
+    let mut harness = EditorHarness::with_content("");
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.type_text("abc").await.unwrap();
+    harness
+        .execute_action(Action::DeletePreviousChar)
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("ab\n");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("\n");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("ab\n");
+}
+
+#[tokio::test]
+async fn test_backspace_at_line_start_joins_with_previous_line() {
+    let mut harness = EditorHarness::with_content("abc\ndef");
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::DeletePreviousChar)
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("abcdef");
+    harness.assert_cursor_at(3, 0);
+}
+
+#[tokio::test]
+async fn test_undo_delete_range_and_word() {
+    let mut harness = EditorHarness::with_content("hello world");
+
+    harness.execute_action(Action::DeleteWord).await.unwrap();
+    harness.assert_buffer_contents("world");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("hello world");
+
+    harness
+        .execute_action(Action::DeleteRange(0, 0, 5, 0))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents(" world");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("hello world");
+}
+
+#[tokio::test]
+async fn test_undo_delete_current_line() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::DeleteCurrentLine)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("one\nthree");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("one\ntwo\nthree");
+
+    let mut harness = EditorHarness::with_content("single");
+    harness
+        .execute_action(Action::DeleteCurrentLine)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("single");
+}
+
+#[tokio::test]
+async fn test_delete_current_line_yanks_for_linewise_paste_before() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::DeleteCurrentLine)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("one\nthree");
+
+    harness
+        .execute_action(Action::MoveToLineStart)
+        .await
+        .unwrap();
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+    harness.assert_buffer_contents("one\ntwo\nthree");
+}
+
+#[tokio::test]
+async fn test_undo_multiline_insert_and_unicode() {
+    let mut harness = EditorHarness::with_content("");
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.type_text("a👋").await.unwrap();
+    harness.execute_action(Action::InsertNewLine).await.unwrap();
+    harness.type_text("é").await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("a👋\né\n");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("\n");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("a👋\né\n");
+}
+
+#[tokio::test]
+async fn test_redo_stack_clears_after_new_edit() {
+    let mut harness = EditorHarness::with_content("abc");
+
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("bc");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abc");
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('z'))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("zabc");
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("zabc");
+}
+
+#[tokio::test]
+async fn undo_tree_preserves_and_traverses_sibling_branches() {
+    let mut harness = EditorHarness::with_content("abc");
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('z'))
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+
+    harness
+        .execute_action(Action::SelectPreviousUndoBranch)
+        .await
+        .unwrap();
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("bc");
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness
+        .execute_action(Action::SelectNextUndoBranch)
+        .await
+        .unwrap();
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("zabc");
+}
+
+#[tokio::test]
+async fn selective_revert_applies_only_when_the_post_image_still_matches() {
+    let mut harness = EditorHarness::with_content("abc");
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    let transaction_id = harness.editor.test_undo_tree()[0].transaction_id.clone();
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("b");
+
+    harness
+        .execute_action(Action::RevertTransaction(transaction_id))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("ab");
+    assert!(harness.editor.test_undo_tree().len() >= 3);
+
+    let mut harness = EditorHarness::with_content("abc");
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    let transaction_id = harness.editor.test_undo_tree()[0].transaction_id.clone();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('X'))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::RevertTransaction(transaction_id))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("Xbc");
+    assert!(harness
+        .last_error()
+        .is_some_and(|message| message.contains("revert conflict")));
+}
+
+#[tokio::test]
+async fn selective_revert_accepts_adjacent_insertions_from_one_insert_transaction() {
+    let mut harness = EditorHarness::with_content("");
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.type_text("abc").await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("abc\n");
+    let transaction_id = harness.editor.test_undo_tree()[0].transaction_id.clone();
+
+    harness
+        .execute_action(Action::RevertTransaction(transaction_id))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("\n");
+    assert!(!harness
+        .last_error()
+        .is_some_and(|message| message.contains("revert conflict")));
+}
+
+#[tokio::test]
+async fn selective_revert_shifts_a_replacement_past_a_later_left_edge_insertion() {
+    let mut harness = EditorHarness::with_content("abc");
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness
+        .execute_action(Action::ReplaceCharsAtCursor {
+            character: 'B',
+            count: 1,
+        })
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("aBc");
+    let transaction_id = harness.editor.test_undo_tree()[0].transaction_id.clone();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('!'))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("a!Bc");
+
+    harness
+        .execute_action(Action::RevertTransaction(transaction_id))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("a!bc");
+    assert!(!harness
+        .last_error()
+        .is_some_and(|message| message.contains("revert conflict")));
+}
+
+#[tokio::test]
+async fn test_undo_does_not_create_new_undo_entries() {
+    let mut harness = EditorHarness::with_content("abc");
+
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abc");
+}
+
+#[tokio::test]
+async fn test_undo_indent_and_unindent() {
+    let mut harness = EditorHarness::with_content("line");
+
+    harness.execute_action(Action::IndentLine).await.unwrap();
+    harness.assert_buffer_contents("    line");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("line");
+
+    harness.execute_action(Action::IndentLine).await.unwrap();
+    harness.execute_action(Action::UnindentLine).await.unwrap();
+    harness.assert_buffer_contents("line");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("    line");
+}
+
+#[tokio::test]
+async fn visual_indent_shifts_all_selected_lines_as_one_change() {
+    let buffer = Buffer::new(None, "one\n\n  two\n   ".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "Vjjj>").await;
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_buffer_contents("    one\n\n      two\n       ");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("one\n\n  two\n   ");
+}
+
+#[tokio::test]
+async fn visual_indent_supports_character_block_and_counted_selections() {
+    for mode in [Mode::Visual, Mode::VisualBlock] {
+        let buffer = Buffer::new(None, "one\ntwo".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness
+            .execute_action(Action::EnterMode(mode))
+            .await
+            .unwrap();
+        harness.execute_action(Action::MoveDown).await.unwrap();
+        type_normal_keys(&mut harness, ">").await;
+
+        harness.assert_mode(Mode::Normal);
+        harness.assert_buffer_contents("    one\n    two");
+    }
+
+    let buffer = Buffer::new(None, "one\ntwo".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "Vj2>").await;
+    harness.assert_buffer_contents("        one\n        two");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("one\ntwo");
+}
+
+#[tokio::test]
+async fn dot_repeats_visual_indent_by_line_count_for_forward_and_reverse_selections() {
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour\nfive\nsix".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "Vjj>.").await;
+
+    harness.assert_buffer_contents("        one\n        two\n        three\nfour\nfive\nsix");
+
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour\nfive\nsix".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "5GVkk>.").await;
+
+    harness.assert_buffer_contents("one\ntwo\n        three\n        four\n        five\nsix");
+}
+
+#[tokio::test]
+async fn dot_repeats_visual_indent_span_from_the_current_line_and_preserves_count() {
+    let buffer = Buffer::new(
+        None,
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "Vjj>5G.").await;
+
+    harness.assert_buffer_contents(
+        "    one\n    two\n    three\nfour\n    five\n    six\n    seven\neight",
+    );
+
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "Vj2>.").await;
+
+    harness.assert_buffer_contents("                one\n                two\nthree");
+}
+
+#[tokio::test]
+async fn dot_repeats_trailing_actions_from_a_compound_visual_indent_mapping() {
+    let mut config = default_key_config();
+    config.keys.visual.insert(
+        ">".to_string(),
+        KeyAction::Multiple(vec![
+            Action::IndentSelection(1),
+            Action::DeleteCharAtCursorPos,
+        ]),
+    );
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "Vj>j.").await;
+
+    harness.assert_buffer_contents("   one\n       two\n    three\nfour");
+}
+
+#[tokio::test]
+async fn dot_repeats_later_input_after_a_compound_visual_indent_mapping() {
+    let mut config = default_key_config();
+    config.keys.visual.insert(
+        ">".to_string(),
+        KeyAction::Multiple(vec![
+            Action::IndentSelection(1),
+            Action::EnterMode(Mode::Insert),
+        ]),
+    );
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "Vj>").await;
+    type_normal_keys(&mut harness, "X").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    type_normal_keys(&mut harness, "j.").await;
+
+    harness.assert_buffer_contents("X    one\nX        two\n    three\nfour");
+}
+
+#[tokio::test]
+async fn visual_unindent_shifts_all_selected_lines_as_one_change() {
+    let buffer = Buffer::new(None, "    one\n\n      two\n       ".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "Vjjj<").await;
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_buffer_contents("one\n\n  two\n   ");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("    one\n\n      two\n       ");
+}
+
+#[tokio::test]
+async fn visual_unindent_supports_character_block_and_counted_selections() {
+    for mode in [Mode::Visual, Mode::VisualBlock] {
+        let buffer = Buffer::new(None, "    one\n    two".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness
+            .execute_action(Action::EnterMode(mode))
+            .await
+            .unwrap();
+        harness.execute_action(Action::MoveDown).await.unwrap();
+        type_normal_keys(&mut harness, "<").await;
+
+        harness.assert_mode(Mode::Normal);
+        harness.assert_buffer_contents("one\ntwo");
+    }
+
+    let buffer = Buffer::new(None, "        one\n    two".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    type_normal_keys(&mut harness, "Vj2<").await;
+    harness.assert_buffer_contents("one\ntwo");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("        one\n    two");
+}
+
+#[tokio::test]
+async fn dot_repeats_visual_unindent_by_line_count_and_preserves_prior_change_on_noop() {
+    let buffer = Buffer::new(
+        None,
+        "                one\n                two\n                three\nfour\nfive".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "3GVkk2<.").await;
+
+    harness.assert_buffer_contents("one\ntwo\nthree\nfour\nfive");
+
+    let buffer = Buffer::new(None, "ab\ncd\nef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "xjVj<.").await;
+
+    harness.assert_buffer_contents("b\nd\nef");
+}
+
+#[tokio::test]
+async fn gv_reselects_lines_after_visual_indent() {
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "Vj>gv").await;
+
+    harness.assert_mode(Mode::VisualLine);
+    assert_eq!(
+        harness.selection().map(|(_, y0, _, y1)| (y0, y1)),
+        Some((0, 1))
+    );
+    harness.assert_buffer_contents("    one\n    two\nthree");
+}
+
+#[tokio::test]
+async fn gv_reselects_lines_after_visual_unindent() {
+    let buffer = Buffer::new(None, "    one\n    two\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "Vj<gv").await;
+
+    harness.assert_mode(Mode::VisualLine);
+    assert_eq!(
+        harness.selection().map(|(_, y0, _, y1)| (y0, y1)),
+        Some((0, 1))
+    );
+    harness.assert_buffer_contents("one\ntwo\nthree");
+}
+
+#[tokio::test]
+async fn test_undo_visual_char_line_and_block_delete() {
+    let mut harness = EditorHarness::with_content("abcde");
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness.execute_action(Action::Delete).await.unwrap();
+    harness.assert_buffer_contents("de");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abcde");
+
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree");
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualLine))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.execute_action(Action::Delete).await.unwrap();
+    harness.assert_buffer_contents("three");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("one\ntwo\nthree");
+
+    let mut harness = EditorHarness::with_content("abc\ndef");
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualBlock))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.execute_action(Action::Delete).await.unwrap();
+    harness.assert_buffer_contents("c\nf");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abc\ndef");
+}
+
+#[tokio::test]
+async fn test_visual_block_insert_undoes_and_redoes_as_one_transaction() {
+    let mut harness = EditorHarness::with_content("impl\nfn\nColor\n}\n}");
+
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualBlock))
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+    harness.execute_action(Action::InsertBlock).await.unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos(' '))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents(" impl\n fn\n Color\n }\n }");
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("impl\nfn\nColor\n}\n}");
+
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents(" impl\n fn\n Color\n }\n }");
+}
+
+#[tokio::test]
+async fn test_visual_block_insert_coalesces_replayed_change_notifications() {
+    let path = temp_file_path("visual-block-insert-lsp");
+    let lsp = RecordingLsp::default();
+    let events = lsp.events();
+    let config = Config::default();
+    let theme = Theme::default();
+    let buffer = Buffer::new(Some(path.clone()), "impl\nfn\nColor\n}\n}".to_string());
+    let mut editor =
+        Editor::test_with_size(Box::new(lsp), 80, 24, config, theme, vec![buffer]).unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualBlock))
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+    harness.execute_action(Action::InsertBlock).await.unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos(' '))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    let did_change_count = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, LspEvent::DidChange(file) if file == &path))
+        .count();
+    assert_eq!(
+        did_change_count, 2,
+        "expected one notification for the initial insert and one coalesced replay notification"
+    );
+
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn test_visual_block_insert_clears_selection_background_after_apply() {
+    let mut harness = EditorHarness::with_content("impl\nfn\nColor\n}\n}");
+    let selection_bg = Color::Rgb {
+        r: 12,
+        g: 34,
+        b: 56,
+    };
+    harness.editor.theme.selection_style = Some(Style {
+        bg: Some(selection_bg),
+        ..Default::default()
+    });
+
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualBlock))
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+    harness.execute_action(Action::InsertBlock).await.unwrap();
+    harness
+        .execute_action(Action::InsertCharAtCursorPos(' '))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    for y in 0..5 {
+        for x in 0..40 {
+            assert_ne!(
+                harness.render_cell_bg(x, y).unwrap(),
+                Some(selection_bg),
+                "selection background leaked at ({x}, {y}) after block insert"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_visual_line_selection_uses_buffer_lines_after_scrolling() {
+    let content = (0..40)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = EditorHarness::with_content(&content);
+
+    harness
+        .execute_action(Action::SetCursor(0, 30))
+        .await
+        .unwrap();
+    assert_eq!(harness.viewport_top(), 9);
+    harness.assert_cursor_at(0, 30);
+
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualLine))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.execute_action(Action::Delete).await.unwrap();
+
+    let remaining = harness.buffer_contents();
+    assert!(
+        !remaining.contains("line-30\nline-31"),
+        "visual line delete should remove the scrolled-to buffer lines"
+    );
+    assert!(
+        remaining.contains("line-21"),
+        "visual line delete should not use viewport-relative rows as buffer lines"
+    );
+}
+
+#[tokio::test]
+async fn visual_line_delete_whole_scrolled_buffer_repositions_cursor_safely() {
+    let content = (0..40)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffer = Buffer::new(None, content.clone());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "ggVGx").await;
+
+    harness.assert_buffer_contents("");
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.viewport_top(), 0);
+    harness.assert_mode(Mode::Normal);
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(&content);
+}
+
+#[tokio::test]
+async fn visual_paste_replaces_whole_document_from_system_clipboard() {
+    let content = (0..40)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let clipboard_text = Arc::new(Mutex::new(Some("replacement".to_string())));
+    let buffer = Buffer::new(None, content.clone());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+
+    type_normal_keys(&mut harness, "ggVGp").await;
+
+    harness.assert_buffer_contents("replacement");
+    harness.assert_cursor_at(0, 0);
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(
+        clipboard_text.lock().unwrap().as_deref(),
+        Some(content.as_str())
+    );
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(&content);
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("replacement");
+}
+
+#[tokio::test]
+async fn visual_line_paste_replaces_large_interior_selection_with_one_line() {
+    let content = (1..=20)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::with_text(
+            "node dist/src/cli.js plan validate examples/hello-world.yaml",
+        )));
+    harness
+        .execute_action(Action::SetCursor(0, 2))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualLine))
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+
+    type_normal_keys(&mut harness, "p").await;
+
+    harness.assert_buffer_contents(
+        "line-01\nline-02\nnode dist/src/cli.js plan validate examples/hello-world.yaml\nline-09\nline-10\nline-11\nline-12\nline-13\nline-14\nline-15\nline-16\nline-17\nline-18\nline-19\nline-20",
+    );
+    harness.assert_cursor_at(0, 2);
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn visual_line_paste_replaces_small_interior_selection_with_many_lines() {
+    let content = (1..=8)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::with_text(
+            "replacement-a\nreplacement-b\nreplacement-c",
+        )));
+    harness
+        .execute_action(Action::SetCursor(0, 2))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualLine))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "p").await;
+
+    harness.assert_buffer_contents(
+        "line-01\nline-02\nreplacement-a\nreplacement-b\nreplacement-c\nline-04\nline-05\nline-06\nline-07\nline-08",
+    );
+    harness.assert_cursor_at(0, 2);
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn visual_uppercase_p_preserves_system_clipboard() {
+    let clipboard_text = Arc::new(Mutex::new(Some("replacement".to_string())));
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+
+    type_normal_keys(&mut harness, "ggVGP").await;
+
+    harness.assert_buffer_contents("replacement");
+    harness.assert_mode(Mode::Normal);
+    assert_eq!(
+        clipboard_text.lock().unwrap().as_deref(),
+        Some("replacement")
+    );
+}
+
+#[tokio::test]
+async fn visual_paste_replaces_and_captures_a_unicode_grapheme() {
+    let family = "👨‍👩‍👧‍👦";
+    let clipboard_text = Arc::new(Mutex::new(Some("X".to_string())));
+    let buffer = Buffer::new(None, format!("a{family}b"));
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "p").await;
+
+    harness.assert_buffer_contents("aXb");
+    harness.assert_cursor_at(1, 0);
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some(family));
+}
+
+#[tokio::test]
+async fn visual_paste_matches_selection_and_register_kinds() {
+    let sources = [
+        Content::charwise("Q".to_string()),
+        Content::linewise("X\nY\n".to_string()),
+        Content::blockwise("XY\nUV\n".to_string()),
+    ];
+
+    for ((source, expected), cursor) in sources
+        .iter()
+        .cloned()
+        .zip([
+            "pre Q post\nsecond\nthird",
+            "pre \nX\nY\n post\nsecond\nthird",
+            "pre XY post\nsecoUVnd\nthird",
+        ])
+        .zip([(4, 0), (0, 1), (4, 0)])
+    {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "pre abc post\nsecond\nthird".to_string()),
+            default_key_config(),
+        );
+        harness.editor.test_set_default_register(source);
+        for _ in 0..4 {
+            harness.execute_action(Action::MoveRight).await.unwrap();
+        }
+        harness
+            .execute_action(Action::EnterMode(Mode::Visual))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            harness.execute_action(Action::MoveRight).await.unwrap();
+        }
+
+        harness.execute_action(Action::Paste).await.unwrap();
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+    }
+
+    for (source, expected) in
+        sources
+            .iter()
+            .cloned()
+            .zip(["one\nQ\nfour", "one\nX\nY\nfour", "one\nXY\nUV\nfour"])
+    {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "one\ntwo\nthree\nfour".to_string()),
+            default_key_config(),
+        );
+        harness.editor.test_set_default_register(source);
+        harness.execute_action(Action::MoveDown).await.unwrap();
+        harness
+            .execute_action(Action::EnterMode(Mode::VisualLine))
+            .await
+            .unwrap();
+        harness.execute_action(Action::MoveDown).await.unwrap();
+
+        harness.execute_action(Action::Paste).await.unwrap();
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(0, 1);
+    }
+
+    for ((source, expected), cursor) in sources
+        .into_iter()
+        .zip([
+            "Q11zz\nQ22yy\nQ33xx",
+            "11zz\n22yy\n33xx\nX\nY",
+            "XY11zz\nUV22yy\n33xx",
+        ])
+        .zip([(0, 0), (0, 3), (0, 0)])
+    {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "aa11zz\nbb22yy\ncc33xx".to_string()),
+            default_key_config(),
+        );
+        harness.editor.test_set_default_register(source);
+        harness
+            .execute_action(Action::EnterMode(Mode::VisualBlock))
+            .await
+            .unwrap();
+        harness.execute_action(Action::MoveRight).await.unwrap();
+        harness.execute_action(Action::MoveDown).await.unwrap();
+        harness.execute_action(Action::MoveDown).await.unwrap();
+
+        harness.execute_action(Action::Paste).await.unwrap();
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+    }
+}
+
+#[tokio::test]
+async fn visual_paste_emits_one_change_notification() {
+    let path = temp_file_path("visual-paste-lsp");
+    let lsp = RecordingLsp::default();
+    let events = lsp.events();
+    let buffer = Buffer::new(Some(path.clone()), "one\ntwo\nthree".to_string());
+    let mut editor = Editor::test_with_size(
+        Box::new(lsp),
+        80,
+        24,
+        default_key_config(),
+        Theme::default(),
+        vec![buffer],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    editor.test_set_clipboard(Box::new(MemoryClipboardProvider::default()));
+    editor.test_set_default_register(Content::charwise("replacement".to_string()));
+    let mut harness = EditorHarness { editor };
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualLine))
+        .await
+        .unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    harness.execute_action(Action::Paste).await.unwrap();
+
+    let did_change_count = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, LspEvent::DidChange(file) if file == &path))
+        .count();
+    assert_eq!(did_change_count, 1);
+
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn bracketed_paste_inserts_multiline_text_once() {
+    let path = temp_file_path("bracketed-paste-lsp");
+    let lsp = RecordingLsp::default();
+    let events = lsp.events();
+    let buffer = Buffer::new(Some(path.clone()), "\n".to_string());
+    let mut editor = Editor::test_with_size(
+        Box::new(lsp),
+        80,
+        24,
+        default_key_config(),
+        Theme::default(),
+        vec![buffer],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+
+    harness
+        .execute_event(Event::Paste("alpha\r\nbeta 👋".to_string()))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("alpha\nbeta 👋\n");
+    harness.assert_cursor_at(6, 1);
+    let did_change_count = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, LspEvent::DidChange(file) if file == &path))
+        .count();
+    assert_eq!(did_change_count, 1);
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("\n");
+
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn rust_linewise_paste_reindents_multiline_clipboard_without_range_formatting() {
+    let original = concat!(
+        "impl Recap {\n",
+        "    fn note_focus_gained(&mut self) {\n",
+        "        if let Some(task) = self.scheduled_check.take() {\n",
+        "            task.abort();\n",
+        "        }\n",
+        "\n",
+        "        self.retry_revision = None;\n",
+        "        self.in_flight_request_id = None;\n",
+        "    }\n",
+        "}\n",
+    );
+    let clipboard = concat!(
+        "self.retry_revision = None;\n",
+        "if self.in_flight_trigger == Some(RecapTrigger::Automatic) {\n",
+        "    self.clear_in_flight_request();\n",
+        "}\n",
+    );
+    let mut harness = comment_harness("main.rs", original);
+    harness
+        .editor
+        .test_set_default_register(Content::linewise(clipboard.to_string()));
+    harness
+        .execute_action(Action::SetCursor(8, 6))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "impl Recap {\n",
+        "    fn note_focus_gained(&mut self) {\n",
+        "        if let Some(task) = self.scheduled_check.take() {\n",
+        "            task.abort();\n",
+        "        }\n",
+        "\n",
+        "        self.retry_revision = None;\n",
+        "        if self.in_flight_trigger == Some(RecapTrigger::Automatic) {\n",
+        "            self.clear_in_flight_request();\n",
+        "        }\n",
+        "        self.retry_revision = None;\n",
+        "        self.in_flight_request_id = None;\n",
+        "    }\n",
+        "}\n",
+    ));
+    harness.assert_cursor_at(8, 6);
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(original);
+}
+
+#[tokio::test]
+async fn rust_bracketed_paste_dedents_a_whole_file_with_a_leading_doc_comment() {
+    let clipboard = concat!(
+        "    //! Manual recap progress presentation for `ChatWidget`.\n",
+        "\n",
+        "    use super::*;\n",
+        "\n",
+        "    impl ChatWidget {\n",
+        "        pub(crate) fn show_recap_loading(&mut self) {\n",
+        "            self.flush_active_cell();\n",
+        "            self.request_redraw();\n",
+        "        }\n",
+        "    }\n",
+    );
+    let mut harness = comment_harness("recap.rs", "");
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+
+    harness
+        .execute_event(Event::Paste(clipboard.to_string()))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "//! Manual recap progress presentation for `ChatWidget`.\n",
+        "\n",
+        "use super::*;\n",
+        "\n",
+        "impl ChatWidget {\n",
+        "    pub(crate) fn show_recap_loading(&mut self) {\n",
+        "        self.flush_active_cell();\n",
+        "        self.request_redraw();\n",
+        "    }\n",
+        "}\n",
+    ));
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("");
+}
+
+#[tokio::test]
+async fn rust_whole_file_paste_dedents_code_without_changing_raw_string_contents() {
+    let clipboard = concat!(
+        "    //! A module containing an intentionally indented raw string.\n",
+        "    const MESSAGE: &str = r#\"first\n",
+        "    literal indentation\n",
+        "    \"#;\n",
+    );
+    let mut harness = comment_harness("recap.rs", "");
+    harness
+        .editor
+        .test_set_default_register(Content::linewise(clipboard.to_string()));
+
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "//! A module containing an intentionally indented raw string.\n",
+        "const MESSAGE: &str = r#\"first\n",
+        "    literal indentation\n",
+        "    \"#;\n",
+    ));
+}
+
+#[tokio::test]
+async fn rust_bracketed_paste_reindents_following_lines_without_range_formatting() {
+    let original = concat!(
+        "impl Recap {\n",
+        "    fn note_focus_gained(&mut self) {\n",
+        "        \n",
+        "        self.in_flight_request_id = None;\n",
+        "    }\n",
+        "}\n",
+    );
+    let clipboard = concat!(
+        "self.retry_revision = None;\n",
+        "if self.in_flight_trigger == Some(RecapTrigger::Automatic) {\n",
+        "    self.clear_in_flight_request();\n",
+        "}",
+    );
+    let mut harness = comment_harness("main.rs", original);
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::SetCursor(8, 2))
+        .await
+        .unwrap();
+
+    harness
+        .execute_event(Event::Paste(clipboard.to_string()))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "impl Recap {\n",
+        "    fn note_focus_gained(&mut self) {\n",
+        "        self.retry_revision = None;\n",
+        "        if self.in_flight_trigger == Some(RecapTrigger::Automatic) {\n",
+        "            self.clear_in_flight_request();\n",
+        "        }\n",
+        "        self.in_flight_request_id = None;\n",
+        "    }\n",
+        "}\n",
+    ));
+    harness.assert_cursor_at(9, 5);
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(original);
+}
+
+#[tokio::test]
+async fn rust_system_clipboard_paste_reindents_multiline_code() {
+    let original = "fn update() {\n    existing();\n}\n";
+    let clipboard = "if ready() {\n    update();\n}\n";
+    let mut harness = comment_harness("main.rs", original);
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::with_text(clipboard)));
+    harness
+        .execute_action(Action::SetCursor(0, 1))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "fn update() {\n",
+        "    if ready() {\n",
+        "        update();\n",
+        "    }\n",
+        "    existing();\n",
+        "}\n",
+    ));
+    harness.assert_cursor_at(4, 1);
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(original);
+}
+
+#[tokio::test]
+async fn rust_visual_line_paste_reindents_multiline_code() {
+    let original = "fn update() {\n    replace();\n    existing();\n}\n";
+    let clipboard = "if ready() {\n    update();\n}";
+    let mut harness = comment_harness("main.rs", original);
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::with_text(clipboard)));
+    harness
+        .execute_action(Action::SetCursor(0, 1))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualLine))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::Paste).await.unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "fn update() {\n",
+        "    if ready() {\n",
+        "        update();\n",
+        "    }\n",
+        "    existing();\n",
+        "}\n",
+    ));
+    harness.assert_cursor_at(4, 1);
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents(original);
+}
+
+#[tokio::test]
+async fn rust_paste_rebases_existing_clipboard_indentation() {
+    let original = "impl Recap {\n    fn update(&mut self) {\n        existing();\n    }\n}\n";
+    let clipboard = "    if ready() {\n        update();\n    }\n";
+    let mut harness = comment_harness("main.rs", original);
+    harness
+        .editor
+        .test_set_default_register(Content::linewise(clipboard.to_string()));
+    harness
+        .execute_action(Action::SetCursor(0, 2))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "impl Recap {\n",
+        "    fn update(&mut self) {\n",
+        "        if ready() {\n",
+        "            update();\n",
+        "        }\n",
+        "        existing();\n",
+        "    }\n",
+        "}\n",
+    ));
+}
+
+#[tokio::test]
+async fn rust_paste_preserves_multiline_raw_string_contents() {
+    let original = "fn update() {\n    existing();\n}\n";
+    let clipboard = "let message = r#\"first\nraw text\n\"#;\n";
+    let mut harness = comment_harness("main.rs", original);
+    harness
+        .editor
+        .test_set_default_register(Content::linewise(clipboard.to_string()));
+    harness
+        .execute_action(Action::SetCursor(0, 1))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "fn update() {\n",
+        "    let message = r#\"first\n",
+        "raw text\n",
+        "\"#;\n",
+        "    existing();\n",
+        "}\n",
+    ));
+}
+
+#[tokio::test]
+async fn rust_paste_preserves_raw_indentation_when_format_on_paste_is_disabled() {
+    let mut config = default_key_config();
+    config.formatting.on_paste = false;
+    let buffer = Buffer::new(
+        Some("main.rs".to_string()),
+        "fn update() {\n    existing();\n}\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.editor.test_set_default_register(Content::linewise(
+        "if ready() {\n    update();\n}\n".to_string(),
+    ));
+    harness
+        .execute_action(Action::SetCursor(0, 1))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents(
+        "fn update() {\nif ready() {\n    update();\n}\n    existing();\n}\n",
+    );
+}
+
+#[tokio::test]
+async fn rust_paste_reindents_when_lsp_is_disabled() {
+    let mut config = default_key_config();
+    config.lsp.enabled = false;
+    let buffer = Buffer::new(
+        Some("main.rs".to_string()),
+        "fn update() {\n    existing();\n}\n".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.editor.test_set_default_register(Content::linewise(
+        "if ready() {\n    update();\n}\n".to_string(),
+    ));
+    harness
+        .execute_action(Action::SetCursor(0, 1))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+
+    harness.assert_buffer_contents(concat!(
+        "fn update() {\n",
+        "    if ready() {\n",
+        "        update();\n",
+        "    }\n",
+        "    existing();\n",
+        "}\n",
+    ));
+}
+
+#[tokio::test]
+async fn bracketed_paste_reveals_a_distant_endpoint_without_pin_to_top() {
+    let content = (0..80)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = Config {
+        scrolloff: Some(3),
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 80, 24);
+    harness.set_viewport_cursor(9, 0, 10);
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+
+    harness
+        .execute_event(Event::Paste("pasted\n".repeat(40)))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_line(), 59);
+    assert_eq!(harness.viewport_top(), 49);
+    assert_eq!(harness.buffer_line() - harness.viewport_top(), 10);
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.execute_action(Action::Undo).await.unwrap();
+    assert_eq!(harness.buffer_line(), 19);
+    assert_eq!(harness.viewport_top(), 9);
+
+    harness.execute_action(Action::Redo).await.unwrap();
+    assert_eq!(harness.buffer_line(), 59);
+    assert_eq!(harness.viewport_top(), 49);
+}
+
+#[tokio::test]
+async fn disabled_lsp_skips_document_change_notifications() {
+    let path = temp_file_path("disabled-lsp-change");
+    let lsp = RecordingLsp::default();
+    let events = lsp.events();
+    let mut config = default_key_config();
+    config.lsp.enabled = false;
+    let buffer = Buffer::new(Some(path.clone()), "text".to_string());
+    let mut editor = Editor::test_with_size(
+        Box::new(lsp),
+        80,
+        24,
+        config,
+        Theme::default(),
+        vec![buffer],
+    )
+    .unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('x'))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("xtext");
+    assert!(events.lock().unwrap().iter().all(|event| {
+        !matches!(event, LspEvent::DidOpen(file) | LspEvent::DidChange(file) if file == &path)
+    }));
+}
+
+#[tokio::test]
+async fn bracketed_paste_uses_first_line_in_command_mode() {
+    let mut harness = EditorHarness::with_content("safe");
+    harness.set_commandline(Mode::Command, "");
+
+    harness
+        .execute_event(Event::Paste("q\r\nj".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.commandline_text(), "q");
+    harness.assert_mode(Mode::Command);
+}
+
+#[tokio::test]
+async fn bracketed_paste_uses_first_line_in_search_mode() {
+    let mut harness = EditorHarness::with_content("alpha beta");
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+
+    harness
+        .execute_event(Event::Paste("alpha\r\nbeta".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.commandline_text(), "alpha");
+    harness.assert_mode(Mode::Search);
+}
+
+#[tokio::test]
+async fn bracketed_paste_is_ignored_in_normal_mode() {
+    let mut harness = EditorHarness::with_content("safe");
+
+    harness
+        .execute_event(Event::Paste("iddanger".to_string()))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("safe");
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn bracketed_paste_cancels_pending_normal_key_sequence() {
+    let mut harness = EditorHarness::with_content("safe word");
+    type_normal_keys(&mut harness, "d").await;
+    assert!(harness.is_waiting_for_key_sequence());
+
+    harness
+        .execute_event(Event::Paste("ignored".to_string()))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "w").await;
+
+    assert!(!harness.is_waiting_for_key_sequence());
+    harness.assert_buffer_contents("safe word");
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn test_undo_paste_and_paste_before() {
+    let mut harness = EditorHarness::with_content("hello world");
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    harness.execute_action(Action::Delete).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("world");
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness.execute_action(Action::Paste).await.unwrap();
+    harness.assert_buffer_contents("worldhello ");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("world");
+
+    harness
+        .execute_action(Action::MoveToLineStart)
+        .await
+        .unwrap();
+    harness.execute_action(Action::PasteBefore).await.unwrap();
+    harness.assert_buffer_contents("hello world");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("world");
+}
+
+#[tokio::test]
+async fn test_undo_insert_text_action() {
+    let mut harness = EditorHarness::with_content("abc");
+    let content = Content::charwise("ZZ".to_string());
+
+    harness
+        .execute_action(Action::InsertText {
+            x: 1,
+            y: 0,
+            content,
+        })
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("aZZbc");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abc");
+}
+
+#[tokio::test]
+async fn test_undo_history_is_per_buffer() {
+    let lsp = Box::new(MockLsp) as Box<dyn LspClient + Send>;
+    let config = Config::default();
+    let theme = Theme::default();
+    let buffers = vec![
+        Buffer::new(None, "one".to_string()),
+        Buffer::new(None, "two".to_string()),
+    ];
+    let mut editor = Editor::test_with_size(lsp, 80, 24, config, theme, buffers).unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("ne");
+    harness.execute_action(Action::NextBuffer).await.unwrap();
+    harness.assert_buffer_contents("two");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("two");
+    harness
+        .execute_action(Action::PreviousBuffer)
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("ne");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("one");
+}
+
+#[tokio::test]
+async fn test_buffer_delete_removes_current_buffer_from_list() {
+    let lsp = Box::new(MockLsp) as Box<dyn LspClient + Send>;
+    let config = Config::default();
+    let theme = Theme::default();
+    let buffers = vec![
+        Buffer::new(Some("one.rs".to_string()), "one".to_string()),
+        Buffer::new(Some("two.rs".to_string()), "two".to_string()),
+        Buffer::new(Some("three.rs".to_string()), "three".to_string()),
+    ];
+    let mut editor = Editor::test_with_size(lsp, 80, 24, config, theme, buffers).unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness.execute_action(Action::NextBuffer).await.unwrap();
+    harness
+        .execute_action(Action::Command("bd".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["one.rs", "three.rs"]);
+    assert_eq!(harness.current_buffer_index(), 1);
+    harness.assert_buffer_contents("three");
+}
+
+#[tokio::test]
+async fn test_buffer_delete_requires_force_for_dirty_buffer() {
+    let lsp = Box::new(MockLsp) as Box<dyn LspClient + Send>;
+    let config = Config::default();
+    let theme = Theme::default();
+    let buffers = vec![
+        Buffer::new(Some("one.rs".to_string()), "one".to_string()),
+        Buffer::new(Some("two.rs".to_string()), "two".to_string()),
+    ];
+    let mut editor = Editor::test_with_size(lsp, 80, 24, config, theme, buffers).unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::Command("bd".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["one.rs", "two.rs"]);
+    assert_eq!(
+        harness.last_error(),
+        Some("No write since last change (add ! to override)")
+    );
+    harness.assert_buffer_contents("ne");
+
+    harness
+        .execute_action(Action::Command("bd!".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_names(), vec!["two.rs"]);
+    harness.assert_buffer_contents("two");
+}
+
+#[tokio::test]
+async fn test_preview_theme_reports_missing_theme_without_changing_buffer() {
+    let mut harness = EditorHarness::with_content("abc");
+
+    harness
+        .execute_action(Action::PreviewTheme(
+            "definitely-missing-theme.json".to_string(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.last_error(),
+        Some("Theme file definitely-missing-theme.json not found")
+    );
+    harness.assert_buffer_contents("abc");
+}
+
+#[tokio::test]
+async fn test_dirty_clears_after_manual_same_length_replacement() {
+    let mut harness = EditorHarness::with_content("abc");
+    for (character, dirty) in [('z', true), ('a', false)] {
+        harness
+            .execute_action(Action::ReplaceCharsAtCursor {
+                character,
+                count: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(harness.is_dirty(), dirty);
+    }
+    harness.assert_buffer_contents("abc");
+    assert!(harness.editor.test_current_buffer().undo_history.is_dirty());
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("zbc");
+    assert!(harness.is_dirty());
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("abc");
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn test_dirty_clears_before_leaving_insert_mode() {
+    let mut harness =
+        EditorHarness::with_config(Buffer::new(None, "abc".to_string()), default_key_config());
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.type_text("z").await.unwrap();
+    assert!(harness.is_dirty());
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("abc");
+    assert!(harness.is_insert());
+    assert!(!harness.is_dirty());
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn test_dirty_session_baseline_survives_external_disk_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("saved.txt");
+    fs::write(&path, "abc").unwrap();
+    let buffer = Buffer::new(Some(path.to_string_lossy().into_owned()), "abc".into());
+    let mut source = EditorHarness::with_buffer(buffer);
+    source
+        .execute_action(Action::ReplaceCharsAtCursor {
+            character: 'z',
+            count: 1,
+        })
+        .await
+        .unwrap();
+    fs::write(&path, "external").unwrap();
+    let snapshot = source.editor.test_session_snapshot();
+    assert_eq!(snapshot.buffers[0].saved_contents.as_deref(), Some("abc"));
+    assert_eq!(
+        snapshot.buffers[0].disk_contents.as_deref(),
+        Some("external")
+    );
+    let encoded = serde_json::to_vec(&snapshot).unwrap();
+    let snapshot = serde_json::from_slice(&encoded).unwrap();
+    let mut buffers = Editor::buffers_from_session_snapshot(&snapshot);
+    let mut restored = EditorHarness::with_buffer(buffers.remove(0));
+    assert!(restored.is_dirty());
+    restored
+        .execute_action(Action::ReplaceCharsAtCursor {
+            character: 'a',
+            count: 1,
+        })
+        .await
+        .unwrap();
+    assert!(!restored.is_dirty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "external");
+}
+
+#[tokio::test]
+async fn test_dirty_background_session_writer_keeps_the_saved_baseline() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = red::session::SessionStore::for_owner(directory.path(), "dirty-baseline").unwrap();
+    let mut harness = EditorHarness::with_content("abc");
+    harness.editor.set_session_store(store.clone());
+    harness
+        .execute_action(Action::ReplaceCharsAtCursor {
+            character: 'z',
+            count: 1,
+        })
+        .await
+        .unwrap();
+    harness
+        .editor
+        .test_persist_session_snapshot(/*force*/ true, /*due*/ true);
+    let snapshot = store.load().unwrap();
+    assert_eq!(snapshot.buffers[0].contents, "zbc");
+    assert_eq!(snapshot.buffers[0].saved_contents.as_deref(), Some("abc"));
+}
+
+#[tokio::test]
+async fn test_dirty_clears_when_undo_returns_to_clean_revision() {
+    let mut harness = EditorHarness::with_content("abc");
+    assert!(!harness.is_dirty());
+
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('z'))
+        .await
+        .unwrap();
+    assert!(harness.is_dirty());
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abc");
+    assert!(!harness.is_dirty());
+
+    harness.execute_action(Action::Redo).await.unwrap();
+    harness.assert_buffer_contents("zabc");
+    assert!(harness.is_dirty());
+}
+
+#[tokio::test]
+async fn test_dirty_checkpoint_moves_after_save() {
+    let path = temp_file_path("dirty-save");
+    fs::write(&path, "abc").unwrap();
+
+    let buffer = Buffer::new(Some(path.clone()), "abc".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('z'))
+        .await
+        .unwrap();
+    assert!(harness.is_dirty());
+    harness.execute_action(Action::Save).await.unwrap();
+    assert!(!harness.is_dirty());
+
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('y'))
+        .await
+        .unwrap();
+    assert!(harness.is_dirty());
+    harness.execute_action(Action::Undo).await.unwrap();
+    assert!(!harness.is_dirty());
+
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn test_save_during_insert_keeps_saved_buffer_clean_on_escape() {
+    let path = temp_file_path("dirty-save-insert");
+    fs::write(&path, "abc").unwrap();
+
+    let buffer = Buffer::new(Some(path.clone()), "abc".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.type_text("z").await.unwrap();
+    assert!(harness.is_dirty());
+
+    harness.execute_action(Action::Save).await.unwrap();
+    assert!(!harness.is_dirty());
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness.assert_buffer_contents("zabc");
+    assert!(!harness.is_dirty());
+
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn test_dirty_remains_after_undoing_past_saved_revision() {
+    let path = temp_file_path("dirty-past-save");
+    fs::write(&path, "abc").unwrap();
+
+    let buffer = Buffer::new(Some(path.clone()), "abc".to_string());
+    let mut harness = EditorHarness::with_buffer(buffer);
+
+    harness
+        .execute_action(Action::InsertCharAtCursorPos('z'))
+        .await
+        .unwrap();
+    harness.execute_action(Action::Save).await.unwrap();
+    assert!(!harness.is_dirty());
+
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("abc");
+    assert!(harness.is_dirty());
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn test_right_panel_reserves_editor_window_width() {
+    let mut harness = EditorHarness::with_content("abcdef");
+
+    harness.editor.test_create_panel(
+        "tree",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 20,
+            title: None,
+            composer: None,
+            surface: None,
+            border: None,
+            header_actions: Vec::new(),
+        },
+    );
+
+    let (position, size) = harness.editor.test_active_window_bounds().unwrap();
+    assert_eq!(position.x, 0);
+    assert_eq!(size.0, 59);
+}
+
+#[test]
+fn focused_panel_hides_editor_cursor_until_focus_returns() {
+    let mut harness = EditorHarness::with_content("abcdef");
+    let editor_cursor = harness.render_cursor_position();
+    add_tree_panel(&mut harness);
+
+    assert!(harness.editor.test_focus_panel("tree"));
+    assert_eq!(harness.render_cursor_position(), None);
+
+    harness.editor.test_close_panel("tree");
+    assert_eq!(harness.render_cursor_position(), editor_cursor);
+}
+
+#[tokio::test]
+async fn focused_panel_commandline_receives_text_before_panel_shortcuts() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    add_tree_panel(&mut harness);
+    assert!(harness.editor.test_focus_panel("tree"));
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(':'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    harness.assert_mode(Mode::Command);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.commandline_text(), "q");
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("tree"));
+}
+
+#[tokio::test]
+async fn focused_panel_does_not_fall_through_to_editing_keys() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    add_tree_panel(&mut harness);
+    assert!(harness.editor.test_focus_panel("tree"));
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("abcdef");
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("tree"));
+}
+
+#[test]
+fn focused_panel_allows_global_builtin_hotkeys() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut config = default_key_config();
+    config
+        .keys
+        .normal
+        .insert("x".to_string(), KeyAction::Single(Action::FilePicker));
+    config
+        .keys
+        .normal
+        .insert("Meta-p".to_string(), KeyAction::Single(Action::FilePicker));
+    let mut harness = EditorHarness::with_config(buffer, config);
+    add_tree_panel(&mut harness);
+    assert!(harness.editor.test_focus_panel("tree"));
+
+    for (code, modifiers, expected) in [
+        (
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+            Action::FilePicker,
+        ),
+        (KeyCode::Char('p'), KeyModifiers::META, Action::FilePicker),
+        (KeyCode::Char('z'), KeyModifiers::CONTROL, Action::Suspend),
+        (
+            KeyCode::Char('x'),
+            KeyModifiers::ALT,
+            Action::CommandPalette,
+        ),
+    ] {
+        let action = harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(code, modifiers)))
+            .unwrap();
+        assert_eq!(action, Some(KeyAction::Single(expected)));
+    }
+
+    let local = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    assert!(matches!(
+        local,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:tree" && payload["action"] == "x"
+            ))
+    ));
+}
+
+#[tokio::test]
+async fn focused_panel_allows_explicitly_global_plugin_commands() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    add_tree_panel(&mut harness);
+    assert!(harness.editor.test_focus_panel("tree"));
+    let mut runtime = Runtime::new();
+    runtime
+        .load_plugin(
+            "navigation",
+            r#"
+                pub fn activate() {
+                    red::add_command("NeoTree", noop, Json { scope: "global" });
+                    red::add_command("LspDocumentSymbols", noop);
+                }
+                fn noop() {}
+            "#,
+        )
+        .await
+        .unwrap();
+
+    let action = harness
+        .editor
+        .test_handle_event_with_runtime(
+            Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            &runtime,
+        )
+        .unwrap();
+
+    assert_eq!(
+        action,
+        Some(KeyAction::Single(Action::PluginCommand(
+            "NeoTree".to_string()
+        )))
+    );
+
+    let contextual = harness
+        .editor
+        .test_handle_event_with_runtime(
+            Event::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+            &runtime,
+        )
+        .unwrap();
+    assert!(matches!(
+        contextual,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:tree" && payload["action"] == "Ctrl-t"
+            ))
+    ));
+}
+
+#[test]
+fn focused_row_panel_forwards_file_operation_keys_to_its_plugin() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut config = default_key_config();
+    config
+        .keys
+        .normal
+        .insert("Ctrl-r".to_string(), KeyAction::Single(Action::FilePicker));
+    let mut harness = EditorHarness::with_config(buffer, config);
+    add_tree_panel(&mut harness);
+    assert!(harness.editor.test_focus_panel("tree"));
+
+    for (code, modifiers, expected) in [
+        (KeyCode::Char('a'), KeyModifiers::NONE, "a"),
+        (KeyCode::Char('x'), KeyModifiers::NONE, "x"),
+        (KeyCode::Tab, KeyModifiers::NONE, "Tab"),
+        (KeyCode::Char('r'), KeyModifiers::CONTROL, "Ctrl-r"),
+    ] {
+        let action = harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(code, modifiers)))
+            .unwrap();
+        assert!(matches!(
+            action,
+            Some(KeyAction::Multiple(actions))
+                if actions.iter().any(|action| matches!(
+                    action,
+                    Action::NotifyPlugins(name, payload)
+                        if name == "panel:event:tree" && payload["action"] == expected
+                ))
+        ));
+    }
+}
+
+#[test]
+fn focused_row_panel_pages_with_control_keys_and_page_keys() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config_and_size(buffer, default_key_config(), 80, 10);
+    add_tree_panel(&mut harness);
+    harness
+        .editor
+        .test_update_panel("tree", numbered_tree_rows(30));
+    assert!(harness.editor.test_focus_panel("tree"));
+
+    for (code, modifiers, expected_top, expected_selected) in [
+        (KeyCode::Char('f'), KeyModifiers::CONTROL, "row-06.rs", 9),
+        (KeyCode::PageDown, KeyModifiers::NONE, "row-12.rs", 15),
+        (KeyCode::Char('b'), KeyModifiers::CONTROL, "row-06.rs", 10),
+        (KeyCode::PageUp, KeyModifiers::NONE, "row-00.rs", 4),
+    ] {
+        let action = harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(code, modifiers)))
+            .unwrap();
+        assert!(matches!(action, Some(KeyAction::Multiple(_))));
+        assert!(harness.render_row(0).unwrap().starts_with(expected_top));
+        assert_eq!(
+            harness.editor.test_focused_panel_selected_index("tree"),
+            Some(expected_selected)
+        );
+    }
+
+    harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('G'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    assert!(harness.render_row(0).unwrap().starts_with("row-22.rs"));
+    assert_eq!(
+        harness.editor.test_focused_panel_selected_index("tree"),
+        Some(29)
+    );
+
+    harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    assert!(harness.render_row(0).unwrap().starts_with("row-00.rs"));
+    assert_eq!(
+        harness.editor.test_focused_panel_selected_index("tree"),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn focused_agent_panel_keeps_global_leader_until_the_composer_is_focused() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut config = default_key_config();
+    config
+        .keys
+        .normal
+        .insert("q".to_string(), KeyAction::Single(Action::FilePicker));
+    config
+        .keys
+        .normal
+        .insert("Ctrl-c".to_string(), KeyAction::Single(Action::Suspend));
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 40,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            surface: None,
+            border: None,
+            header_actions: Vec::new(),
+        },
+    );
+    assert!(harness.editor.test_focus_panel("agent"));
+    let mut runtime = Runtime::new();
+    runtime
+        .load_plugin(
+            "agent",
+            r#"
+                pub fn activate() {
+                    red::add_command("Agent", noop, Json { scope: "global" });
+                    red::add_command("AgentToggle", noop, Json { scope: "global" });
+                }
+                fn noop() {}
+            "#,
+        )
+        .await
+        .unwrap();
+
+    let toggle = harness
+        .editor
+        .test_handle_event_with_runtime(
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT)),
+            &runtime,
+        )
+        .unwrap();
+    assert_eq!(
+        toggle,
+        Some(KeyAction::Single(Action::PluginCommand(
+            "AgentToggle".to_string()
+        )))
+    );
+
+    let action = harness
+        .editor
+        .test_handle_event_with_runtime(
+            Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            &runtime,
+        )
+        .unwrap();
+    let Some(KeyAction::Nested(leader)) = action else {
+        panic!("expected Space to start the leader sequence from the conversation, got {action:?}");
+    };
+    assert_eq!(leader.len(), 8);
+    for global in ["A", "?", "d", "e", "m", "N", "P", "s"] {
+        assert!(
+            leader.contains_key(global),
+            "global leader branch {global:?} must remain available"
+        );
+    }
+    for contextual in [" ", "a", "n", "p", "b", "f", ".", "r"] {
+        assert!(
+            !leader.contains_key(contextual),
+            "contextual leader branch {contextual:?} must be filtered"
+        );
+    }
+    assert_eq!(
+        leader.get("m"),
+        Some(&KeyAction::Single(Action::OpenMessages))
+    );
+    assert_eq!(
+        leader.get("N"),
+        Some(&KeyAction::Single(Action::OpenLatestInlineCompletion))
+    );
+    assert_eq!(
+        leader.get("A"),
+        Some(&KeyAction::Single(Action::PluginCommand(
+            "Agent".to_string()
+        )))
+    );
+
+    for (code, modifiers, expected) in [
+        (KeyCode::Char('q'), KeyModifiers::NONE, "close"),
+        (KeyCode::Char('c'), KeyModifiers::CONTROL, "interrupt"),
+    ] {
+        let action = harness
+            .editor
+            .test_handle_event_with_runtime(Event::Key(KeyEvent::new(code, modifiers)), &runtime)
+            .unwrap();
+        assert!(matches!(
+            action,
+            Some(KeyAction::Multiple(actions))
+                if actions.iter().any(|action| matches!(
+                    action,
+                    Action::NotifyPlugins(name, payload)
+                        if name == "panel:event:agent" && payload["action"] == expected
+                ))
+        ));
+    }
+
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+    let action = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    assert!(matches!(
+        action,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:agent" && payload["action"] == "composer_input"
+            ))
+    ));
+    assert!(harness.render_cursor_position().is_some());
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+    assert!(matches!(
+        action,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:agent" && payload["action"] == "interrupt"
+            ))
+    ));
+    assert!(harness.render_cursor_position().is_some());
+}
+
+#[test]
+fn agent_scrollback_tab_focuses_a_cursor_and_visual_yank_uses_the_clipboard() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    let clipboard_text = Arc::new(Mutex::new(None));
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 24,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            ..PanelConfig::default()
+        },
+    );
+    harness.editor.test_update_text_panel(
+        "agent",
+        vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Plain,
+            text: "alpha beta gamma".to_string(),
+        }],
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+
+    harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+        .unwrap();
+    assert!(harness.render_cursor_position().is_some());
+
+    for key in ['g', 'w', 'v', 'e', 'y'] {
+        harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(key),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+    }
+
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("beta"));
+    assert_eq!(harness.last_error(), Some("4 characters yanked"));
+    assert!(harness.render_cursor_position().is_some());
+}
+
+#[test]
+fn agent_scrollback_visual_yank_copies_code_without_markdown_frame() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    let clipboard_text = Arc::new(Mutex::new(None));
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 24,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            ..PanelConfig::default()
+        },
+    );
+    harness.editor.test_update_text_panel(
+        "agent",
+        vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Agent,
+            format: TextPanelBlockFormat::Markdown,
+            text: "```bash\n/game\n```".to_string(),
+        }],
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+
+    for code in [
+        KeyCode::Tab,
+        KeyCode::Char('g'),
+        KeyCode::Char('v'),
+        KeyCode::Char('G'),
+        KeyCode::Char('y'),
+    ] {
+        harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+            .unwrap();
+    }
+
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("/game"));
+}
+
+#[test]
+fn mouse_drag_selects_agent_scrollback_text_for_visual_yank() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    let clipboard_text = Arc::new(Mutex::new(None));
+    harness
+        .editor
+        .test_set_clipboard(Box::new(MemoryClipboardProvider::from(
+            clipboard_text.clone(),
+        )));
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 24,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            ..PanelConfig::default()
+        },
+    );
+    harness.editor.test_update_text_panel(
+        "agent",
+        vec![TextPanelBlock {
+            id: "answer".to_string(),
+            kind: TextPanelBlockKind::Text,
+            format: TextPanelBlockFormat::Plain,
+            text: "alpha beta gamma".to_string(),
+        }],
+    );
+
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        let column = if matches!(kind, MouseEventKind::Down(_)) {
+            57
+        } else {
+            61
+        };
+        harness
+            .editor
+            .test_handle_event(Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+    }
+    harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+
+    assert_eq!(clipboard_text.lock().unwrap().as_deref(), Some("alpha"));
+}
+
+#[test]
+fn focused_agent_composer_keeps_control_j_local_and_routes_other_navigation() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 40,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+
+    for (code, modifiers, expected) in [
+        (KeyCode::Char('h'), KeyModifiers::CONTROL, "up"),
+        (KeyCode::Char('j'), KeyModifiers::CONTROL, "composer_input"),
+        (KeyCode::Char('k'), KeyModifiers::CONTROL, "up"),
+        (KeyCode::Char('g'), KeyModifiers::CONTROL, "top"),
+        (
+            KeyCode::Char('G'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            "bottom",
+        ),
+    ] {
+        let action = harness
+            .editor
+            .test_handle_event(Event::Key(KeyEvent::new(code, modifiers)))
+            .unwrap();
+        assert!(matches!(
+            action,
+            Some(KeyAction::Multiple(actions))
+                if actions.iter().any(|action| matches!(
+                    action,
+                    Action::NotifyPlugins(name, payload)
+                        if name == "panel:event:agent" && payload["action"] == expected
+                ))
+        ));
+    }
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    assert!(matches!(
+        action,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:agent" && payload["action"] == "composer_input"
+            ))
+    ));
+}
+
+#[tokio::test]
+async fn escape_from_focused_panel_restores_editor_cursor() {
+    let mut harness = EditorHarness::with_content("abcdef");
+    add_tree_panel(&mut harness);
+    let editor_cursor = harness.render_cursor_position();
+    assert!(harness.editor.test_focus_panel("tree"));
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+    assert_eq!(harness.render_cursor_position(), editor_cursor);
+}
+
+#[tokio::test]
+async fn next_and_previous_window_cycle_through_focused_panels() {
+    let mut harness = EditorHarness::with_content("abcdef");
+    add_tree_panel(&mut harness);
+
+    harness.execute_action(Action::NextWindow).await.unwrap();
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("tree"));
+
+    harness.execute_action(Action::NextWindow).await.unwrap();
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+
+    harness
+        .execute_action(Action::PreviousWindow)
+        .await
+        .unwrap();
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("tree"));
+}
+
+#[tokio::test]
+async fn focused_vertical_panels_resize_with_vim_width_chords() {
+    for side in [PanelSide::Left, PanelSide::Right] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.editor.test_create_panel(
+            "inspector",
+            PanelConfig {
+                side,
+                width: 20,
+                ..PanelConfig::default()
+            },
+        );
+        assert!(harness.editor.test_focus_panel("inspector"));
+
+        execute_window_chord(&mut harness, '>').await;
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, 21)),
+        );
+        assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+
+        execute_window_chord(&mut harness, '<').await;
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, 20)),
+        );
+
+        execute_window_chord(&mut harness, '+').await;
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, 20)),
+            "height commands must not resize a vertical pane or the hidden editor window",
+        );
+    }
+}
+
+#[tokio::test]
+async fn focused_horizontal_panels_resize_with_vim_height_chords() {
+    for side in [PanelSide::Top, PanelSide::Bottom] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.editor.test_create_panel(
+            "inspector",
+            PanelConfig {
+                side,
+                width: 6,
+                ..PanelConfig::default()
+            },
+        );
+        assert!(harness.editor.test_focus_panel("inspector"));
+
+        execute_window_chord(&mut harness, '+').await;
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, 7)),
+        );
+
+        execute_window_chord(&mut harness, '-').await;
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, 6)),
+        );
+
+        execute_window_chord(&mut harness, '>').await;
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, 6)),
+            "width commands must not resize a horizontal pane or the hidden editor window",
+        );
+    }
+}
+
+#[tokio::test]
+async fn pane_resize_mode_moves_docked_panel_dividers_in_screen_direction() {
+    for (side, initial_size, grow_keys, shrink_keys) in [
+        (
+            PanelSide::Left,
+            20,
+            [KeyCode::Char('l'), KeyCode::Right],
+            [KeyCode::Char('h'), KeyCode::Left],
+        ),
+        (
+            PanelSide::Right,
+            20,
+            [KeyCode::Char('h'), KeyCode::Left],
+            [KeyCode::Char('l'), KeyCode::Right],
+        ),
+        (
+            PanelSide::Top,
+            6,
+            [KeyCode::Char('j'), KeyCode::Down],
+            [KeyCode::Char('k'), KeyCode::Up],
+        ),
+        (
+            PanelSide::Bottom,
+            6,
+            [KeyCode::Char('k'), KeyCode::Up],
+            [KeyCode::Char('j'), KeyCode::Down],
+        ),
+    ] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.editor.test_create_panel(
+            "inspector",
+            PanelConfig {
+                side,
+                width: initial_size,
+                ..PanelConfig::default()
+            },
+        );
+        assert!(harness.editor.test_focus_panel("inspector"));
+
+        execute_window_chord(&mut harness, 'r').await;
+        for key in grow_keys {
+            execute_unmodified_key(&mut harness, key).await;
+        }
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, initial_size + 2)),
+            "moving the {side:?} panel's divider outward should grow it",
+        );
+
+        for key in shrink_keys {
+            execute_unmodified_key(&mut harness, key).await;
+        }
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, initial_size)),
+            "moving the {side:?} panel's divider inward should shrink it",
+        );
+    }
+}
+
+#[tokio::test]
+async fn pane_resize_mode_resizes_editor_splits_with_hjkl_and_arrows() {
+    for (split_action, grow_keys, shrink_keys, vertical) in [
+        (
+            Action::SplitVertical,
+            [KeyCode::Char('h'), KeyCode::Left],
+            [KeyCode::Char('l'), KeyCode::Right],
+            true,
+        ),
+        (
+            Action::SplitHorizontal,
+            [KeyCode::Char('k'), KeyCode::Up],
+            [KeyCode::Char('j'), KeyCode::Down],
+            false,
+        ),
+    ] {
+        let buffer = Buffer::new(None, "first\nsecond\nthird\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.execute_action(split_action).await.unwrap();
+        let (initial_position, initial_size) = harness.editor.test_active_window_bounds().unwrap();
+        let initial_dimension = if vertical {
+            initial_size.0
+        } else {
+            initial_size.1
+        };
+
+        execute_window_chord(&mut harness, 'r').await;
+        assert!(harness.statusline_row().contains("RESIZE"));
+
+        for key in grow_keys {
+            execute_unmodified_key(&mut harness, key).await;
+        }
+        let (grown_position, grown_size) = harness.editor.test_active_window_bounds().unwrap();
+        let grown_dimension = if vertical { grown_size.0 } else { grown_size.1 };
+        assert_eq!(grown_dimension, initial_dimension + 2);
+        if vertical {
+            assert_eq!(grown_position.x, initial_position.x - 2);
+        } else {
+            assert_eq!(grown_position.y, initial_position.y - 2);
+        }
+
+        for key in shrink_keys {
+            execute_unmodified_key(&mut harness, key).await;
+        }
+        assert_eq!(
+            harness.editor.test_active_window_bounds().unwrap().1,
+            initial_size
+        );
+
+        execute_unmodified_key(&mut harness, KeyCode::Enter).await;
+        let statusline = harness.statusline_row();
+        assert!(!statusline.contains("RESIZE"), "{statusline:?}");
+        assert!(statusline.contains("NORMAL"), "{statusline:?}");
+    }
+}
+
+#[tokio::test]
+async fn focused_agent_composer_can_enter_and_exit_pane_resize_mode() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 20,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            ..PanelConfig::default()
+        },
+    );
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+    let initial_editor_size = harness.editor.test_active_window_bounds().unwrap().1;
+
+    execute_window_chord(&mut harness, 'r').await;
+    execute_unmodified_key(&mut harness, KeyCode::Char('h')).await;
+    assert_eq!(
+        harness.editor.test_panel_layout("agent"),
+        Some((PanelSide::Right, 21)),
+        "moving the shared divider left should work while the editor is focused",
+    );
+    let resized_editor_size = harness.editor.test_active_window_bounds().unwrap().1;
+    assert_eq!(resized_editor_size.0, initial_editor_size.0 - 1,);
+    execute_unmodified_key(&mut harness, KeyCode::Right).await;
+    assert_eq!(
+        harness.editor.test_panel_layout("agent"),
+        Some((PanelSide::Right, 20))
+    );
+    execute_unmodified_key(&mut harness, KeyCode::Enter).await;
+
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+
+    execute_window_chord(&mut harness, 'r').await;
+    assert!(harness.statusline_row().contains("RESIZE"));
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+
+    for key in [KeyCode::Char('h'), KeyCode::Left] {
+        execute_unmodified_key(&mut harness, key).await;
+    }
+    assert_eq!(
+        harness.editor.test_panel_layout("agent"),
+        Some((PanelSide::Right, 22))
+    );
+
+    for key in [KeyCode::Char('j'), KeyCode::Down, KeyCode::Char('x')] {
+        execute_unmodified_key(&mut harness, key).await;
+    }
+    assert_eq!(
+        harness.editor.test_panel_layout("agent"),
+        Some((PanelSide::Right, 22)),
+        "orthogonal and unsupported keys should leave the pane unchanged",
+    );
+    assert!(harness.statusline_row().contains("RESIZE"));
+
+    for key in [KeyCode::Char('l'), KeyCode::Right] {
+        execute_unmodified_key(&mut harness, key).await;
+    }
+    assert_eq!(
+        harness.editor.test_panel_layout("agent"),
+        Some((PanelSide::Right, 20))
+    );
+
+    execute_unmodified_key(&mut harness, KeyCode::Esc).await;
+    assert!(!harness.statusline_row().contains("RESIZE"));
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+
+    execute_unmodified_key(&mut harness, KeyCode::Char('l')).await;
+    assert_eq!(
+        harness.editor.test_panel_layout("agent"),
+        Some((PanelSide::Right, 20)),
+        "keys should return to the focused composer after leaving resize mode",
+    );
+}
+
+#[tokio::test]
+async fn pane_resize_mode_cancels_when_terminal_focus_is_lost() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+
+    execute_window_chord(&mut harness, 'r').await;
+    assert!(harness.statusline_row().contains("RESIZE"));
+
+    harness.execute_event(Event::FocusLost).await.unwrap();
+    assert!(!harness.statusline_row().contains("RESIZE"));
+}
+
+#[tokio::test]
+async fn pane_resize_mode_cancels_when_terminal_geometry_changes() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+
+    execute_window_chord(&mut harness, 'r').await;
+    assert!(harness.statusline_row().contains("RESIZE"));
+
+    harness.execute_event(Event::Resize(100, 30)).await.unwrap();
+    assert!(!harness.statusline_row().contains("RESIZE"));
+}
+
+#[tokio::test]
+async fn vim_resize_chords_grow_and_shrink_either_editor_split_by_one_cell() {
+    for (split_action, grow, shrink, first_window_action, vertical) in [
+        (
+            Action::SplitVertical,
+            '>',
+            '<',
+            Action::MoveWindowLeft,
+            true,
+        ),
+        (
+            Action::SplitHorizontal,
+            '+',
+            '-',
+            Action::MoveWindowUp,
+            false,
+        ),
+    ] {
+        for first_window in [false, true] {
+            let buffer = Buffer::new(None, "first\nsecond\nthird\n".to_string());
+            let mut harness = EditorHarness::with_config(buffer, default_key_config());
+            harness.execute_action(split_action.clone()).await.unwrap();
+            if first_window {
+                harness
+                    .execute_action(first_window_action.clone())
+                    .await
+                    .unwrap();
+            }
+            let (_, initial_size) = harness.editor.test_active_window_bounds().unwrap();
+            let initial_dimension = if vertical {
+                initial_size.0
+            } else {
+                initial_size.1
+            };
+
+            execute_window_chord(&mut harness, grow).await;
+            let (_, grown_size) = harness.editor.test_active_window_bounds().unwrap();
+            let grown_dimension = if vertical { grown_size.0 } else { grown_size.1 };
+            assert_eq!(grown_dimension, initial_dimension + 1);
+
+            execute_window_chord(&mut harness, shrink).await;
+            let (_, restored_size) = harness.editor.test_active_window_bounds().unwrap();
+            assert_eq!(restored_size, initial_size);
+        }
+    }
+}
+
+#[tokio::test]
+async fn counted_vim_resize_moves_editor_split_by_the_requested_cells() {
+    let buffer = Buffer::new(None, "first\nsecond\nthird\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    let (_, initial_size) = harness.editor.test_active_window_bounds().unwrap();
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('5'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    execute_window_chord(&mut harness, '>').await;
+
+    let (_, resized) = harness.editor.test_active_window_bounds().unwrap();
+    assert_eq!(resized.0, initial_size.0 + 5);
+    assert_eq!(resized.1, initial_size.1);
+}
+
+#[tokio::test]
+async fn focused_panel_window_resize_chords_honor_vim_counts() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_panel(
+        "inspector",
+        PanelConfig {
+            side: PanelSide::Left,
+            width: 20,
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_panel("inspector"));
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('5'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    execute_window_chord(&mut harness, '>').await;
+
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 25)),
+    );
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+}
+
+#[tokio::test]
+async fn ctrl_w_equals_resets_a_focused_panel_without_balancing_editor_splits() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    harness
+        .execute_action(Action::ResizeWindowLeft(/*amount*/ 3))
+        .await
+        .unwrap();
+    harness.editor.test_create_panel(
+        "inspector",
+        PanelConfig {
+            side: PanelSide::Left,
+            width: 20,
+            ..PanelConfig::default()
+        },
+    );
+    let split_topology = harness.editor.test_session_snapshot().window_layout.root;
+    assert!(harness.editor.test_focus_panel("inspector"));
+
+    harness
+        .execute_action(Action::ResizeWindowRight(/*amount*/ 5))
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 25)),
+    );
+
+    execute_window_chord(&mut harness, '=').await;
+
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 20)),
+    );
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+    assert_eq!(
+        harness.editor.test_session_snapshot().window_layout.root,
+        split_topology,
+        "resetting a pane must not rebalance unrelated editor splits",
+    );
+}
+
+#[tokio::test]
+async fn shifted_window_chords_move_every_panel_kind_to_all_four_edges() {
+    for source_backed in [false, true] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        let config = PanelConfig {
+            side: PanelSide::Left,
+            width: 24,
+            title: Some("Inspector".to_string()),
+            ..PanelConfig::default()
+        };
+        if source_backed {
+            harness.editor.test_create_text_panel("inspector", config);
+        } else {
+            harness.editor.test_create_panel("inspector", config);
+        }
+        assert!(harness.editor.test_focus_panel("inspector"));
+
+        for (key, side, expected_size) in [
+            ('K', PanelSide::Top, 7),
+            ('J', PanelSide::Bottom, 7),
+            ('L', PanelSide::Right, 24),
+            ('H', PanelSide::Left, 24),
+        ] {
+            execute_window_chord(&mut harness, key).await;
+
+            assert_eq!(
+                harness.editor.test_panel_layout("inspector"),
+                Some((side, expected_size)),
+                "both row and source-backed panes should move with Ctrl-w {key}",
+            );
+            assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+            let (_, editor_size) = harness.editor.test_active_window_bounds().unwrap();
+            assert!(editor_size.0 >= 10);
+            assert!(editor_size.1 >= 5);
+        }
+    }
+}
+
+#[tokio::test]
+async fn moved_panels_restore_their_independent_width_and_height() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_text_panel(
+        "inspector",
+        PanelConfig {
+            side: PanelSide::Left,
+            width: 24,
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_panel("inspector"));
+
+    execute_window_chord(&mut harness, 'K').await;
+    execute_window_chord(&mut harness, '+').await;
+    execute_window_chord(&mut harness, '+').await;
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Top, 9)),
+    );
+
+    execute_window_chord(&mut harness, 'L').await;
+    execute_window_chord(&mut harness, '>').await;
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Right, 25)),
+    );
+
+    execute_window_chord(&mut harness, 'J').await;
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Bottom, 9)),
+    );
+
+    execute_window_chord(&mut harness, 'H').await;
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 25)),
+    );
+}
+
+#[tokio::test]
+async fn docked_pane_resizing_preserves_minimum_editor_dimensions() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut vertical = EditorHarness::with_config_and_size(
+        buffer,
+        default_key_config(),
+        /*width*/ 40,
+        /*height*/ 14,
+    );
+    vertical.editor.test_create_panel(
+        "inspector",
+        PanelConfig {
+            side: PanelSide::Left,
+            width: 15,
+            ..PanelConfig::default()
+        },
+    );
+    assert!(vertical.editor.test_focus_panel("inspector"));
+
+    vertical
+        .execute_action(Action::ResizeWindowRight(/*amount*/ usize::MAX))
+        .await
+        .unwrap();
+    assert_eq!(
+        vertical.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 29)),
+    );
+    let (_, vertical_editor_size) = vertical.editor.test_active_window_bounds().unwrap();
+    assert_eq!(vertical_editor_size.0, 10);
+
+    vertical
+        .execute_action(Action::ResizeWindowLeft(/*amount*/ usize::MAX))
+        .await
+        .unwrap();
+    assert_eq!(
+        vertical.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 12)),
+    );
+
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut horizontal = EditorHarness::with_config_and_size(
+        buffer,
+        default_key_config(),
+        /*width*/ 40,
+        /*height*/ 14,
+    );
+    horizontal.editor.test_create_panel(
+        "inspector",
+        PanelConfig {
+            side: PanelSide::Bottom,
+            width: 4,
+            ..PanelConfig::default()
+        },
+    );
+    assert!(horizontal.editor.test_focus_panel("inspector"));
+
+    horizontal
+        .execute_action(Action::ResizeWindowDown(/*amount*/ usize::MAX))
+        .await
+        .unwrap();
+    assert_eq!(
+        horizontal.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Bottom, 6)),
+    );
+    let (_, horizontal_editor_size) = horizontal.editor.test_active_window_bounds().unwrap();
+    assert_eq!(horizontal_editor_size.1, 5);
+
+    horizontal
+        .execute_action(Action::ResizeWindowUp(/*amount*/ usize::MAX))
+        .await
+        .unwrap();
+    assert_eq!(
+        horizontal.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Bottom, 4)),
+    );
+}
+
+#[tokio::test]
+async fn terminal_resize_preserves_independent_docked_pane_preferences() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_text_panel(
+        "inspector",
+        PanelConfig {
+            side: PanelSide::Left,
+            width: 24,
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_panel("inspector"));
+    execute_window_chord(&mut harness, 'J').await;
+    execute_window_chord(&mut harness, '+').await;
+    execute_window_chord(&mut harness, '+').await;
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Bottom, 9)),
+    );
+
+    harness
+        .execute_event(Event::Resize(/*columns*/ 60, /*rows*/ 20))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Bottom, 9)),
+    );
+    let (_, editor_size) = harness.editor.test_active_window_bounds().unwrap();
+    assert_eq!(editor_size, (60, 8));
+
+    execute_window_chord(&mut harness, 'L').await;
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Right, 24)),
+    );
+
+    execute_window_chord(&mut harness, 'K').await;
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Top, 9)),
+    );
+}
+
+#[tokio::test]
+async fn directional_window_chords_focus_and_leave_all_four_pane_edges() {
+    for (side, enter, leave, initial_size, split, move_to_edge) in [
+        (
+            PanelSide::Left,
+            'h',
+            'l',
+            20,
+            Action::SplitVertical,
+            Some(Action::MoveWindowLeft),
+        ),
+        (PanelSide::Right, 'l', 'h', 20, Action::SplitVertical, None),
+        (
+            PanelSide::Top,
+            'k',
+            'j',
+            6,
+            Action::SplitHorizontal,
+            Some(Action::MoveWindowUp),
+        ),
+        (
+            PanelSide::Bottom,
+            'j',
+            'k',
+            6,
+            Action::SplitHorizontal,
+            None,
+        ),
+    ] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.execute_action(split).await.unwrap();
+        if let Some(action) = move_to_edge {
+            harness.execute_action(action).await.unwrap();
+        }
+        harness.editor.test_create_panel(
+            "inspector",
+            PanelConfig {
+                side,
+                width: initial_size,
+                ..PanelConfig::default()
+            },
+        );
+
+        execute_window_chord(&mut harness, enter).await;
+        assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+
+        execute_window_chord(&mut harness, leave).await;
+        assert_eq!(harness.editor.test_focused_panel_id(), None);
+    }
+}
+
+#[tokio::test]
+async fn directional_window_chords_wrap_across_opposite_edges_by_default() {
+    for (split, wrap_from_second, wrap_from_first) in [
+        (Action::SplitVertical, 'l', 'h'),
+        (Action::SplitHorizontal, 'j', 'k'),
+    ] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.execute_action(split).await.unwrap();
+        assert_eq!(harness.active_window_id(), 1);
+
+        execute_window_chord(&mut harness, wrap_from_second).await;
+        assert_eq!(harness.active_window_id(), 0);
+
+        execute_window_chord(&mut harness, wrap_from_first).await;
+        assert_eq!(harness.active_window_id(), 1);
+    }
+}
+
+#[tokio::test]
+async fn directional_window_chords_stop_at_edges_when_wrapping_is_disabled() {
+    for (split, second_edge, toward_first, first_edge, messages) in [
+        (
+            Action::SplitVertical,
+            'l',
+            'h',
+            'h',
+            ("no window to the right", "no window to the left"),
+        ),
+        (
+            Action::SplitHorizontal,
+            'j',
+            'k',
+            'k',
+            ("no window below", "no window above"),
+        ),
+    ] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut config = default_key_config();
+        config.wrap_window_navigation = Some(false);
+        let mut harness = EditorHarness::with_config(buffer, config);
+        harness.execute_action(split).await.unwrap();
+
+        execute_window_chord(&mut harness, second_edge).await;
+        assert_eq!(harness.active_window_id(), 1);
+        assert!(harness.commandline_row().contains(messages.0));
+
+        execute_window_chord(&mut harness, toward_first).await;
+        assert_eq!(harness.active_window_id(), 0);
+
+        execute_window_chord(&mut harness, first_edge).await;
+        assert_eq!(harness.active_window_id(), 0);
+        assert!(harness.commandline_row().contains(messages.1));
+    }
+}
+
+#[tokio::test]
+async fn window_cycle_includes_top_left_editor_right_and_bottom_panes() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    for (id, side, width) in [
+        ("top", PanelSide::Top, 4),
+        ("left", PanelSide::Left, 12),
+        ("right", PanelSide::Right, 12),
+        ("bottom", PanelSide::Bottom, 4),
+    ] {
+        harness.editor.test_create_panel(
+            id,
+            PanelConfig {
+                side,
+                width,
+                ..PanelConfig::default()
+            },
+        );
+    }
+
+    for expected in [
+        Some("right"),
+        Some("bottom"),
+        Some("top"),
+        Some("left"),
+        None,
+    ] {
+        execute_window_chord(&mut harness, 'w').await;
+        assert_eq!(harness.editor.test_focused_panel_id(), expected);
+    }
+}
+
+#[tokio::test]
+async fn shifted_window_chords_move_nested_splits_to_each_outer_edge() {
+    for (key, expected_position, expected_size) in [
+        ('H', (0, 0), (39, 22)),
+        ('J', (0, 11), (80, 11)),
+        ('K', (0, 0), (80, 10)),
+        ('L', (40, 0), (40, 22)),
+    ] {
+        let contents = (0..40)
+            .map(|line| format!("line {line:02}\n"))
+            .collect::<String>();
+        let buffer = Buffer::new(None, contents);
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.execute_action(Action::SplitVertical).await.unwrap();
+        harness
+            .execute_action(Action::SplitHorizontal)
+            .await
+            .unwrap();
+        harness.set_viewport_cursor(2, 3, 3);
+        let cursor = harness.cursor_position();
+
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('w'),
+                KeyModifiers::CONTROL,
+            )))
+            .await
+            .unwrap();
+        assert!(harness.is_waiting_for_key_sequence());
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(key),
+                KeyModifiers::SHIFT,
+            )))
+            .await
+            .unwrap();
+
+        let (position, size) = harness.editor.test_active_window_bounds().unwrap();
+        assert_eq!((position.x, position.y), expected_position);
+        assert_eq!(size, expected_size);
+        assert_eq!(harness.window_count(), 3);
+        assert_eq!(harness.cursor_position(), cursor);
+        assert_eq!(harness.viewport_top(), 2);
+        assert!(!harness.is_waiting_for_key_sequence());
+
+        let snapshot = harness.editor.test_session_snapshot();
+        match (key, snapshot.window_layout.root) {
+            ('H', SplitSnapshot::Vertical { left, .. }) => {
+                assert!(matches!(left.as_ref(), SplitSnapshot::Window { .. }));
+            }
+            ('L', SplitSnapshot::Vertical { right, .. }) => {
+                assert!(matches!(right.as_ref(), SplitSnapshot::Window { .. }));
+            }
+            ('K', SplitSnapshot::Horizontal { top, .. }) => {
+                assert!(matches!(top.as_ref(), SplitSnapshot::Window { .. }));
+            }
+            ('J', SplitSnapshot::Horizontal { bottom, .. }) => {
+                assert!(matches!(bottom.as_ref(), SplitSnapshot::Window { .. }));
+            }
+            _ => panic!("shifted window chord did not create the expected outer split"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn lowercase_window_chords_preserve_split_topology_and_move_focus() {
+    for (key, preparation) in [
+        ('h', Some(Action::MoveWindowRight)),
+        ('j', Some(Action::MoveWindowUp)),
+        ('k', None),
+        ('l', None),
+    ] {
+        let buffer = Buffer::new(None, "first\nsecond\nthird\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.execute_action(Action::SplitVertical).await.unwrap();
+        harness
+            .execute_action(Action::SplitHorizontal)
+            .await
+            .unwrap();
+        harness
+            .execute_action(Action::MoveWindowLeft)
+            .await
+            .unwrap();
+        harness
+            .execute_action(Action::SplitHorizontal)
+            .await
+            .unwrap();
+        if let Some(action) = preparation {
+            harness.execute_action(action).await.unwrap();
+        }
+        let before = harness.editor.test_session_snapshot().window_layout;
+
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('w'),
+                KeyModifiers::CONTROL,
+            )))
+            .await
+            .unwrap();
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(key),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+
+        let after = harness.editor.test_session_snapshot().window_layout;
+        assert_eq!(after.root, before.root);
+        assert_ne!(after.active_window_id, before.active_window_id);
+        assert_eq!(harness.window_count(), 4);
+    }
+}
+
+#[tokio::test]
+async fn moving_a_window_to_an_edge_preserves_both_side_panels() {
+    let buffer = Buffer::new(None, "first\nsecond\nthird\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    harness
+        .execute_action(Action::SplitHorizontal)
+        .await
+        .unwrap();
+    add_tree_panel(&mut harness);
+    harness.editor.test_create_panel(
+        "right",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 20,
+            title: None,
+            composer: None,
+            surface: None,
+            border: None,
+            header_actions: Vec::new(),
+        },
+    );
+
+    harness
+        .execute_action(Action::MoveWindowToLeft)
+        .await
+        .unwrap();
+    let (left_position, left_size) = harness.editor.test_active_window_bounds().unwrap();
+    assert_eq!(left_position.x, 21);
+    assert_eq!(left_position.y, 0);
+    assert_eq!(left_size.1, 22);
+    assert!(left_position.x + left_size.0 <= 59);
+
+    harness
+        .execute_action(Action::MoveWindowToRight)
+        .await
+        .unwrap();
+    let (right_position, right_size) = harness.editor.test_active_window_bounds().unwrap();
+    assert_eq!(right_position.y, 0);
+    assert_eq!(right_size.1, 22);
+    assert_eq!(right_position.x + right_size.0, 59);
+    assert_eq!(harness.window_count(), 3);
+}
+
+#[tokio::test]
+async fn moving_a_single_window_to_an_edge_is_silent() {
+    for action in [
+        Action::MoveWindowToLeft,
+        Action::MoveWindowToBottom,
+        Action::MoveWindowToTop,
+        Action::MoveWindowToRight,
+    ] {
+        let mut harness = EditorHarness::with_content("abcdef");
+        let before = harness.editor.test_session_snapshot().window_layout;
+
+        harness.execute_action(action).await.unwrap();
+
+        assert_eq!(harness.editor.test_session_snapshot().window_layout, before);
+        assert_eq!(harness.last_error(), None);
+        assert_eq!(harness.window_count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn directional_window_boundaries_report_no_op() {
+    let mut harness = EditorHarness::with_content("abcdef");
+
+    for (action, message) in [
+        (Action::MoveWindowUp, "no window above"),
+        (Action::MoveWindowDown, "no window below"),
+        (Action::MoveWindowLeft, "no window to the left"),
+        (Action::MoveWindowRight, "no window to the right"),
+    ] {
+        harness.execute_action(action).await.unwrap();
+        assert!(harness.commandline_row().contains(message));
+        assert_eq!(
+            harness
+                .editor
+                .notifications()
+                .records()
+                .next_back()
+                .unwrap()
+                .severity,
+            Severity::Warning
+        );
+    }
+}
+
+#[tokio::test]
+async fn window_cycle_uses_left_windows_right_visual_groups() {
+    let mut harness = EditorHarness::with_content("abcdef");
+    add_tree_panel(&mut harness);
+    harness.editor.test_create_panel(
+        "right",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 20,
+            title: None,
+            composer: None,
+            surface: None,
+            border: None,
+            header_actions: Vec::new(),
+        },
+    );
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    assert_eq!(harness.active_window_id(), 1);
+
+    harness.execute_action(Action::NextWindow).await.unwrap();
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("right"));
+
+    harness.execute_action(Action::NextWindow).await.unwrap();
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("tree"));
+
+    harness.execute_action(Action::NextWindow).await.unwrap();
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+    assert_eq!(harness.active_window_id(), 0);
+}
+
+#[tokio::test]
+async fn focused_panel_routes_ctrl_w_w_into_focus_cycle() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    add_tree_panel(&mut harness);
+    assert!(harness.editor.test_focus_panel("tree"));
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+}
+
+#[tokio::test]
+async fn focused_agent_composer_routes_ctrl_w_w_into_focus_cycle() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 40,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    assert!(harness.is_waiting_for_key_sequence());
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+    assert!(!harness.is_waiting_for_key_sequence());
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+}
+
+#[tokio::test]
+async fn ctrl_w_w_focuses_agent_composer_and_makes_cursor_visible() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 40,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            surface: None,
+            border: None,
+            header_actions: Vec::new(),
+        },
+    );
+    let editor_cursor = harness.render_cursor_position();
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+    let composer_cursor = harness.render_cursor_position();
+    assert!(composer_cursor.is_some());
+    assert_ne!(composer_cursor, editor_cursor);
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+    assert!(matches!(
+        action,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:agent" && payload["action"] == "composer_input"
+            ))
+    ));
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .unwrap();
+    assert!(matches!(
+        action,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:agent" && payload["action"] == "composer_input"
+            ))
+    ));
+    assert!(harness.render_cursor_position().is_some());
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .unwrap();
+    assert!(matches!(
+        action,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:agent" && payload["action"] == "composer_blur"
+            ))
+    ));
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+    assert!(harness.render_cursor_position().is_some());
+}
+
+#[tokio::test]
+async fn mouse_click_inside_panel_focuses_and_selects_row() {
+    let mut harness = EditorHarness::with_content("abcdef");
+    add_tree_panel(&mut harness);
+
+    harness
+        .execute_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("tree"));
+    assert_eq!(
+        harness.editor.test_focused_panel_selected_index("tree"),
+        Some(2)
+    );
+    assert_eq!(harness.render_cursor_position(), None);
+}
+
+#[test]
+fn mouse_double_click_inside_panel_activates_selected_row() {
+    let mut harness = EditorHarness::with_content("abcdef");
+    add_tree_panel(&mut harness);
+
+    for expected_action in ["select", "activate"] {
+        let action = harness
+            .editor
+            .test_handle_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+
+        assert!(matches!(
+            action,
+            Some(KeyAction::Multiple(actions))
+                if actions.iter().any(|action| matches!(
+                    action,
+                    Action::NotifyPlugins(name, payload)
+                        if name == "panel:event:tree"
+                            && payload["action"] == expected_action
+                            && payload["selected_index"] == 2
+                ))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn mouse_click_in_editor_clears_panel_focus() {
+    let mut harness = EditorHarness::with_content("abcdef");
+    add_tree_panel(&mut harness);
+    assert!(harness.editor.test_focus_panel("tree"));
+
+    harness
+        .execute_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 25,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+    assert!(harness.render_cursor_position().is_some());
+}
+
+#[tokio::test]
+async fn pane_divider_highlight_follows_press_drag_and_release_on_all_edges() {
+    for (side, initial_size, start, end, expected_glyph) in [
+        (PanelSide::Left, 20, (20, 4), (25, 4), '│'),
+        (PanelSide::Right, 20, (59, 4), (54, 4), '│'),
+        (PanelSide::Top, 6, (12, 6), (12, 9), '─'),
+        (PanelSide::Bottom, 6, (12, 15), (12, 12), '─'),
+    ] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.editor.test_create_panel(
+            "inspector",
+            PanelConfig {
+                side,
+                width: initial_size,
+                ..PanelConfig::default()
+            },
+        );
+        assert!(harness.editor.test_focus_panel("inspector"));
+
+        assert_eq!(
+            harness
+                .render_row(usize::from(start.1))
+                .unwrap()
+                .chars()
+                .nth(usize::from(start.0)),
+            Some(' '),
+        );
+
+        harness
+            .execute_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: start.0,
+                row: start.1,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            harness
+                .render_row(usize::from(start.1))
+                .unwrap()
+                .chars()
+                .nth(usize::from(start.0)),
+            Some(expected_glyph),
+            "the {side:?} divider should highlight immediately on mouse-down",
+        );
+
+        harness
+            .execute_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: end.0,
+                row: end.1,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            harness
+                .render_row(usize::from(end.1))
+                .unwrap()
+                .chars()
+                .nth(usize::from(end.0)),
+            Some(expected_glyph),
+            "the {side:?} highlight should follow its moved divider",
+        );
+
+        harness
+            .execute_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: end.0,
+                row: end.1,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            harness
+                .render_row(usize::from(end.1))
+                .unwrap()
+                .chars()
+                .nth(usize::from(end.0)),
+            Some(' '),
+            "the {side:?} divider should restore its idle appearance on mouse-up",
+        );
+        assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+    }
+}
+
+#[tokio::test]
+async fn escape_cancels_a_pane_divider_drag_without_stealing_focus() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_panel(
+        "inspector",
+        PanelConfig {
+            side: PanelSide::Left,
+            width: 20,
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_panel("inspector"));
+
+    harness
+        .execute_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(harness.render_row(4).unwrap().chars().nth(20), Some('│'));
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.render_row(4).unwrap().chars().nth(20), Some(' '));
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 20)),
+    );
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+
+    let passive_drag = harness
+        .editor
+        .test_handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 25,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+    assert_eq!(passive_drag, None);
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 20)),
+    );
+}
+
+#[tokio::test]
+async fn mouse_drag_resizes_all_four_docked_pane_edges_without_stealing_focus() {
+    for (side, initial_size, start, end, expected_size) in [
+        (PanelSide::Left, 20, (20, 4), (25, 4), 25),
+        (PanelSide::Right, 20, (59, 4), (54, 4), 25),
+        (PanelSide::Top, 6, (12, 6), (12, 9), 9),
+        (PanelSide::Bottom, 6, (12, 15), (12, 12), 9),
+    ] {
+        let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness.editor.test_create_panel(
+            "inspector",
+            PanelConfig {
+                side,
+                width: initial_size,
+                ..PanelConfig::default()
+            },
+        );
+        assert!(harness.editor.test_focus_panel("inspector"));
+
+        drag_window_divider(&mut harness, start, end).await;
+
+        assert_eq!(
+            harness.editor.test_panel_layout("inspector"),
+            Some((side, expected_size)),
+            "dragging the actual {side:?} divider should resize the focused pane",
+        );
+        assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+    }
+}
+
+#[tokio::test]
+async fn pane_divider_drag_stays_captured_after_the_pointer_enters_the_editor() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_panel(
+        "inspector",
+        PanelConfig {
+            side: PanelSide::Left,
+            width: 20,
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_panel("inspector"));
+
+    for (kind, column) in [
+        (MouseEventKind::Down(MouseButton::Left), 20),
+        (MouseEventKind::Drag(MouseButton::Left), 34),
+    ] {
+        harness
+            .execute_event(Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 34)),
+    );
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+
+    harness
+        .execute_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 34,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .await
+        .unwrap();
+
+    let passive_drag = harness
+        .editor
+        .test_handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 45,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+
+    assert_eq!(passive_drag, None);
+    assert_eq!(
+        harness.editor.test_panel_layout("inspector"),
+        Some((PanelSide::Left, 34)),
+    );
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("inspector"));
+}
+
+#[tokio::test]
+async fn mouse_drag_resizes_a_vertical_editor_split_without_moving_the_cursor() {
+    let buffer = Buffer::new(None, "first\nsecond\nthird\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    let active_window_id = harness.active_window_id();
+    let cursor = harness.cursor_position();
+
+    drag_window_divider(&mut harness, (39, 4), (53, 4)).await;
+
+    let (position, size) = harness.editor.test_active_window_bounds().unwrap();
+    assert_eq!((position.x, position.y), (54, 0));
+    assert_eq!(size, (26, 22));
+    assert_eq!(harness.active_window_id(), active_window_id);
+    assert_eq!(harness.cursor_position(), cursor);
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+}
+
+#[tokio::test]
+async fn mouse_drag_resizes_a_horizontal_editor_split_without_moving_the_cursor() {
+    let buffer = Buffer::new(None, "first\nsecond\nthird\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .execute_action(Action::SplitHorizontal)
+        .await
+        .unwrap();
+    let active_window_id = harness.active_window_id();
+    let cursor = harness.cursor_position();
+
+    drag_window_divider(&mut harness, (8, 10), (8, 14)).await;
+
+    let (position, size) = harness.editor.test_active_window_bounds().unwrap();
+    assert_eq!((position.x, position.y), (0, 15));
+    assert_eq!(size, (80, 7));
+    assert_eq!(harness.active_window_id(), active_window_id);
+    assert_eq!(harness.cursor_position(), cursor);
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+}
+
+#[tokio::test]
+async fn mouse_drag_preserves_a_focused_text_composer_and_its_draft() {
+    let buffer = Buffer::new(None, "first\nsecond\n".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 24,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            ..PanelConfig::default()
+        },
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+    harness
+        .editor
+        .test_handle_event(Event::Paste("keep this follow-up".to_string()))
+        .unwrap();
+
+    drag_window_divider(&mut harness, (55, 4), (50, 4)).await;
+
+    assert_eq!(
+        harness.editor.test_panel_layout("agent"),
+        Some((PanelSide::Right, 29)),
+    );
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+    assert!(harness.render_cursor_position().is_some());
+
+    let submitted = harness
+        .editor
+        .test_handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+    assert!(matches!(
+        submitted,
+        Some(KeyAction::Multiple(actions))
+            if actions.iter().any(|action| matches!(
+                action,
+                Action::NotifyPlugins(name, payload)
+                    if name == "panel:event:agent"
+                        && payload["action"] == "submit"
+                        && payload["text"] == "keep this follow-up"
+            ))
+    ));
+}
+
+#[test]
+fn mouse_wheel_scrolls_hovered_row_panel_without_taking_focus() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config_and_size(buffer, default_key_config(), 80, 10);
+    add_tree_panel(&mut harness);
+    harness
+        .editor
+        .test_update_panel("tree", numbered_tree_rows(30));
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+
+    let down = Event::Mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 1,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    });
+    harness.editor.test_handle_event(down.clone()).unwrap();
+    assert!(harness.render_row(0).unwrap().starts_with("row-03.rs"));
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+    assert_eq!(
+        harness.editor.test_focused_panel_selected_index("tree"),
+        Some(6)
+    );
+
+    harness.editor.test_handle_event(down).unwrap();
+    assert!(harness.render_row(0).unwrap().starts_with("row-06.rs"));
+    assert_eq!(
+        harness.editor.test_focused_panel_selected_index("tree"),
+        Some(9)
+    );
+
+    harness
+        .editor
+        .test_handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 1,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+    assert!(harness.render_row(0).unwrap().starts_with("row-03.rs"));
+    assert_eq!(
+        harness.editor.test_focused_panel_selected_index("tree"),
+        Some(7)
+    );
+}
+
+#[test]
+fn mouse_wheel_over_editor_preserves_focused_row_panel() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    add_tree_panel(&mut harness);
+    assert!(harness.editor.test_focus_panel("tree"));
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 30,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+
+    assert_eq!(action, Some(KeyAction::Single(Action::ScrollDown)));
+    assert_eq!(harness.editor.test_focused_panel_id(), Some("tree"));
+}
+
+#[test]
+fn zero_mouse_scroll_lines_does_not_move_hovered_row_panel() {
+    let mut config = default_key_config();
+    config.mouse_scroll_lines = Some(0);
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 80, 10);
+    add_tree_panel(&mut harness);
+    harness
+        .editor
+        .test_update_panel("tree", numbered_tree_rows(30));
+
+    let action = harness
+        .editor
+        .test_handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 1,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+
+    assert!(matches!(action, Some(KeyAction::Multiple(_))));
+    assert!(harness.render_row(0).unwrap().starts_with("row-00.rs"));
+    assert_eq!(
+        harness.editor.test_focused_panel_selected_index("tree"),
+        Some(0)
+    );
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+}
+
+#[test]
+fn passive_mouse_events_over_editor_do_not_clear_focused_agent_composer() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 40,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            surface: None,
+            border: None,
+            header_actions: Vec::new(),
+        },
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+    let cursor = harness.render_cursor_position();
+
+    for kind in [
+        MouseEventKind::Moved,
+        MouseEventKind::Up(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+    ] {
+        let action = harness
+            .editor
+            .test_handle_event(Event::Mouse(MouseEvent {
+                kind,
+                column: 10,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+
+        assert_eq!(action, None);
+        assert_eq!(harness.editor.test_focused_panel_id(), Some("agent"));
+        assert_eq!(harness.render_cursor_position(), cursor);
+    }
+}
+
+#[tokio::test]
+async fn only_window_hides_auxiliary_panels_and_preserves_agent_draft() {
+    let buffer = Buffer::new(None, "abcdef".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    add_tree_panel(&mut harness);
+    harness.editor.test_create_text_panel(
+        "agent",
+        PanelConfig {
+            side: PanelSide::Right,
+            width: 24,
+            title: Some("Agent".to_string()),
+            composer: Some(TextPanelComposerConfig {
+                placeholder: "Ask".to_string(),
+                rows: 2,
+            }),
+            surface: None,
+            border: None,
+            header_actions: Vec::new(),
+        },
+    );
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+    harness
+        .editor
+        .test_handle_event(Event::Paste("keep this follow-up".to_string()))
+        .unwrap();
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    harness
+        .execute_action(Action::PreviousWindow)
+        .await
+        .unwrap();
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.window_count(), 1);
+    assert_eq!(harness.editor.test_focused_panel_id(), None);
+    assert!(!harness.editor.test_focus_panel("tree"));
+    assert!(!harness.editor.test_focus_text_panel_composer("agent"));
+    assert_eq!(
+        harness.editor.test_active_window_bounds(),
+        Some((red::editor::Point::new(0, 0), (80, 22)))
+    );
+
+    assert!(harness.editor.test_set_panel_visible("agent", true));
+    assert!(harness.editor.test_focus_text_panel_composer("agent"));
+    assert!((0..24).any(|row| {
+        harness
+            .editor
+            .test_render_row(row)
+            .unwrap()
+            .contains("keep this follow-up")
+    }));
+}
+
+#[tokio::test]
+async fn test_dirty_isolated_per_buffer() {
+    let lsp = Box::new(MockLsp) as Box<dyn LspClient + Send>;
+    let config = Config::default();
+    let theme = Theme::default();
+    let buffers = vec![
+        Buffer::new(None, "one".to_string()),
+        Buffer::new(None, "two".to_string()),
+    ];
+    let mut editor = Editor::test_with_size(lsp, 80, 24, config, theme, buffers).unwrap();
+    editor.test_disable_terminal_output();
+    let mut harness = EditorHarness { editor };
+
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    assert!(harness.is_dirty());
+
+    harness.execute_action(Action::NextBuffer).await.unwrap();
+    assert!(!harness.is_dirty());
+    harness
+        .execute_action(Action::DeleteCharAtCursorPos)
+        .await
+        .unwrap();
+    assert!(harness.is_dirty());
+    harness.execute_action(Action::Undo).await.unwrap();
+    assert!(!harness.is_dirty());
+
+    harness
+        .execute_action(Action::PreviousBuffer)
+        .await
+        .unwrap();
+    assert!(harness.is_dirty());
+    harness.execute_action(Action::Undo).await.unwrap();
+    assert!(!harness.is_dirty());
+}
+
+#[tokio::test]
+async fn test_paste() {
+    let mut harness = EditorHarness::with_content("Hello World");
+
+    // Delete a word (should be yanked to clipboard)
+    harness.execute_action(Action::DeleteWord).await.unwrap();
+    harness.assert_buffer_contents("World");
+
+    // Move to end and paste with 'p'
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness.execute_action(Action::Paste).await.unwrap();
+    // This depends on clipboard/register implementation
+    // For now, let's just verify it doesn't crash
+}
+
+#[tokio::test]
+async fn test_yank_and_paste() {
+    let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3");
+
+    // Yank action exists
+    harness.execute_action(Action::Yank).await.unwrap();
+
+    // Move down and paste
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.execute_action(Action::Paste).await.unwrap();
+    // This depends on clipboard/register implementation
+}
+
+#[tokio::test]
+async fn test_direct_open_line_below_groups_insert_undo() {
+    let mut harness = EditorHarness::with_content("Line 1\nLine 2");
+
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    harness.type_text("New line").await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("Line 1\nNew line\nLine 2");
+    harness.execute_action(Action::Undo).await.unwrap();
+    harness.assert_buffer_contents("Line 1\nLine 2");
+}
+
+#[tokio::test]
+async fn test_editing_empty_buffer() {
+    let mut harness = EditorHarness::new();
+
+    // Enter insert mode in empty buffer
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness.type_text("First line").await.unwrap();
+    harness.assert_buffer_contents("First line\n");
+
+    // Exit and create new line below
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    harness.type_text("Second line").await.unwrap();
+    harness.assert_buffer_contents("First line\nSecond line\n");
+}
+
+#[tokio::test]
+async fn test_delete_at_end_of_file() {
+    let mut harness = EditorHarness::with_content("Line 1\nLine 2");
+
+    // Move to last line
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+    println!(
+        "After MoveToBottom: cursor at {:?}",
+        harness.cursor_position()
+    );
+    println!("Current line: {:?}", harness.current_line());
+
+    // Try to delete line at end of file
+    harness
+        .execute_action(Action::DeleteCurrentLine)
+        .await
+        .unwrap();
+    println!("After delete: {:?}", harness.buffer_contents());
+    harness.assert_buffer_contents("Line 1\n");
+}
+
+#[tokio::test]
+async fn test_change_to_end_of_line() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "Hello World Test".to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "wC").await;
+    harness.assert_mode(Mode::Insert);
+    harness.type_text("Universe").await.unwrap();
+    harness.assert_buffer_contents("Hello Universe");
+}
+
+#[tokio::test]
+async fn vim_parity_counted_word_operators_stop_at_blank_line_boundaries() {
+    for (contents, keys, expected, cursor) in [
+        (
+            "alpha beta\n\nnext line",
+            "wd2w",
+            "alpha \nnext line",
+            (5, 0),
+        ),
+        (
+            "alpha beta\n\nnext line",
+            "w2dw",
+            "alpha \nnext line",
+            (5, 0),
+        ),
+        ("alpha beta\n\nnext line", "wd3w", "alpha line", (6, 0)),
+        ("\n    next line", "dw", "    next line", (4, 0)),
+        ("\n    next line", "cwX", "X\n    next line", (0, 0)),
+        (
+            "alpha beta\n\nnext line",
+            "wy2wp",
+            "alpha bbeta\neta\n\nnext line",
+            (7, 0),
+        ),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_big_word_operators_and_text_objects_match_neovim() {
+    for (contents, keys, expected, cursor) in [
+        ("foo.bar baz", "dW", "baz", (0, 0)),
+        ("foo.bar baz qux", "d2W", "qux", (0, 0)),
+        ("foo.bar baz", "cWX", "X baz", (0, 0)),
+        ("foo.bar baz", "yWp", "ffoo.bar oo.bar baz", (8, 0)),
+        ("foo.bar baz", "diW", " baz", (0, 0)),
+        ("foo.bar baz", "daW", "baz", (0, 0)),
+        ("α.β γδ", "dW", "γδ", (0, 0)),
+        ("foo.bar\n\n baz qux", "d2W", " baz qux", (1, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_character_operators_accept_horizontal_motions_and_counts() {
+    for (contents, keys, expected, cursor) in [
+        ("alpha", "dl", "lpha", (0, 0)),
+        ("alpha", "ldh", "lpha", (0, 0)),
+        ("alpha", "d2l", "pha", (0, 0)),
+        ("alpha", "d99l", "", (0, 0)),
+        ("alpha", "3ld99h", "ha", (0, 0)),
+        ("alpha", "clX", "Xlpha", (0, 0)),
+        ("alpha", "ylp", "aalpha", (1, 0)),
+        ("αβγ", "dl", "βγ", (0, 0)),
+        ("αβγ", "ldh", "βγ", (0, 0)),
+        ("αβγ", "d2l", "γ", (0, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_end_word_operators_include_the_final_buffer_character() {
+    for (contents, keys, expected, cursor) in [
+        ("alpha beta", "de", " beta", (0, 0)),
+        ("alpha", "$de", "alph", (3, 0)),
+        ("alpha", "$dE", "alph", (3, 0)),
+        ("x", "de", "", (0, 0)),
+        ("alpha", "$ceX", "alphX", (4, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_linewise_operators_accept_file_boundary_motions() {
+    for (contents, keys, expected, cursor) in [
+        ("one\ntwo\nthree", "dG", "", (0, 0)),
+        ("one\ntwo\nthree", "jdG", "one", (0, 0)),
+        ("one\ntwo\nthree", "jdgg", "three", (0, 0)),
+        ("one\ntwo\nthree\nfour", "2dG", "three\nfour", (0, 0)),
+        ("one\ntwo\nthree\nfour", "d2G", "three\nfour", (0, 0)),
+        ("one\ntwo\nthree\nfour", "jjd2gg", "one\nfour", (0, 1)),
+        (
+            "one\ntwo\nthree",
+            "yGp",
+            "one\none\ntwo\nthree\ntwo\nthree",
+            (0, 1),
+        ),
+        ("one\ntwo\nthree", "cGX", "X", (0, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_operators_accept_previous_word_end_g_motions() {
+    for (contents, keys, expected, cursor) in [
+        ("alpha beta gamma", "wdge", "alpheta gamma", (4, 0)),
+        ("alpha.beta gamma", "wdgE", "beta gamma", (0, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_charwise_paste_places_the_cursor_on_the_last_inserted_grapheme() {
+    for (contents, keys, expected, cursor) in [
+        ("alpha beta", "ywp", "aalpha lpha beta", (6, 0)),
+        (
+            "alpha beta\nnext line",
+            "wywp",
+            "alpha bbetaeta\nnext line",
+            (10, 0),
+        ),
+        ("alpha", "ylp", "aalpha", (1, 0)),
+        ("αβ γδ", "ywp", "ααβ β γδ", (3, 0)),
+        (
+            "a\u{301}bc next",
+            "ywp",
+            "a\u{301}a\u{301}bc bc next",
+            (4, 0),
+        ),
+        ("alpha beta", "ywP", "alpha alpha beta", (5, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_paragraph_operators_preserve_exclusive_and_linewise_ranges() {
+    for (contents, keys, expected, cursor) in [
+        ("alpha\n\nbeta", "d}", "\nbeta", (0, 0)),
+        ("alpha\n\nbeta", "2ld}", "al\n\nbeta", (1, 0)),
+        ("alpha\n\nbeta\n\ngamma", "d2}", "\ngamma", (0, 0)),
+        ("alpha\n\nbeta\n\ngamma", "2d}", "\ngamma", (0, 0)),
+        ("alpha\n   \nbeta\n\ngamma", "d}", "\ngamma", (0, 0)),
+        ("alpha\nbeta", "d}", "", (0, 0)),
+        ("alpha\n\nbeta", "y}p", "alpha\nalpha\n\nbeta", (0, 1)),
+        ("alpha\n\nbeta", "v}x", "beta", (0, 0)),
+        ("one\n\ntwo\n\nthree", "Gd{", "one\n\ntwo\nthree", (0, 3)),
+        ("one\n\ntwo\n\nthree", "d}.", "\nthree", (0, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_sentence_operators_and_objects_preserve_sentence_whitespace() {
+    for (contents, keys, expected, cursor) in [
+        ("One.  Two! Three? End", "d)", "Two! Three? End", (0, 0)),
+        ("One.  Two! Three? End", "d2)", "Three? End", (0, 0)),
+        ("One.  Two! Three? End", "2d)", "Three? End", (0, 0)),
+        ("One.  Two! Three? End", ")d(", "Two! Three? End", (0, 0)),
+        ("One.  Two! Three? End", "dis", "  Two! Three? End", (0, 0)),
+        ("One.  Two! Three? End", "das", "Two! Three? End", (0, 0)),
+        ("One.  Two! Three? End", "d2is", "Two! Three? End", (0, 0)),
+        ("One.  Two! Three? End", "d3is", " Three? End", (0, 0)),
+        ("One.  Two! Three? End", "d2as", "Three? End", (0, 0)),
+        (
+            "One.  Two! Three? End",
+            "4ldis",
+            "One.Two! Three? End",
+            (4, 0),
+        ),
+        ("One.  Two! Three? End", "4ldas", "One. Three? End", (4, 0)),
+        ("One.  Two! Three? End", "visx", "  Two! Three? End", (0, 0)),
+        ("One.  Two! Three? End", "vasx", "Two! Three? End", (0, 0)),
+        ("One.  Two! Three? End", "v2isx", "Two! Three? End", (0, 0)),
+        ("One. Two! Last", "v)x", "wo! Last", (0, 0)),
+        ("One.)\"  Two!", "dis", "  Two!", (0, 0)),
+        ("One.\nTwo", "dis", "Two", (0, 0)),
+        ("One.\n\nTwo", "d2as", "Two", (0, 0)),
+        (
+            "Olá! 👨‍👩‍👧 e\u{301}lan. Fim",
+            "das",
+            "👨‍👩‍👧 e\u{301}lan. Fim",
+            (0, 0),
+        ),
+        ("One.  Two! Three? End", "das.", "Three? End", (0, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn sentence_changes_remain_one_undoable_transaction() {
+    let contents = "One.  Two!";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "cisnew").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    harness.assert_buffer_contents("new  Two!");
+
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents(contents);
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn vim_parity_paragraph_text_objects_preserve_inner_blank_line_semantics() {
+    for (contents, keys, expected, cursor) in [
+        (
+            "one paragraph\nstill one\n\nnext paragraph",
+            "dip",
+            "\nnext paragraph",
+            (0, 0),
+        ),
+        (
+            "one paragraph\nstill one\n\nnext paragraph",
+            "dap",
+            "next paragraph",
+            (0, 0),
+        ),
+        (
+            "one\n\nsecond line\nsecond end\n\nthird",
+            "jjdip",
+            "one\n\n\nthird",
+            (0, 2),
+        ),
+        (
+            "one\n\nsecond line\nsecond end\n\nthird",
+            "jjdap",
+            "one\n\nthird",
+            (0, 2),
+        ),
+        ("one\n\n\nnext", "jdip", "one\nnext", (0, 1)),
+        ("one\n\n\nnext", "jdap", "one", (0, 0)),
+        ("one\nsecond", "dip", "", (0, 0)),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(cursor.0, cursor.1);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_visual_big_word_and_paragraph_objects_match_operator_objects() {
+    for (contents, keys, expected) in [
+        ("foo.bar baz", "viWx", " baz"),
+        (
+            "one paragraph\nstill one\n\nnext paragraph",
+            "vipx",
+            "\nnext paragraph",
+        ),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_cursor_at(0, 0);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_default_character_search_repeat_honors_counts() {
+    for (contents, keys, expected_x) in [("foo.bar.baz", "f.;", 7), ("foo.bar.baz.qux", "f.2;", 11)]
+    {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(contents);
+        harness.assert_cursor_at(expected_x, 0);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_editing_shortcuts_honor_counts_and_register_kinds() {
+    let cases = [
+        ("one two\nthree four\nfive", "w2D", "one \nfive"),
+        ("one two\nthree four\nfive", "w2CX", "one X\nfive"),
+        ("  one two\nnext", "SX", "  X\nnext"),
+        ("one two", "w2sX", "one Xo"),
+        ("one two", "wX", "onetwo"),
+        ("one two", "wY$p", "one twotwo"),
+        ("abc", "xp", "bac"),
+        ("abc", "xuU", "bc"),
+    ];
+
+    for (contents, keys, expected) in cases {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            line_end_delete_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+
+        harness.assert_buffer_contents(expected);
+    }
+}
+
+#[tokio::test]
+async fn vim_operator_motions_cover_line_edges_backward_words_and_vertical_lines() {
+    for (contents, keys, expected) in [
+        ("one two three", "wd$", "one "),
+        ("one two three", "wdb", "two three"),
+        ("one\ntwo\nthree", "dj", "three"),
+        ("one\ntwo\nthree", "jdk", "three"),
+        ("one two three", "cwX", "X two three"),
+        ("one two three four", "c2wX", "X three four"),
+        ("one two", "wcwX", "one X"),
+        ("  one\n    two\nthree", "cjX", "  X\nthree"),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+
+        harness.assert_buffer_contents(expected);
+    }
+}
+
+#[tokio::test]
+async fn vim_line_end_changes_repeat_at_the_new_cursor() {
+    for (keys, expected) in [("wCX", "one X\nthree X"), ("wD", "one \nthree ")] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "one two\nthree four".to_string()),
+            line_end_delete_key_config(),
+        );
+        type_normal_keys(&mut harness, keys).await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+        type_normal_keys(&mut harness, "jw.").await;
+        if harness.is_insert() {
+            command_key(&mut harness, KeyCode::Esc).await;
+        }
+        harness.assert_buffer_contents(expected);
+    }
+}
+
+#[tokio::test]
+async fn vim_backward_character_and_end_word_motions_work_in_normal_and_operator_modes() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "alpha.beta.gamma".to_string()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "$F.").await;
+    harness.assert_cursor_at(10, 0);
+
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "alpha.beta.gamma".to_string()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "$T.").await;
+    harness.assert_cursor_at(11, 0);
+
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "alpha.beta.gamma".to_string()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "f.f.,").await;
+    harness.assert_cursor_at(5, 0);
+
+    for (contents, keys, expected) in [
+        ("alpha.beta.gamma", "$dF.", "alpha.betaa"),
+        ("alpha.beta.gamma", "$dT.", "alpha.beta.a"),
+        ("alpha beta gamma", "de", " beta gamma"),
+        ("alpha beta gamma", "wdb", "beta gamma"),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+        type_normal_keys(&mut harness, keys).await;
+        harness.assert_buffer_contents(expected);
+    }
+
+    for (keys, cursor) in [("e", 4), ("E", 9), ("$ge", 9), ("$gE", 9), ("$B", 11)] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "alpha.beta gamma".to_string()),
+            default_key_config(),
+        );
+        type_normal_keys(&mut harness, keys).await;
+        harness.assert_cursor_at(cursor, 0);
+    }
+}
+
+#[tokio::test]
+async fn vim_case_changes_and_visual_replace_are_transactional() {
+    for (contents, keys, expected) in [
+        ("alpha beta", "~", "Alpha beta"),
+        ("alpha beta", "gUiw", "ALPHA beta"),
+        ("ALPHA beta", "guiw", "alpha beta"),
+        ("aLpHa beta", "g~iw", "AlPhA beta"),
+        ("alpha beta", "viwU", "ALPHA beta"),
+        ("ALPHA beta", "viwu", "alpha beta"),
+        ("aLpHa beta", "viw~", "AlPhA beta"),
+        ("alpha beta", "viwrX", "XXXXX beta"),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(expected);
+        harness.assert_mode(Mode::Normal);
+        type_normal_keys(&mut harness, "u").await;
+        harness.assert_buffer_contents(contents);
+    }
+}
+
+#[tokio::test]
+async fn vim_word_and_character_repeat_actions_use_the_default_keymap() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "alpha.beta gamma".to_string()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "W").await;
+    harness.assert_cursor_at(11, 0);
+
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "alpha.beta.gamma".to_string()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "f.;").await;
+    harness.assert_cursor_at(10, 0);
+}
+
+#[tokio::test]
+async fn visual_replace_accepts_a_shifted_terminal_key_event() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "alpha beta".to_string()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "viwr").await;
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('X'),
+            KeyModifiers::SHIFT,
+        )))
+        .await
+        .unwrap();
+
+    harness.assert_buffer_contents("XXXXX beta");
+    harness.assert_mode(Mode::Normal);
+}
+
+#[tokio::test]
+async fn visual_multiline_and_block_replace_and_case_changes_preserve_line_breaks() {
+    let cases = [
+        ("vjrX", "XXXXX\nXeta\ngamma"),
+        ("VjrX", "XXXXX\nXXXX\ngamma"),
+        ("VjU", "ALPHA\nBETA\ngamma"),
+    ];
+    for (keys, expected) in cases {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "alpha\nbeta\ngamma".to_string()),
+            default_key_config(),
+        );
+        type_normal_keys(&mut harness, keys).await;
+        harness.assert_buffer_contents(expected);
+    }
+
+    for (suffix, expected) in [
+        ("jlrX", "XXpha\nXXta\ngamma"),
+        ("jlU", "ALpha\nBEta\ngamma"),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, "alpha\nbeta\ngamma".to_string()),
+            default_key_config(),
+        );
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL,
+            )))
+            .await
+            .unwrap();
+        type_normal_keys(&mut harness, suffix).await;
+        harness.assert_buffer_contents(expected);
+    }
+}
+
+#[tokio::test]
+async fn vim_half_page_keys_move_the_cursor_by_half_a_viewport() {
+    let contents = (0..40)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = EditorHarness::with_config_and_size(
+        Buffer::new(None, contents),
+        default_key_config(),
+        80,
+        12,
+    );
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(harness.buffer_line(), 5);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(harness.buffer_line(), 0);
+}
+
+#[tokio::test]
+async fn structural_text_objects_support_inner_outer_and_linewise_operators() {
+    let contents = "fn first() {\n    alpha();\n    beta();\n}\nfn second() {}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "dif").await;
+    harness.assert_buffer_contents("fn first() {\n    \n}\nfn second() {}\n");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents(contents);
+
+    type_normal_keys(&mut harness, "daf").await;
+    harness.assert_buffer_contents("fn second() {}\n");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents(contents);
+
+    type_normal_keys(&mut harness, "yaf]fP").await;
+    harness.assert_buffer_contents(
+        "fn first() {\n    alpha();\n    beta();\n}\nfn first() {\n    alpha();\n    beta();\n}\nfn second() {}\n",
+    );
+}
+
+#[tokio::test]
+async fn structural_comment_objects_synthesize_rust_inner_capture() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(
+            Some("sample.rs".to_string()),
+            "let café = 1; // comentário\n".to_string(),
+        ),
+        default_key_config(),
+    );
+    harness
+        .execute_action(Action::SetCursor(18, 0))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "dik").await;
+
+    harness.assert_buffer_contents("let café = 1; // \n");
+}
+
+#[tokio::test]
+async fn structural_function_objects_support_change_and_case_operators() {
+    let contents = "fn first() {\n    alpha();\n}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "gUif").await;
+    harness.assert_buffer_contents("fn first() {\n    ALPHA();\n}\n");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents(contents);
+
+    type_normal_keys(&mut harness, "cifupdated();").await;
+    command_key(&mut harness, KeyCode::Esc).await;
+    harness.assert_buffer_contents("fn first() {\n    updated();\n}\n");
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents(contents);
+}
+
+#[tokio::test]
+async fn structural_operator_motions_accept_prefix_and_motion_counts() {
+    let contents = "// header\nfn first() {}\nfn second() {}\nfn third() {}\n";
+    for keys in ["d2]f", "2d]f"] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents("fn second() {}\nfn third() {}\n");
+        type_normal_keys(&mut harness, "u").await;
+        harness.assert_buffer_contents(contents);
+    }
+}
+
+#[tokio::test]
+async fn structural_visual_function_selection_is_linewise() {
+    let contents = "fn first() {\n    alpha();\n}\nfn second() {}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "vaf").await;
+
+    harness.assert_mode(Mode::VisualLine);
+    assert_eq!(harness.selection(), Some((0, 0, 0, 2)));
+    type_normal_keys(&mut harness, "y").await;
+    harness.assert_mode(Mode::Normal);
+    type_normal_keys(&mut harness, "]fP").await;
+    harness.assert_buffer_contents(
+        "fn first() {\n    alpha();\n}\nfn first() {\n    alpha();\n}\nfn second() {}\n",
+    );
+}
+
+#[tokio::test]
+async fn parameter_swaps_preserve_separators_undo_and_dot_repeat() {
+    let original = "fn call(alpha: i32, beta: i32, gamma: i32) {}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), original.to_string()),
+        default_key_config(),
+    );
+    harness
+        .execute_action(Action::SetCursor(8, 0))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, " ]a").await;
+    harness.assert_buffer_contents("fn call(beta: i32, alpha: i32, gamma: i32) {}\n");
+    type_normal_keys(&mut harness, ".").await;
+    harness.assert_buffer_contents("fn call(beta: i32, gamma: i32, alpha: i32) {}\n");
+    type_normal_keys(&mut harness, "uu").await;
+    harness.assert_buffer_contents(original);
+}
+
+#[tokio::test]
+async fn parameter_swaps_record_and_replay_inside_macros() {
+    let original = "fn call(alpha: i32, beta: i32, gamma: i32) {}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), original.to_string()),
+        default_key_config(),
+    );
+    harness
+        .execute_action(Action::SetCursor(8, 0))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "qa ]aq@a").await;
+
+    harness.assert_buffer_contents("fn call(beta: i32, gamma: i32, alpha: i32) {}\n");
+    type_normal_keys(&mut harness, "uu").await;
+    harness.assert_buffer_contents(original);
+}
+
+#[tokio::test]
+async fn parameter_swaps_do_not_cross_argument_containers() {
+    let original = "fn first(alpha: i32) {}\nfn second(beta: i32) {}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), original.to_string()),
+        default_key_config(),
+    );
+    harness
+        .execute_action(Action::SetCursor(9, 0))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, " ]a").await;
+
+    harness.assert_buffer_contents(original);
+    assert_eq!(harness.last_error(), Some("adjacent text object not found"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
+}
+
+#[tokio::test]
+async fn function_swaps_preserve_scope_multiline_ranges_and_jump_history() {
+    let original = "fn first() {\n    one();\n}\nfn second() { two(); }\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), original.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, " ]m").await;
+    harness.assert_buffer_contents("fn second() { two(); }\nfn first() {\n    one();\n}\n");
+    harness.assert_cursor_at(0, 1);
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+    type_normal_keys(&mut harness, "u").await;
+    harness.assert_buffer_contents(original);
+}

@@ -1,0 +1,78 @@
+// Search-match decoration lifecycle for the active editor search.
+//
+// Search and cursor events replace one decoration namespace atomically. Leaving a
+// search-related mode clears that namespace so highlights cannot survive stale state.
+
+struct ModeChangedEvent {
+    to: String,
+}
+
+struct CursorMovedEvent {
+    mode: String,
+    cause: String,
+}
+
+struct CoolSearchState {
+    highlight_active: bool,
+}
+
+#[red::state]
+fn initial_state() -> CoolSearchState {
+    return CoolSearchState { highlight_active: false };
+}
+
+fn state() -> CoolSearchState {
+    return red::state();
+}
+
+#[red::on("search:highlighted")]
+fn search_highlighted(event: EmptyEvent) {
+    red::state_patch(CoolSearchState { highlight_active: true });
+}
+
+#[red::on("search:cleared")]
+fn search_cleared(event: EmptyEvent) {
+    red::state_patch(CoolSearchState { highlight_active: false });
+}
+
+#[red::on("mode:changed")]
+fn mode_changed(event: ModeChangedEvent) {
+    if event.to == "Insert" {
+        clear();
+    }
+}
+
+#[red::on("cursor:moved")]
+fn cursor_moved(event: CursorMovedEvent) {
+    if !state().highlight_active {
+        return;
+    }
+
+    if event.mode != "Normal" {
+        return;
+    }
+
+    if is_search_cause(event.cause) {
+        return;
+    }
+
+    clear();
+}
+
+fn clear() {
+    if !state().highlight_active {
+        return;
+    }
+
+    red::state_patch(CoolSearchState { highlight_active: false });
+    red::execute("ClearSearchHighlight");
+}
+
+fn is_search_cause(cause: String) -> bool {
+    return cause == "CommitSearch"
+        || cause == "FindNext"
+        || cause == "FindPrevious"
+        || cause == "RepeatSearch"
+        || cause == "RepeatSearchOpposite"
+        || cause == "SearchWordUnderCursor";
+}

@@ -1,0 +1,431 @@
+use std::{fs, path::PathBuf};
+
+use husk_package::{
+    LOCK_FILE, PackageError, PackageLimits, PackageLock, PackageManifest, ResolvedPackage,
+    discover_manifest,
+};
+use tempfile::TempDir;
+
+fn package(manifest_extensions: &str) -> TempDir {
+    let directory = TempDir::new().unwrap();
+    fs::create_dir_all(directory.path().join("src")).unwrap();
+    fs::write(
+        directory.path().join("Husk.toml"),
+        format!(
+            r#"
+                schema_version = 1
+
+                [package]
+                name = "example"
+                version = "0.1.0"
+                entry = "src/main.hk"
+
+                {manifest_extensions}
+            "#
+        ),
+    )
+    .unwrap();
+    directory
+}
+
+#[test]
+fn resolves_flat_and_nested_modules_in_stable_order() {
+    let directory = package("");
+    fs::write(
+        directory.path().join("src/main.hk"),
+        "mod util;\nfn main() -> i32 { util::answer() }",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("src/util.hk"),
+        "mod nested;\npub fn answer() -> i32 { nested::value() }",
+    )
+    .unwrap();
+    fs::create_dir(directory.path().join("src/util")).unwrap();
+    fs::create_dir(directory.path().join("src/util/nested")).unwrap();
+    fs::write(
+        directory.path().join("src/util/nested/mod.hk"),
+        "pub fn value() -> i32 { 42 }",
+    )
+    .unwrap();
+
+    let resolved =
+        ResolvedPackage::open(directory.path().join("Husk.toml"), PackageLimits::default())
+            .unwrap();
+    assert_eq!(
+        resolved
+            .modules
+            .iter()
+            .map(|module| module.module_path.join("::"))
+            .collect::<Vec<_>>(),
+        vec!["", "util", "util::nested"]
+    );
+    assert_eq!(
+        discover_manifest(directory.path().join("src/util/nested/mod.hk")).unwrap(),
+        directory.path().join("Husk.toml").canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn resolves_embedded_modules_in_stable_order() {
+    let manifest = r#"
+        schema_version = 1
+
+        [package]
+        name = "embedded-example"
+        version = "0.1.0"
+        entry = "src/main.hk"
+    "#;
+    let resolved = ResolvedPackage::from_sources(
+        "embedded/example",
+        manifest,
+        &[
+            (
+                "src/main.hk",
+                "mod util;\nfn main() -> i32 { util::answer() }",
+            ),
+            (
+                "src/util.hk",
+                "mod nested;\npub fn answer() -> i32 { nested::value() }",
+            ),
+            ("src/util/nested/mod.hk", "pub fn value() -> i32 { 42 }"),
+        ],
+        PackageLimits::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        resolved
+            .modules
+            .iter()
+            .map(|module| module.module_path.join("::"))
+            .collect::<Vec<_>>(),
+        vec!["", "util", "util::nested"]
+    );
+    assert_eq!(resolved.modules[0].display_path, PathBuf::from("main.hk"));
+    assert_eq!(
+        resolved.modules[2].display_path,
+        PathBuf::from("util/nested/mod.hk")
+    );
+}
+
+#[test]
+fn embedded_modules_reject_ambiguous_missing_duplicate_and_extension_inputs() {
+    let manifest = r#"
+        schema_version = 1
+
+        [package]
+        name = "embedded-example"
+        version = "0.1.0"
+        entry = "src/main.hk"
+    "#;
+    let missing = ResolvedPackage::from_sources(
+        "embedded/example",
+        manifest,
+        &[("src/main.hk", "mod util;")],
+        PackageLimits::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(missing.contains("expected exactly one"), "{missing}");
+
+    let ambiguous = ResolvedPackage::from_sources(
+        "embedded/example",
+        manifest,
+        &[
+            ("src/main.hk", "mod util;"),
+            ("src/util.hk", "pub fn answer() {}"),
+            ("src/util/mod.hk", "pub fn answer() {}"),
+        ],
+        PackageLimits::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(ambiguous.contains("ambiguous"), "{ambiguous}");
+
+    let duplicate = ResolvedPackage::from_sources(
+        "embedded/example",
+        manifest,
+        &[
+            ("src/main.hk", "fn main() {}"),
+            ("src/main.hk", "fn other() {}"),
+        ],
+        PackageLimits::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        duplicate.contains("duplicate embedded source"),
+        "{duplicate}"
+    );
+
+    let duplicate_module = ResolvedPackage::from_sources(
+        "embedded/example",
+        manifest,
+        &[
+            ("src/main.hk", "mod util;\nmod util;"),
+            ("src/util.hk", "pub fn answer() {}"),
+        ],
+        PackageLimits::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        duplicate_module.contains("resolves as both"),
+        "{duplicate_module}"
+    );
+
+    let escaping = ResolvedPackage::from_sources(
+        "embedded/example",
+        manifest,
+        &[("../src/main.hk", "fn main() {}")],
+        PackageLimits::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        escaping.contains("must be a normalized relative path"),
+        "{escaping}"
+    );
+
+    let extension_manifest =
+        format!("{manifest}\n[extensions.regex]\npath = \"vendor/regex.huskext\"\n");
+    let extension = ResolvedPackage::from_sources(
+        "embedded/example",
+        &extension_manifest,
+        &[("src/main.hk", "fn main() {}")],
+        PackageLimits::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        extension.contains("embedded packages cannot declare extensions"),
+        "{extension}"
+    );
+}
+
+#[test]
+fn rejects_missing_and_ambiguous_module_files() {
+    let directory = package("");
+    fs::write(directory.path().join("src/main.hk"), "mod missing;").unwrap();
+    let error = ResolvedPackage::open(directory.path().join("Husk.toml"), PackageLimits::default())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("expected exactly one"), "{error}");
+
+    let directory = package("");
+    fs::write(directory.path().join("src/main.hk"), "mod util;").unwrap();
+    fs::write(directory.path().join("src/util.hk"), "pub fn value() {}").unwrap();
+    fs::create_dir(directory.path().join("src/util")).unwrap();
+    fs::write(
+        directory.path().join("src/util/mod.hk"),
+        "pub fn value() {}",
+    )
+    .unwrap();
+    let error = ResolvedPackage::open(directory.path().join("Husk.toml"), PackageLimits::default())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("ambiguous"), "{error}");
+}
+
+#[test]
+fn creates_and_enforces_a_deterministic_local_extension_lock() {
+    let directory = package(
+        r#"
+            [extensions.regex]
+            path = "vendor/regex.huskext"
+        "#,
+    );
+    fs::write(directory.path().join("src/main.hk"), "fn main() {}").unwrap();
+    let bundle = directory.path().join("vendor/regex.huskext");
+    fs::create_dir_all(&bundle).unwrap();
+    fs::write(
+        bundle.join("extension.toml"),
+        r#"
+            schema_version = 1
+            name = "regex"
+            version = "1.2.3"
+            module = "regex"
+            artifact = "component.wasm"
+            world = "example:regex/husk-extension@1.2.3"
+            minimum_husk = "0.1.0"
+        "#,
+    )
+    .unwrap();
+    fs::write(bundle.join("component.wasm"), b"component-v1").unwrap();
+
+    let resolved =
+        ResolvedPackage::open(directory.path().join("Husk.toml"), PackageLimits::default())
+            .unwrap();
+    resolved.write_lock().unwrap();
+    let first = fs::read_to_string(directory.path().join(LOCK_FILE)).unwrap();
+    resolved.enforce_lock().unwrap();
+    resolved.write_lock().unwrap();
+    assert_eq!(
+        first,
+        fs::read_to_string(directory.path().join(LOCK_FILE)).unwrap()
+    );
+
+    fs::write(bundle.join("component.wasm"), b"component-v2").unwrap();
+    let changed =
+        ResolvedPackage::open(directory.path().join("Husk.toml"), PackageLimits::default())
+            .unwrap();
+    assert!(matches!(
+        changed.enforce_lock(),
+        Err(PackageError::LockChanged { .. })
+    ));
+}
+
+#[test]
+fn enforces_source_and_module_limits() {
+    let directory = package("");
+    fs::write(directory.path().join("src/main.hk"), "fn main() {}").unwrap();
+    let error = ResolvedPackage::open(
+        directory.path().join("Husk.toml"),
+        PackageLimits {
+            max_source_bytes: 2,
+            ..PackageLimits::default()
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("maximum is 2"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_duplicate_or_cycle_through_symlink_fails_closed() {
+    use std::os::unix::fs::symlink;
+
+    let directory = package("");
+    fs::write(directory.path().join("src/main.hk"), "fn main() {}").unwrap();
+    let manifest = directory.path().join("Husk.toml");
+    let real_manifest = directory.path().join("manifest.toml");
+    fs::rename(&manifest, &real_manifest).unwrap();
+    symlink("manifest.toml", &manifest).unwrap();
+    let error = ResolvedPackage::open(&manifest, PackageLimits::default())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("must not be a symlink"), "{error}");
+
+    let directory = package("");
+    fs::write(directory.path().join("src/main.hk"), "mod looped;").unwrap();
+    symlink("main.hk", directory.path().join("src/looped.hk")).unwrap();
+    let error = ResolvedPackage::open(directory.path().join("Husk.toml"), PackageLimits::default())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("must not be a symlink") || error.contains("cycle"),
+        "{error}"
+    );
+}
+
+#[test]
+fn lock_reads_use_the_package_specific_limit() {
+    let directory = package("");
+    fs::write(directory.path().join("src/main.hk"), "fn main() {}").unwrap();
+    let resolved = ResolvedPackage::open(
+        directory.path().join("Husk.toml"),
+        PackageLimits {
+            max_lock_bytes: 4,
+            ..PackageLimits::default()
+        },
+    )
+    .unwrap();
+    fs::write(directory.path().join(LOCK_FILE), "more than four bytes").unwrap();
+
+    let error = resolved.enforce_lock().unwrap_err().to_string();
+    assert!(error.contains("maximum is 4"), "{error}");
+}
+
+#[test]
+fn crate_lock_rejects_changed_generic_specializations() {
+    let manifest = PackageManifest::parse(
+        r#"
+        schema_version = 1
+
+        [package]
+        name = "example"
+        version = "0.1.0"
+        entry = "src/main.hk"
+
+        [extensions.serde_json]
+        crate = "serde_json"
+        version = "^1"
+        specializations = ["serde_json::from_str<serde_json::Value>"]
+        "#,
+    )
+    .unwrap();
+    let lock = PackageLock::parse(
+        r#"
+        schema_version = 1
+
+        [package]
+        name = "example"
+        version = "0.1.0"
+
+        [extensions.serde_json]
+        module = "serde_json"
+        version = "1.0.151"
+        source = ".husk/extensions/fixture-digest.huskext"
+        sha256 = "fixture-digest"
+        artifact = "vendor/husk/fixture-digest.huskext"
+        report_sha256 = "fixture-report-digest"
+
+        [extensions.serde_json.crate]
+        package = "serde_json"
+        version = "1.0.151"
+        requirement = "^1"
+        default_features = true
+        specializations = ["serde_json::to_string<serde_json::Value>"]
+        "#,
+    )
+    .unwrap();
+
+    let error = lock.validate_manifest(&manifest).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("differs between Husk.toml and Husk.lock"),
+        "{error}"
+    );
+}
+
+#[test]
+fn existing_locks_without_specialization_or_report_provenance_remain_readable() {
+    let lock = PackageLock::parse(
+        r#"
+        schema_version = 1
+
+        [package]
+        name = "example"
+        version = "0.1.0"
+
+        [extensions.serde_json]
+        module = "serde_json"
+        version = "1.0.151"
+        source = ".husk/extensions/fixture-digest.huskext"
+        sha256 = "fixture-digest"
+        artifact = "vendor/husk/fixture-digest.huskext"
+
+        [extensions.serde_json.crate]
+        package = "serde_json"
+        version = "1.0.151"
+        requirement = "^1"
+        default_features = true
+        "#,
+    )
+    .unwrap();
+
+    let extension = &lock.extensions["serde_json"];
+    assert!(extension.report_sha256.is_none());
+    assert!(
+        extension
+            .crate_source
+            .as_ref()
+            .unwrap()
+            .specializations
+            .is_empty()
+    );
+}

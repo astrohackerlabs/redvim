@@ -1,0 +1,462 @@
+//! Command-line contract for interactive, utility, recovery, and detach modes.
+//!
+//! Clap enforces syntactic conflicts while [`Args::validate_utility_args`] handles
+//! constraints that depend on positional files. Hidden flags are internal process
+//! boundaries rather than supported interactive workflows, so callers should prefer the
+//! public modes documented by the CLI.
+
+use std::path::PathBuf;
+
+use clap::{Args as ClapArgs, Parser, Subcommand};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "redvim",
+    version,
+    about = "RedVim — Astrohacker's modal editor, based on Red"
+)]
+pub struct Args {
+    /// Non-interactive Red utilities.
+    #[command(subcommand)]
+    pub command: Option<RootCommand>,
+
+    /// Root path
+    #[clap(short, long)]
+    pub root: Option<String>,
+
+    /// Inline TOML config override. Can be provided multiple times.
+    #[clap(short = 'c', long = "config-override", value_name = "TOML")]
+    pub config_overrides: Vec<String>,
+
+    /// List runtime files from user config, $REDVIM_RUNTIME, and embedded assets.
+    #[clap(long = "runtime-files")]
+    pub runtime_files: bool,
+
+    /// Validate the embedded runtime and assets, then exit.
+    #[clap(long = "self-check", hide = true)]
+    pub self_check: bool,
+
+    /// Validate the effective user configuration and exit.
+    #[clap(long = "check-config")]
+    pub check_config: bool,
+
+    /// Report Codex app-server prerequisites without installing anything.
+    #[clap(long = "agent-check")]
+    pub agent_check: bool,
+
+    /// Exit non-zero when the Codex prerequisite check is not agent-edit ready.
+    #[clap(long, requires = "agent_check")]
+    pub strict: bool,
+
+    /// Restore the latest core-owned crash-safe session snapshot.
+    #[clap(long, conflicts_with_all = ["files", "root"])]
+    pub resume: bool,
+
+    /// Skip Husk semantic compatibility checks (unsupported development mode).
+    #[clap(long = "no-typecheck")]
+    pub no_typecheck: bool,
+
+    /// Start a detachable editor owner and attach this terminal.
+    #[clap(
+        long,
+        value_name = "SESSION",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "default",
+        conflicts_with_all = ["attach", "stop", "core_session", "resume"]
+    )]
+    pub detach: Option<String>,
+
+    /// Attach this terminal to an existing local editor session.
+    #[clap(long, value_name = "SESSION", conflicts_with_all = ["files", "root", "stop", "core_session", "resume"])]
+    pub attach: Option<String>,
+
+    /// Stop an existing local editor session.
+    #[clap(long, value_name = "SESSION", conflicts_with_all = ["files", "root", "attach", "core_session", "resume"])]
+    pub stop: Option<String>,
+
+    /// Internal detached-core process entrypoint.
+    #[clap(long, value_name = "SESSION", hide = true, conflicts_with_all = ["attach", "stop", "detach", "resume"])]
+    pub core_session: Option<String>,
+
+    /// Replace an editor target with RED_PROCESS_EDITOR_CONTENT and exit.
+    #[clap(long = "process-editor-replace", hide = true)]
+    pub process_editor_replace: bool,
+
+    /// Copy a bundled/runtime asset into the user config directory for editing.
+    /// Accepts `plugins/name.hk`, `themes/name.json`, or a bare plugin/theme file name.
+    #[clap(long = "eject", value_name = "ASSET", conflicts_with = "eject_force")]
+    pub eject: Option<String>,
+
+    /// Copy a bundled/runtime asset into the user config directory, overwriting an existing user file.
+    /// Accepts `plugins/name.hk`, `themes/name.json`, or a bare plugin/theme file name.
+    #[clap(long = "eject-force", value_name = "ASSET")]
+    pub eject_force: Option<String>,
+
+    /// Files to edit
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RootCommand {
+    /// Inspect how this terminal reports composer keyboard shortcuts.
+    Keys(KeyboardArgs),
+    /// Install and manage external plugin packages.
+    Plugin(PluginArgs),
+    /// Inspect and approve explicitly configured native language grammars.
+    Language(LanguageArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct KeyboardArgs {
+    /// Override automatic keyboard protocol selection for this diagnostic only.
+    #[arg(long, value_enum, default_value_t)]
+    pub protocol: crate::keyboard::KeyboardPreference,
+    /// Exit after this many decoded key events.
+    #[arg(long)]
+    pub count: Option<usize>,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct LanguageArgs {
+    #[command(subcommand)]
+    pub command: LanguageCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LanguageCommand {
+    /// Approve the exact current bytes of a native grammar path or language id.
+    Trust(LanguageTrustArgs),
+    /// Revoke the current approval associated with a native grammar path or id.
+    Untrust(LanguageTrustArgs),
+    /// Check portable indentation fixtures using the effective language configuration.
+    CheckIndent(LanguageIndentArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct LanguageIndentArgs {
+    /// JSON fixture file. Native grammars must already be explicitly trusted.
+    pub fixtures: PathBuf,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct LanguageTrustArgs {
+    /// Configured language identifier or path to its native grammar shared library.
+    pub language_or_path: String,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct PluginArgs {
+    #[command(subcommand)]
+    pub command: PluginCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PluginCommand {
+    /// Install a plugin from GitHub or a local development checkout.
+    Install(PluginInstallArgs),
+    /// List curated language packs available for this Red release.
+    Catalog(PluginCatalogArgs),
+    /// List installed external plugins.
+    List,
+    /// Update one plugin or every enabled plugin.
+    Update(PluginUpdateArgs),
+    /// Disable an installed plugin without deleting state.
+    Disable(PluginIdArgs),
+    /// Enable a disabled installed plugin.
+    Enable(PluginIdArgs),
+    /// Remove an installed plugin, preserving its data by default.
+    Remove(PluginRemoveArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct PluginInstallArgs {
+    /// GitHub repository in `owner/repository` form, optionally followed by `@tag`.
+    #[arg(
+        required_unless_present_any = ["path", "catalog"],
+        conflicts_with_all = ["path", "catalog"]
+    )]
+    pub source: Option<String>,
+    /// Install a local package checkout for development.
+    #[arg(long, value_name = "DIRECTORY", conflicts_with = "catalog")]
+    pub path: Option<PathBuf>,
+    /// Install a curated language pack by its stable catalog id.
+    #[arg(long, value_name = "ID", conflicts_with_all = ["source", "path"])]
+    pub catalog: Option<String>,
+    /// Override the official catalog URL for this catalog installation.
+    #[arg(long, value_name = "URL", requires = "catalog")]
+    pub catalog_url: Option<String>,
+    /// Explicitly approve the current verified native grammars shipped by the package.
+    #[arg(long)]
+    pub trust_native_grammars: bool,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct PluginCatalogArgs {
+    /// Override the official catalog URL.
+    #[arg(long, value_name = "URL")]
+    pub catalog_url: Option<String>,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct PluginUpdateArgs {
+    /// Installed plugin identifier.
+    #[arg(required_unless_present = "all", conflicts_with = "all")]
+    pub id: Option<String>,
+    /// Update every enabled external plugin.
+    #[arg(long)]
+    pub all: bool,
+    /// Explicitly approve the updated bytes of package-provided native grammars.
+    #[arg(long)]
+    pub trust_native_grammars: bool,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct PluginIdArgs {
+    /// Installed plugin identifier.
+    pub id: String,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct PluginRemoveArgs {
+    /// Installed plugin identifier.
+    pub id: String,
+    /// Also delete the plugin's namespaced saved data.
+    #[arg(long)]
+    pub purge: bool,
+}
+
+impl Args {
+    pub fn utility_requested(&self) -> bool {
+        self.command.is_some()
+            || self.self_check
+            || self.check_config
+            || self.agent_check
+            || self.runtime_files
+            || self.eject.is_some()
+            || self.eject_force.is_some()
+            || self.process_editor_replace
+    }
+
+    pub fn validate_utility_args(&self) -> anyhow::Result<()> {
+        if self.process_editor_replace {
+            anyhow::ensure!(
+                self.files.len() == 1,
+                "process editor requires exactly one target file"
+            );
+        } else if self.utility_requested() && !self.files.is_empty() {
+            anyhow::bail!("runtime utility flags cannot be used with files to edit");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn parses_repeated_config_overrides() {
+        let args = Args::try_parse_from([
+            "red",
+            "-c",
+            r#"theme = "nightfox.json""#,
+            "--config-override",
+            r#"keys.normal."Ctrl-t" = { PluginCommand = "LspDocumentSymbols" }"#,
+            "src/editor.rs",
+        ])
+        .unwrap();
+
+        assert_eq!(args.config_overrides.len(), 2);
+        assert_eq!(args.files, vec!["src/editor.rs"]);
+    }
+
+    #[test]
+    fn parses_runtime_utility_flags() {
+        let keys =
+            Args::try_parse_from(["red", "keys", "--protocol", "legacy", "--count", "1"]).unwrap();
+        assert!(keys.utility_requested());
+        assert!(matches!(
+            keys.command,
+            Some(RootCommand::Keys(KeyboardArgs {
+                protocol: crate::keyboard::KeyboardPreference::Legacy,
+                count: Some(1)
+            }))
+        ));
+
+        let args = Args::try_parse_from(["red", "--runtime-files"]).unwrap();
+        assert!(args.runtime_files);
+        assert!(args.utility_requested());
+
+        let args = Args::try_parse_from(["red", "--self-check"]).unwrap();
+        assert!(args.self_check);
+        assert!(args.utility_requested());
+
+        let args = Args::try_parse_from(["red", "--check-config"]).unwrap();
+        assert!(args.check_config);
+        assert!(args.utility_requested());
+
+        let args = Args::try_parse_from(["red", "--agent-check"]).unwrap();
+        assert!(args.agent_check);
+        assert!(!args.strict);
+        assert!(args.utility_requested());
+
+        let args = Args::try_parse_from(["red", "--agent-check", "--strict"]).unwrap();
+        assert!(args.agent_check);
+        assert!(args.strict);
+        assert!(args.utility_requested());
+
+        let args = Args::try_parse_from(["red", "--resume"]).unwrap();
+        assert!(args.resume);
+        assert!(!args.utility_requested());
+
+        let args = Args::try_parse_from(["red", "--no-typecheck"]).unwrap();
+        assert!(args.no_typecheck);
+
+        let args = Args::try_parse_from(["red", "--detach"]).unwrap();
+        assert_eq!(args.detach.as_deref(), Some("default"));
+
+        let args = Args::try_parse_from(["red", "--detach", "src/main.rs"]).unwrap();
+        assert_eq!(args.detach.as_deref(), Some("default"));
+        assert_eq!(args.files, ["src/main.rs"]);
+
+        let args = Args::try_parse_from(["red", "--detach=work", "src/main.rs"]).unwrap();
+        assert_eq!(args.detach.as_deref(), Some("work"));
+        assert_eq!(args.files, ["src/main.rs"]);
+
+        let args = Args::try_parse_from(["red", "--attach", "work"]).unwrap();
+        assert_eq!(args.attach.as_deref(), Some("work"));
+
+        let args = Args::try_parse_from(["red", "--eject", "plugins/fidget.hk"]).unwrap();
+        assert_eq!(args.eject.as_deref(), Some("plugins/fidget.hk"));
+
+        let args = Args::try_parse_from(["red", "--eject-force", "themes/mocha.json"]).unwrap();
+        assert_eq!(args.eject_force.as_deref(), Some("themes/mocha.json"));
+
+        let args = Args::try_parse_from(["red", "--process-editor-replace", "todo"]).unwrap();
+        assert!(args.process_editor_replace);
+        assert!(args.validate_utility_args().is_ok());
+
+        let args =
+            Args::try_parse_from(["red", "plugin", "install", "codersauce/replay@v1.2.3"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(RootCommand::Plugin(PluginArgs {
+                command: PluginCommand::Install(PluginInstallArgs {
+                    source: Some(_),
+                    path: None,
+                    ..
+                }),
+            }))
+        ));
+
+        let args =
+            Args::try_parse_from(["red", "plugin", "install", "--path", "../replay"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(RootCommand::Plugin(PluginArgs {
+                command: PluginCommand::Install(PluginInstallArgs {
+                    source: None,
+                    path: Some(_),
+                    ..
+                }),
+            }))
+        ));
+
+        let args = Args::try_parse_from([
+            "red",
+            "plugin",
+            "install",
+            "--catalog",
+            "go-language",
+            "--trust-native-grammars",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(RootCommand::Plugin(PluginArgs {
+                command: PluginCommand::Install(PluginInstallArgs {
+                    source: None,
+                    path: None,
+                    catalog: Some(_),
+                    trust_native_grammars: true,
+                    ..
+                }),
+            }))
+        ));
+
+        assert_eq!(
+            Args::try_parse_from([
+                "red",
+                "plugin",
+                "install",
+                "codersauce/replay",
+                "--catalog",
+                "go-language",
+            ])
+            .unwrap_err()
+            .kind(),
+            ErrorKind::ArgumentConflict
+        );
+
+        let args = Args::try_parse_from(["red", "plugin", "update", "--all"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(RootCommand::Plugin(PluginArgs {
+                command: PluginCommand::Update(PluginUpdateArgs { all: true, .. }),
+            }))
+        ));
+
+        let args = Args::try_parse_from([
+            "red",
+            "plugin",
+            "install",
+            "--path",
+            "../languages",
+            "--trust-native-grammars",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(RootCommand::Plugin(PluginArgs {
+                command: PluginCommand::Install(PluginInstallArgs {
+                    trust_native_grammars: true,
+                    ..
+                }),
+            }))
+        ));
+
+        let args = Args::try_parse_from(["red", "language", "trust", "css"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(RootCommand::Language(LanguageArgs {
+                command: LanguageCommand::Trust(LanguageTrustArgs { language_or_path }),
+            })) if language_or_path == "css"
+        ));
+    }
+
+    #[test]
+    fn utility_flags_reject_files_to_edit() {
+        let args = Args::try_parse_from(["red", "--runtime-files", "src/main.rs"]).unwrap();
+        assert!(args.validate_utility_args().is_err());
+
+        let args = Args::try_parse_from(["red", "--self-check", "src/main.rs"]).unwrap();
+        assert!(args.validate_utility_args().is_err());
+
+        let args = Args::try_parse_from(["red", "--check-config", "src/main.rs"]).unwrap();
+        assert!(args.validate_utility_args().is_err());
+    }
+
+    #[test]
+    fn parses_version_flag() {
+        let err = Args::try_parse_from(["red", "--version"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn strict_requires_agent_check() {
+        let err = Args::try_parse_from(["red", "--strict"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+}

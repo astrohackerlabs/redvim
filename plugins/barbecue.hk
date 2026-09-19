@@ -1,0 +1,772 @@
+// Per-window breadcrumb bar derived from buffers, symbols, cursor state, and theme.
+//
+// Refreshes are coalesced through one timeout so cursor and window event bursts do not
+// repeatedly query LSP. Window IDs, rather than tree-order indexes, own rendered bars;
+// symbol ancestry is resolved from the small set of ranges containing the cursor; deactivate
+// cancels pending work and removes the plugin's chrome.
+
+struct BarbecueIconOptions {
+    // Symbol kinds are extensible, so overrides are an open string map.
+    overrides: Json,
+}
+
+struct BarbecueOptions {
+    enabled: bool,
+    truncate_marker: String,
+    separator: String,
+    nerd_font: bool,
+    show_directory: bool,
+    show_folder_icon: bool,
+    show_file: bool,
+    show_symbols: bool,
+    icons: BarbecueIconOptions,
+}
+
+struct BarbecuePluginConfig {
+    barbecue: BarbecueOptions,
+}
+
+struct BarbecueConfigValue {
+    plugin_config: BarbecuePluginConfig,
+}
+
+struct BarbecueConfigEvent {
+    value: BarbecueConfigValue,
+}
+
+struct BarbecueCursor {
+    x: i32,
+    y: i32,
+}
+
+struct BarbecueWindow {
+    window_id: i32,
+    buffer_index: i32,
+    document_id: i32,
+    buffer_path: String,
+    breadcrumb_components: [String],
+    revision: i32,
+    cursor: BarbecueCursor,
+    lsp_position: Position,
+}
+
+struct BarbecueWindowsResult {
+    windows: [BarbecueWindow],
+}
+
+struct BarbecueRange {
+    start: Position,
+    end: Position,
+}
+
+struct BarbecueSymbol {
+    id: String,
+    // Root symbols have no parent, while nested symbols carry a string ID.
+    parent_id: Option<String>,
+    name: String,
+    kind_name: String,
+    file: String,
+    depth: i32,
+    range: BarbecueRange,
+    selection_range: BarbecueRange,
+}
+
+struct BarbecueSymbolsResult {
+    ok: bool,
+    file: String,
+    document_id: i32,
+    revision: i32,
+    symbols: [BarbecueSymbol],
+}
+
+struct SymbolRecord {
+    file: String,
+    document_id: i32,
+    revision: i32,
+    symbols: [BarbecueSymbol],
+}
+
+struct FileSavedEvent {
+    document_id: i32,
+}
+
+struct CursorMovedEvent {
+    window_id: i32,
+    x: i32,
+    y: i32,
+    lsp_character: i32,
+}
+
+struct RenderedWindow {
+    window_id: i32,
+    document_id: i32,
+}
+
+struct BarbecueThemeStyle {
+    bg: Json,
+}
+
+struct BarbecueTheme {
+    style: BarbecueThemeStyle,
+}
+
+struct BarbecueEditorInfo {
+    theme: BarbecueTheme,
+}
+
+struct BarThemeStyleSpec {
+    foreground: [String],
+    background: [String],
+    bold: bool,
+}
+
+struct BarWindowStyle {
+    semantic: BarThemeStyleSpec,
+    style: Style,
+}
+
+struct BarSegment {
+    id: String,
+    text: String,
+    style: BarWindowStyle,
+    action: String,
+}
+
+struct WindowBarActionEvent {
+    action: String,
+}
+
+struct BarbecueState {
+    windows: [BarbecueWindow],
+    symbols: [SymbolRecord],
+    fallback_symbols: [SymbolRecord],
+    // Window identifiers form an open-ended cache of heterogeneous segment arrays.
+    segments: Json,
+    rendered_windows: [RenderedWindow],
+    info: Option<BarbecueEditorInfo>,
+    timer: String,
+    context_loaded: bool,
+    info_loaded: bool,
+    separator: String,
+    nerd_font: bool,
+    show_directory: bool,
+    show_folder_icon: bool,
+    show_file: bool,
+    show_symbols: bool,
+    // Symbol-kind overrides are an open string-keyed user configuration map.
+    icon_overrides: Json,
+    enabled: bool,
+    truncate_marker: String,
+}
+
+#[red::state]
+fn initial_state() -> BarbecueState {
+    return BarbecueState {
+        windows: [],
+        symbols: [],
+        fallback_symbols: [],
+        segments: Json {},
+        rendered_windows: [],
+        info: None,
+        timer: "",
+        context_loaded: false,
+        info_loaded: false,
+        separator: "",
+        nerd_font: true,
+        show_directory: true,
+        show_folder_icon: false,
+        show_file: true,
+        show_symbols: true,
+        icon_overrides: Json {},
+        enabled: true,
+        truncate_marker: "…",
+    };
+}
+
+fn state() -> BarbecueState {
+    return red::state();
+}
+
+#[red::lifecycle("activate")]
+fn initialize_barbecue() {
+    create_bar();
+    refresh(EmptyEvent {});
+}
+
+fn create_bar() {
+    red::execute("CreateWindowBar", "barbecue", WindowBarConfig {
+        edge: "top",
+        overflow: "truncate_left",
+        priority: 100,
+        truncate_marker: red::string(state().truncate_marker, "…"),
+        style: normal_style(),
+    });
+}
+
+#[red::on("editor:ready")]
+#[red::on("editor:state_restored")]
+#[red::on("window:focused")]
+#[red::on("window:layout_changed")]
+#[red::on("window:buffer_changed")]
+#[red::on("window:closed")]
+#[red::on("file:opened")]
+fn refresh(event: EmptyEvent) {
+    if state().context_loaded && !state().enabled {
+        return;
+    }
+    if !state().context_loaded {
+        red::request("GetConfig", config_loaded);
+    }
+    red::request("GetWindows", windows_loaded);
+    if !state().info_loaded {
+        let info: BarbecueEditorInfo = red::editor_info();
+        info_loaded(info);
+    }
+}
+
+#[red::on("theme:changed")]
+fn refresh_theme(event: EmptyEvent) {
+    red::state_patch(BarbecueState { info_loaded: false });
+    refresh(EmptyEvent {});
+}
+
+#[red::on("buffer:changed")]
+fn schedule_refresh(event: EmptyEvent) {
+    let timer = red::string(state().timer, "");
+    if timer != "" {
+        red::execute("CancelTimeout", timer);
+    }
+    red::state_patch(BarbecueState { timer: red::execute("SetTimeout", 120) });
+}
+
+#[red::on("timeout:callback")]
+fn timeout_callback(event: TimerEvent) {
+    if event.timer_id == state().timer {
+        red::state_patch(BarbecueState { timer: "" });
+        refresh(EmptyEvent {});
+    }
+}
+
+fn config_loaded(event: BarbecueConfigEvent) {
+    let config = event.value;
+    red::state_patch(BarbecueState { context_loaded: true });
+    let options = config.plugin_config.barbecue;
+    if options != red::null() {
+        red::state_patch(BarbecueState { enabled: red::bool(options.enabled, true) });
+        red::state_patch(BarbecueState { truncate_marker: red::string(options.truncate_marker, "…") });
+        red::state_patch(BarbecueState { separator: red::string(options.separator, "") });
+        red::state_patch(BarbecueState { nerd_font: red::bool(options.nerd_font, true) });
+        red::state_patch(BarbecueState { show_directory: red::bool(options.show_directory, true) });
+        red::state_patch(BarbecueState { show_folder_icon: red::bool(options.show_folder_icon, false) });
+        red::state_patch(BarbecueState { show_file: red::bool(options.show_file, true) });
+        red::state_patch(BarbecueState { show_symbols: red::bool(options.show_symbols, true) });
+        if options.icons != red::null() && options.icons.overrides != red::null() {
+            red::state_patch(BarbecueState { icon_overrides: options.icons.overrides });
+        }
+    }
+    if !state().enabled {
+        red::execute("CloseWindowBar", "barbecue");
+        return;
+    }
+    create_bar();
+    render_windows();
+}
+
+fn windows_loaded(result: BarbecueWindowsResult) {
+    retain_rendered_windows(result.windows);
+    red::state_patch(BarbecueState { windows: result.windows });
+    render_windows();
+    if !state().show_symbols {
+        return;
+    }
+    let buffers: [i32] = [];
+    for window in result.windows {
+        let buffer_index = red::int(window.buffer_index, -1);
+        if buffer_index < 0 || red::string(window.buffer_path, "") == ""
+            || has_symbols_for(window) || red::contains(buffers, window.document_id) {
+            continue;
+        }
+        buffers = red::push(buffers, window.document_id);
+        red::request("DocumentSymbols", symbols_loaded, buffer_index);
+    }
+}
+
+fn info_loaded(info: BarbecueEditorInfo) {
+    red::state_patch(BarbecueState { info: Some(info) });
+    red::state_patch(BarbecueState { info_loaded: true });
+    render_windows();
+}
+
+fn symbols_loaded(result: BarbecueSymbolsResult) {
+    if !red::bool(result.ok, false) {
+        return;
+    }
+    let current = false;
+    for window in state().windows {
+        if window.document_id == result.document_id && window.revision == result.revision {
+            current = true;
+        }
+    }
+    if !current {
+        return;
+    }
+    let records: [SymbolRecord] = [];
+    let should_add = true;
+    for record in state().symbols {
+        if record.document_id != result.document_id {
+            records = red::push(records, record);
+        } else if red::int(record.revision, -1) > red::int(result.revision, -1) {
+            records = red::push(records, record);
+            should_add = false;
+        }
+    }
+    if should_add {
+        records = red::push(records, symbol_record(result));
+    }
+    red::state_patch(BarbecueState { symbols: records });
+    render_windows();
+}
+
+fn symbol_record(result: BarbecueSymbolsResult) -> SymbolRecord {
+    return SymbolRecord {
+        file: result.file,
+        document_id: result.document_id,
+        revision: result.revision,
+        symbols: result.symbols,
+    };
+}
+
+#[red::on("file:saved")]
+fn file_saved(event: FileSavedEvent) {
+    let records: [SymbolRecord] = [];
+    for record in state().symbols {
+        if record.document_id != event.document_id {
+            records = red::push(records, record);
+        }
+    }
+    red::state_patch(BarbecueState { symbols: records });
+    let fallback_records: [SymbolRecord] = [];
+    for record in state().fallback_symbols {
+        if record.document_id != event.document_id {
+            fallback_records = red::push(fallback_records, record);
+        }
+    }
+    red::state_patch(BarbecueState { fallback_symbols: fallback_records });
+    refresh(EmptyEvent {});
+}
+
+#[red::on("cursor:moved")]
+fn cursor_moved(event: CursorMovedEvent) {
+    let windows: [BarbecueWindow] = [];
+    let updated = red::null();
+    for window in state().windows {
+        if red::int(window.window_id, -1) == red::int(event.window_id, -2) {
+            window.lsp_position = Position {
+                line: red::int(event.y, 0),
+                character: red::int(event.lsp_character, red::int(event.x, 0)),
+            };
+            updated = window;
+        }
+        windows = red::push(windows, window);
+    }
+    red::state_patch(BarbecueState { windows: windows });
+    if updated != red::null() {
+        render_window(updated);
+    }
+}
+
+fn render_windows() {
+    for window in state().windows {
+        render_window(window);
+    }
+}
+
+fn render_window(window: BarbecueWindow) {
+    if should_defer_symbol_render(window) {
+        return;
+    }
+    let segments = segments_for(window);
+    let cache = state().segments;
+    let key = red::int(window.window_id, -1) + "";
+    if cache[key] == segments {
+        return;
+    }
+    cache[key] = segments;
+    red::state_patch(BarbecueState { segments: cache });
+    remember_rendered_window(window);
+    red::execute("UpdateWindowBar", "barbecue", window.window_id, segments);
+}
+
+fn should_defer_symbol_render(window: BarbecueWindow) -> bool {
+    if !state().show_symbols || has_symbols_for(window) {
+        return false;
+    }
+    for rendered in state().rendered_windows {
+        if red::int(rendered.window_id, -1) == red::int(window.window_id, -2)
+            && rendered.document_id == window.document_id {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn has_symbols_for(window: BarbecueWindow) -> bool {
+    for record in state().symbols {
+        if record.document_id == window.document_id && record.revision == window.revision {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn remember_rendered_window(window: BarbecueWindow) {
+    let rendered_windows: [RenderedWindow] = [];
+    for rendered in state().rendered_windows {
+        if red::int(rendered.window_id, -1) != red::int(window.window_id, -1) {
+            rendered_windows = red::push(rendered_windows, rendered);
+        }
+    }
+    rendered_windows = red::push(rendered_windows, RenderedWindow {
+        window_id: window.window_id,
+        document_id: window.document_id,
+    });
+    red::state_patch(BarbecueState { rendered_windows: rendered_windows });
+}
+
+fn retain_rendered_windows(windows: [BarbecueWindow]) {
+    let rendered_windows: [RenderedWindow] = [];
+    for rendered in state().rendered_windows {
+        for window in windows {
+            if red::int(rendered.window_id, -1) == red::int(window.window_id, -2) {
+                rendered_windows = red::push(rendered_windows, rendered);
+            }
+        }
+    }
+    red::state_patch(BarbecueState { rendered_windows: rendered_windows });
+}
+
+fn segments_for(window: BarbecueWindow) -> [BarSegment] {
+    let segments: [BarSegment] = [];
+    let parts = window.breadcrumb_components;
+    let file = "[No Name]";
+    if red::len(parts) > 0 {
+        file = red::string(parts[red::len(parts) - 1], "[No Name]");
+    }
+
+    if state().show_directory {
+        let index = 0;
+        for part in parts {
+            if part != "" && part != "." && index < red::len(parts) - 1 {
+                segments = add_separator(segments);
+                let text = part;
+                if state().show_folder_icon && state().nerd_font {
+                    text = " " + text;
+                }
+                segments = red::push(segments, BarSegment {
+                    id: "directory:" + index + ":" + part,
+                    text: text,
+                    style: directory_style(),
+                });
+            }
+            index = index + 1;
+        }
+    }
+    if state().show_file {
+        segments = add_separator(segments);
+        if state().nerd_font {
+            segments = red::push(segments, BarSegment {
+                id: "file-icon",
+                text: file_icon(file) + " ",
+                style: file_icon_style(file),
+            });
+        }
+        segments = red::push(segments, BarSegment {
+            id: "file",
+            text: file,
+            style: file_style(),
+        });
+    }
+    if state().show_symbols {
+        let chain = symbol_chain(window);
+        let index = 0;
+        for symbol in chain {
+            segments = add_separator(segments);
+            segments = red::push(segments, BarSegment {
+                id: "symbol:" + symbol.id,
+                text: symbol_icon(symbol.kind_name) + " " + symbol.name,
+                style: symbol_style(symbol.kind_name, index == red::len(chain) - 1),
+                action: "jump:" + window.document_id + ":" + symbol.id,
+            });
+            index = index + 1;
+        }
+    }
+    return segments;
+}
+
+fn add_separator(segments: [BarSegment]) -> [BarSegment] {
+    if red::len(segments) > 0 {
+        segments = red::push(segments, BarSegment {
+            id: "separator:" + red::len(segments),
+            text: " " + red::string(state().separator, "") + " ",
+            style: separator_style(),
+        });
+    }
+    return segments;
+}
+
+fn symbol_chain(window: BarbecueWindow) -> [BarbecueSymbol] {
+    let position = window_position(window);
+    for record in state().symbols {
+        if record.document_id == window.document_id && record.revision == window.revision {
+            let chain: [BarbecueSymbol] = red::document_symbol_chain(record.symbols, position, record.file);
+            if red::len(chain) > 0 {
+                remember_fallback_symbols(record);
+                return chain;
+            }
+            // A nonempty current outline is authoritative outside its scopes.
+            if red::len(record.symbols) > 0 {
+                return [];
+            }
+        }
+    }
+
+    for record in state().fallback_symbols {
+        if record.document_id == window.document_id {
+            return red::document_symbol_chain(record.symbols, position, record.file);
+        }
+    }
+    return [];
+}
+
+fn remember_fallback_symbols(snapshot: SymbolRecord) {
+    let records: [SymbolRecord] = [];
+    let should_add = true;
+    for record in state().fallback_symbols {
+        if record.document_id != snapshot.document_id {
+            records = red::push(records, record);
+        } else if record.revision > snapshot.revision {
+            records = red::push(records, record);
+            should_add = false;
+        }
+    }
+    if should_add {
+        records = red::push(records, snapshot);
+    }
+    red::state_patch(BarbecueState { fallback_symbols: records });
+}
+
+fn window_position(window: BarbecueWindow) -> Position {
+    if window.lsp_position != red::null() {
+        return window.lsp_position;
+    }
+    return Position {
+        line: red::int(window.cursor.y, 0),
+        character: red::int(window.cursor.x, 0),
+    };
+}
+
+fn file_icon(file: String) -> String {
+    if red::ends_with(file, ".rs") { return ""; }
+    if red::ends_with(file, ".ts") { return ""; }
+    if red::ends_with(file, ".tsx") { return ""; }
+    if red::ends_with(file, ".js") || red::ends_with(file, ".cjs") { return ""; }
+    if red::ends_with(file, ".json") { return ""; }
+    if red::ends_with(file, ".lua") { return ""; }
+    if red::ends_with(file, ".md") { return ""; }
+    if red::ends_with(file, ".toml") { return ""; }
+    return "";
+}
+
+fn file_icon_style(file: String) -> BarWindowStyle {
+    let light = false;
+    if let Some(info) = state().info {
+        light = red::is_light_color(info.theme.style.bg);
+    }
+    let color = file_icon_color(file, light);
+    if color == red::null() {
+        return file_style();
+    }
+    return BarWindowStyle {
+        semantic: BarThemeStyleSpec {
+            background: ["breadcrumb.background", "editor.background"],
+        },
+        style: Style {
+            fg: color,
+            bg: red::null(),
+            bold: false,
+            italic: false,
+        },
+    };
+}
+
+fn file_icon_color(file: String, light: bool) -> Json {
+    let parts = red::split(red::lower(file), ".");
+    let extension = red::string(parts[red::len(parts) - 1], "");
+    if extension == "cjs" || extension == "js" || extension == "json" {
+        if light { return rgb(102, 102, 32); }
+        return rgb(203, 203, 65);
+    }
+    if extension == "fish" || extension == "sh" {
+        if light { return rgb(58, 68, 70); }
+        return rgb(77, 90, 94);
+    }
+    if extension == "jsx" {
+        if light { return rgb(21, 129, 151); }
+        return rgb(32, 194, 227);
+    }
+    if extension == "lock" {
+        if light { return rgb(94, 94, 94); }
+        return rgb(187, 187, 187);
+    }
+    if extension == "lua" {
+        if light { return rgb(54, 107, 138); }
+        return rgb(81, 160, 207);
+    }
+    if extension == "md" || extension == "markdown" {
+        if light { return rgb(74, 74, 74); }
+        return rgb(221, 221, 221);
+    }
+    if extension == "mjs" {
+        if light { return rgb(80, 75, 30); }
+        return rgb(241, 224, 90);
+    }
+    if extension == "rs" {
+        if light { return rgb(111, 82, 66); }
+        return rgb(222, 165, 132);
+    }
+    if extension == "toml" {
+        if light { return rgb(117, 50, 25); }
+        return rgb(156, 66, 33);
+    }
+    if extension == "ts" {
+        if light { return rgb(54, 103, 124); }
+        return rgb(81, 154, 186);
+    }
+    if extension == "tsx" {
+        return rgb(19, 84, 191);
+    }
+    if extension == "zsh" {
+        if light { return rgb(68, 112, 40); }
+        return rgb(137, 224, 81);
+    }
+    return red::null();
+}
+
+fn rgb(red: i32, green: i32, blue: i32) -> Json {
+    return Color { Rgb: Json { r: red, g: green, b: blue } };
+}
+
+fn symbol_icon(kind: String) -> String {
+    let override = red::string(state().icon_overrides[red::lower(kind)], "");
+    if override != "" { return override; }
+    if kind == "Array" { return ""; }
+    if kind == "Boolean" { return "󰨙"; }
+    if kind == "Function" || kind == "Method" { return "󰊕"; }
+    if kind == "Class" { return ""; }
+    if kind == "Constant" { return "󰏿"; }
+    if kind == "Constructor" { return ""; }
+    if kind == "Event" { return ""; }
+    if kind == "Field" || kind == "Property" { return ""; }
+    if kind == "File" { return ""; }
+    if kind == "Key" { return ""; }
+    if kind == "Module" || kind == "Package" { return ""; }
+    if kind == "Namespace" { return "󰦮"; }
+    if kind == "Number" { return "󰎠"; }
+    if kind == "Object" { return ""; }
+    if kind == "Operator" { return ""; }
+    if kind == "String" { return ""; }
+    if kind == "Variable" { return "󰀫"; }
+    if kind == "Struct" { return "󰆼"; }
+    if kind == "Enum" || kind == "EnumMember" { return ""; }
+    if kind == "Interface" { return ""; }
+    if kind == "TypeParameter" { return ""; }
+    return "";
+}
+
+fn normal_style() -> BarWindowStyle {
+    return BarWindowStyle { semantic: BarThemeStyleSpec {
+        foreground: ["breadcrumb.foreground", "editor.foreground"],
+        background: ["breadcrumb.background", "editor.background"],
+    }};
+}
+fn separator_style() -> BarWindowStyle {
+    return BarWindowStyle { semantic: BarThemeStyleSpec {
+        foreground: ["breadcrumb.foreground", "descriptionForeground", "editor.foreground"],
+        background: ["breadcrumb.background", "editor.background"],
+    }};
+}
+fn directory_style() -> BarWindowStyle {
+    return BarWindowStyle { semantic: BarThemeStyleSpec {
+        foreground: ["symbolIcon.folderForeground", "breadcrumb.foreground", "editor.foreground"],
+        background: ["breadcrumb.background", "editor.background"],
+    }};
+}
+fn file_style() -> BarWindowStyle {
+    return BarWindowStyle { semantic: BarThemeStyleSpec {
+        foreground: ["symbolIcon.fileForeground", "breadcrumb.foreground", "editor.foreground"],
+        background: ["breadcrumb.background", "editor.background"],
+    }};
+}
+fn symbol_style(kind: String, current: bool) -> BarWindowStyle {
+    if !current {
+        return BarWindowStyle { semantic: BarThemeStyleSpec {
+            foreground: [kind_theme_key(kind), "breadcrumb.foreground", "editor.foreground"],
+            background: ["breadcrumb.background", "editor.background"],
+        }};
+    }
+    return BarWindowStyle { semantic: BarThemeStyleSpec {
+        foreground: ["breadcrumb.focusForeground", "breadcrumb.activeSelectionForeground", "list.activeSelectionForeground", "editor.foreground"],
+        background: ["breadcrumb.background", "editor.background"],
+        bold: true,
+    }};
+}
+
+fn kind_theme_key(kind: String) -> String {
+    if kind == "Function" { return "symbolIcon.functionForeground"; }
+    if kind == "Method" { return "symbolIcon.methodForeground"; }
+    if kind == "Class" { return "symbolIcon.classForeground"; }
+    if kind == "Variable" { return "symbolIcon.variableForeground"; }
+    if kind == "Struct" { return "symbolIcon.structForeground"; }
+    if kind == "Enum" { return "symbolIcon.enumeratorForeground"; }
+    if kind == "Interface" { return "symbolIcon.interfaceForeground"; }
+    return "breadcrumb.foreground";
+}
+
+#[red::on("window_bar:action:barbecue")]
+fn bar_action(event: WindowBarActionEvent) {
+    let action = red::string(event.action, "");
+    if !red::starts_with(action, "jump:") {
+        return;
+    }
+    let parts = red::split(action, ":");
+    let document_id = red::int(parts[1], -1);
+    // Symbol IDs themselves contain colons; preserve the complete suffix.
+    let prefix = "jump:" + document_id + ":";
+    let symbol_id = red::slice(action, red::len(prefix));
+    for record in state().symbols {
+        if record.document_id != document_id {
+            continue;
+        }
+        for symbol in record.symbols {
+            if symbol.id == symbol_id {
+                red::execute("OpenLocation", Location {
+                    path: symbol.file,
+                    line: symbol.selection_range.start.line,
+                    column: symbol.selection_range.start.character,
+                    column_encoding: "utf-16",
+                });
+                return;
+            }
+        }
+    }
+}
+
+#[red::lifecycle("deactivate")]
+fn deactivate() {
+    let timer = red::string(state().timer, "");
+    if timer != "" {
+        red::execute("CancelTimeout", timer);
+    }
+    red::state_patch(BarbecueState { timer: "" });
+    red::execute("CloseWindowBar", "barbecue");
+}

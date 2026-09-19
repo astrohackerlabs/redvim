@@ -1,0 +1,41 @@
+theme = "themes/nightfox.json"
+
+[lsp]
+enabled = true
+
+[lsp.servers.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+language_id = "typescript"
+file_extensions = ["ts", "tsx"]
+root_markers = ["package.json", ".git"]
+
+[keys.normal]
+"o" = "InsertLineBelowCursor"
+"O" = "InsertLineAtCursor"
+"q" = "Quit"
+"G" = "MoveToBottom"
+"g" = { "g" = "MoveToTop" }
+"u" = "Undo"
+"Ctrl-r" = "Redo"
+"p" = [ "MoveUp", "MoveRight" ]
+"Down" = "MoveDown"
+"Left" = "MoveLeft"
+"Right" = "MoveRight"
+"Up" = "MoveUp"
+"k" = "MoveUp"
+"j" = "MoveDown"
+"h" = "MoveLeft"
+"l" = "MoveRight"
+"0" = "MoveToLineStart"
+"Home" = "MoveToLineStart"
+"$" = "MoveToLineEnd"
+"End" = "MoveToLineEnd"
+"Ctrl-b" = "PageUp"
+"Ctrl-f" = "PageDown"
+"x" = "DeleteCharAtCursorPos"
+"d" = { "d" = "DeleteCurrentLine" }
+"z" = { "z" = "MoveLineToViewportCenter" }
+
+[keys.normal.i]
+EnterMode = "Normal"

@@ -1,0 +1,396 @@
+// Compact LSP progress overlay with grouped tokens and bounded animation timers.
+//
+// Progress tokens are scoped by server identity, terminal resizes recompute placement,
+// and completion schedules removal rather than blocking the editor. Deactivation cancels
+// animation and completion timers before removing the overlay.
+
+struct FidgetUiStyle {
+    popup_title: Style,
+    muted: Style,
+}
+
+struct FidgetTheme {
+    ui_style: FidgetUiStyle,
+}
+
+struct FidgetEditorInfo {
+    size: [i32],
+    theme: FidgetTheme,
+}
+
+struct FidgetProgressClient {
+    name: String,
+    workspace_root: Option<String>,
+}
+
+struct FidgetProgressDetails {
+    title: Option<String>,
+    message: Option<String>,
+    percentage: Option<f64>,
+}
+
+enum FidgetProgressValue {
+    Begin(FidgetProgressDetails),
+    Report(FidgetProgressDetails),
+    End(FidgetProgressDetails),
+    // The LSP progress protocol may gain additional work-done variants.
+    Unknown(Json),
+}
+
+struct LspProgressEvent {
+    value: FidgetProgressValue,
+    kind: Option<String>,
+    // LSP progress tokens are an intentionally untagged string-or-number union.
+    token: Json,
+    lsp_client: Option<FidgetProgressClient>,
+    message: Option<String>,
+    percentage: Option<f64>,
+    title: Option<String>,
+}
+
+struct FidgetItem {
+    token: String,
+    group: String,
+    message: String,
+    title: String,
+    done: bool,
+}
+
+struct DoneTimer {
+    id: String,
+    group: String,
+    token: String,
+}
+
+struct FidgetState {
+    info: Option<FidgetEditorInfo>,
+    items: [FidgetItem],
+    done_timers: [DoneTimer],
+    animation: String,
+    frame: i32,
+}
+
+#[red::state]
+fn initial_state() -> FidgetState {
+    return FidgetState {
+        info: None,
+        items: [],
+        done_timers: [],
+        animation: "",
+        frame: 0,
+    };
+}
+
+fn state() -> FidgetState {
+    return red::state();
+}
+
+#[red::lifecycle("activate")]
+fn initialize_fidget() {
+    red::request("GetEditorInfo", info_loaded);
+}
+
+fn info_loaded(info: FidgetEditorInfo) {
+    red::state_patch(FidgetState { info: Some(info) });
+    red::execute("CreateOverlay", "fidget-progress", OverlayConfig {
+        align: "bottom",
+        x_padding: 1,
+        y_padding: 0,
+        relative: "editor",
+        max_width: 60,
+        overflow: "truncate_left",
+        truncate_marker: "…",
+    });
+    refresh();
+}
+
+#[red::on("editor:resize")]
+fn resized(size: [i32]) {
+    let Some(info) = state().info else {
+        return;
+    };
+    info.size = size;
+    red::state_patch(FidgetState { info: Some(info) });
+    refresh();
+}
+
+#[red::on("lsp:progress")]
+fn progress(event: LspProgressEvent) {
+    let kind = "";
+    let details = FidgetProgressDetails {
+        title: None,
+        message: None,
+        percentage: None,
+    };
+    match event.value {
+        FidgetProgressValue::Begin(value) => {
+            kind = "begin";
+            details = value;
+        }
+        FidgetProgressValue::Report(value) => {
+            kind = "report";
+            details = value;
+        }
+        FidgetProgressValue::End(value) => {
+            kind = "end";
+            details = value;
+        }
+        FidgetProgressValue::Unknown(value) => {
+            return;
+        }
+    }
+    if let Some(override_kind) = event.kind {
+        kind = override_kind;
+    }
+    if event.token == red::null() || (kind != "begin" && kind != "report" && kind != "end") {
+        return;
+    }
+    let token = red::string(event.token, "");
+    if token == "" {
+        token = "" + red::int(event.token, -1);
+    }
+    let group = "LSP";
+    if let Some(client) = event.lsp_client {
+        if client.name != "" {
+            group = client.name;
+        }
+    }
+    if group == "rust_analyzer" {
+        group = "rust-analyzer";
+    }
+    let message = optional_text(event.message, optional_text(details.message, ""));
+    if message == "" {
+        if kind == "end" {
+            message = "Completed";
+        } else {
+            message = "In progress...";
+        }
+    }
+    let percentage = details.percentage;
+    if let Some(override_percentage) = event.percentage {
+        percentage = Some(override_percentage);
+    }
+    if kind != "end" {
+        if let Some(value) = percentage {
+            message = message + " (" + red::int(value, 0) + "%)";
+        }
+    }
+    let title = optional_text(event.title, optional_text(details.title, ""));
+    let items: [FidgetItem] = [];
+    let found = false;
+    for item in state().items {
+        if item.token == token && item.group == group {
+            item.message = message;
+            if title != "" {
+                item.title = title;
+            }
+            item.done = kind == "end";
+            found = true;
+        }
+        items = red::push(items, item);
+    }
+    if !found {
+        // Refresh groups progress items quadratically; retain a small, useful ceiling.
+        if red::len(items) < 32 {
+            items = red::push(items, FidgetItem {
+                token: token,
+                group: group,
+                message: message,
+                title: title,
+                done: kind == "end",
+            });
+            found = true;
+        }
+    }
+    red::state_patch(FidgetState { items: items });
+    if !found {
+        return;
+    }
+    if kind == "end" {
+        schedule_done(group, token);
+        if !has_active() {
+            cancel_animation();
+        }
+    } else {
+        clear_done_timer(group, token);
+        start_animation();
+    }
+    refresh();
+}
+
+fn schedule_done(group: String, token: String) {
+    clear_done_timer(group, token);
+    let timer = red::execute("SetTimeout", 3000);
+    let timers = red::push(state().done_timers, DoneTimer {
+        id: timer,
+        group: group,
+        token: token,
+    });
+    red::state_patch(FidgetState { done_timers: timers });
+}
+
+fn clear_done_timer(group: String, token: String) {
+    let timers: [DoneTimer] = [];
+    for timer in state().done_timers {
+        if timer.group != group || timer.token != token {
+            timers = red::push(timers, timer);
+        } else {
+            let timer_id = red::string(timer.id, "");
+            if timer_id != "" {
+                red::execute("CancelTimeout", timer_id);
+            }
+        }
+    }
+    red::state_patch(FidgetState { done_timers: timers });
+}
+
+fn cancel_animation() {
+    let animation = red::string(state().animation, "");
+    if animation != "" {
+        red::execute("CancelTimeout", animation);
+    }
+    red::state_patch(FidgetState { animation: "" });
+}
+
+fn start_animation() {
+    if red::string(state().animation, "") != "" || !has_active() {
+        return;
+    }
+    red::state_patch(FidgetState { animation: red::execute("SetTimeout", 100) });
+}
+
+#[red::on("timeout:callback")]
+fn timeout_callback(event: TimerEvent) {
+    if event.timer_id == state().animation {
+        red::state_patch(FidgetState { animation: "" });
+        red::state_patch(FidgetState { frame: red::int(state().frame, 0) + 1 });
+        refresh();
+        start_animation();
+        return;
+    }
+    let timers: [DoneTimer] = [];
+    for timer in state().done_timers {
+        if timer.id == event.timer_id {
+            remove_item(timer.group, timer.token);
+        } else {
+            timers = red::push(timers, timer);
+        }
+    }
+    red::state_patch(FidgetState { done_timers: timers });
+    refresh();
+}
+
+fn remove_item(group: String, token: String) {
+    let items: [FidgetItem] = [];
+    for item in state().items {
+        if item.group != group || item.token != token {
+            items = red::push(items, item);
+        }
+    }
+    red::state_patch(FidgetState { items: items });
+}
+
+fn has_active() -> bool {
+    for item in state().items {
+        if !red::bool(item.done, false) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn spinner() -> String {
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    return red::string(frames[red::int(state().frame, 0) % 10], "⠋");
+}
+
+fn refresh() {
+    let groups: [String] = [];
+    for item in state().items {
+        if !red::contains(groups, item.group) {
+            groups = red::push(groups, item.group);
+        }
+    }
+    let lines: [(String, Style)] = [];
+    for group in groups {
+        if red::len(lines) > 0 {
+            lines = red::push(lines, ("--", message_style()));
+        }
+        let icon = "✔";
+        if group_active(group) {
+            icon = spinner();
+        }
+        lines = red::push(lines, (group + " " + icon, header_style()));
+        let count = 0;
+        for item in state().items {
+            if item.group == group && count < 16 {
+                let text = item.message;
+                if red::string(item.title, "") != "" {
+                    text = text + " " + item.title;
+                }
+                lines = red::push(lines, (text, message_style()));
+                count = count + 1;
+            }
+        }
+    }
+    let rendered: [(String, Style)] = [];
+    for line in red::reverse(lines) {
+        rendered = red::push(rendered, (red::string(line[0], ""), line[1]));
+    }
+    red::execute("UpdateOverlay", "fidget-progress", rendered);
+}
+
+fn group_active(group: String) -> bool {
+    for item in state().items {
+        if item.group == group && !red::bool(item.done, false) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn optional_text(value: Option<String>, fallback: String) -> String {
+    if let Some(text) = value {
+        return text;
+    }
+    return fallback;
+}
+
+fn header_style() -> Style {
+    let Some(info) = state().info else {
+        return Style { fg: red::null(), bg: red::null(), bold: false, italic: false };
+    };
+    let style = info.theme.ui_style.popup_title;
+    if style == red::null() {
+        return Style { fg: red::null(), bg: red::null(), bold: false, italic: false };
+    }
+    style.bg = red::null();
+    return style;
+}
+
+fn message_style() -> Style {
+    let Some(info) = state().info else {
+        return Style { fg: red::null(), bg: red::null(), bold: false, italic: false };
+    };
+    let style = info.theme.ui_style.muted;
+    if style == red::null() {
+        return Style { fg: red::null(), bg: red::null(), bold: false, italic: false };
+    }
+    style.bg = red::null();
+    return style;
+}
+
+#[red::lifecycle("deactivate")]
+fn deactivate() {
+    cancel_animation();
+    for timer in state().done_timers {
+        let timer_id = red::string(timer.id, "");
+        if timer_id != "" {
+            red::execute("CancelTimeout", timer_id);
+        }
+    }
+    red::state_patch(FidgetState { items: [] });
+    red::state_patch(FidgetState { animation: "" });
+    red::state_patch(FidgetState { done_timers: [] });
+    red::execute("RemoveOverlay", "fidget-progress");
+}

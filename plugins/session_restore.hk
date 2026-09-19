@@ -1,0 +1,135 @@
+// Thin Husk lifecycle adapter for core-owned crash recovery and editor-state restore.
+//
+// Rust owns durable snapshots and safety checks. This plugin only decides whether startup
+// context should offer restoration and forwards accepted state through the host request
+// boundary. `before_exit` stores presentation-compatible state but does not write dirty
+// buffers to their backing files.
+
+struct IntegerConfigValue {
+    value: i32,
+}
+
+struct StringConfigValue {
+    value: String,
+}
+
+struct BooleanConfigValue {
+    value: bool,
+}
+
+struct SessionBuffer {
+    path: String,
+    dirty: bool,
+}
+
+struct SessionSnapshot {
+    version: i32,
+    cwd: String,
+    buffers: [SessionBuffer],
+    panels: Option<Json>,
+}
+
+struct StoredSessionSnapshot {
+    value: SessionSnapshot,
+}
+
+struct SkippedFile {
+    path: String,
+    reason: String,
+}
+
+struct RestoreResult {
+    restored: bool,
+    warnings: [String],
+    skipped_files: [SkippedFile],
+}
+
+struct SessionRestoreState {
+    snapshot: Option<SessionSnapshot>,
+}
+
+#[red::state]
+fn initial_state() -> SessionRestoreState {
+    return SessionRestoreState { snapshot: None };
+}
+
+fn state() -> SessionRestoreState {
+    return red::state();
+}
+
+#[red::on("editor:ready")]
+fn ready(event: EmptyEvent) {
+    red::request("GetConfig", startup_resume_loaded, "startup_session_resumed");
+}
+
+fn startup_resume_loaded(event: BooleanConfigValue) {
+    if red::bool(event.value, false) {
+        return;
+    }
+    red::request("GetConfig", startup_count_loaded, "startup_file_count");
+}
+
+fn startup_count_loaded(event: IntegerConfigValue) {
+    if red::int(event.value, 0) > 0 {
+        return;
+    }
+    red::request("GetStorage", snapshot_loaded, "latest");
+}
+
+fn snapshot_loaded(event: StoredSessionSnapshot) {
+    let snapshot = event.value;
+    if snapshot == red::null() {
+        return;
+    }
+    let version = red::int(snapshot.version, 0);
+    if version != 1 && version != 2 {
+        return;
+    }
+    if version == 1 {
+        snapshot.panels = Some(Json { panels: [], focused: red::null() });
+    }
+    red::state_patch(SessionRestoreState { snapshot: Some(snapshot) });
+    red::request("GetConfig", cwd_loaded, "cwd");
+}
+
+fn cwd_loaded(event: StringConfigValue) {
+    let Some(snapshot) = state().snapshot else {
+        return;
+    };
+    let saved_cwd = red::string(snapshot.cwd, "");
+    let current_cwd = red::string(event.value, "");
+    if saved_cwd != "" && current_cwd != "" && saved_cwd != current_cwd {
+        red::log("Session restore skipped: saved cwd differs from current cwd");
+        return;
+    }
+    red::request("RestoreEditorState", restore_finished, snapshot);
+}
+
+fn restore_finished(result: RestoreResult) {
+    if !red::bool(result.restored, false) {
+        red::log("Session restore did not restore files", result.warnings);
+    }
+    for skipped in result.skipped_files {
+        red::log("Session restore skipped file", skipped.path, skipped.reason);
+    }
+}
+
+#[red::lifecycle("before_exit")]
+pub fn before_exit(snapshot: SessionSnapshot) {
+    if snapshot == red::null() {
+        return;
+    }
+    let buffers: [SessionBuffer] = [];
+    for buffer in snapshot.buffers {
+        if red::string(buffer.path, "") != "" && !red::bool(buffer.dirty, false) {
+            buffers = red::push(buffers, buffer);
+        }
+    }
+    snapshot.buffers = buffers;
+    red::execute("SetStorage", "latest", snapshot);
+}
+
+#[red::lifecycle("deactivate")]
+fn deactivate() {
+    red::state_patch(SessionRestoreState { snapshot: None });
+}

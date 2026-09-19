@@ -1,0 +1,2725 @@
+mod common;
+
+use common::EditorHarness;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use red::{
+    buffer::Buffer,
+    color::Color,
+    config::{Config, KeyAction},
+    editor::{Action, Editor, Mode, SearchDirection},
+    notification::Severity,
+    theme::Style,
+};
+use std::collections::HashMap;
+
+async fn type_normal_keys(harness: &mut EditorHarness, keys: &str) {
+    for key in keys.chars() {
+        harness
+            .execute_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(key),
+                KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+    }
+}
+
+fn default_key_config() -> Config {
+    toml::from_str(include_str!("../default_config.toml")).unwrap()
+}
+
+fn wrapped_long_line_content(line_count: usize) -> String {
+    (1..=line_count)
+        .map(|line| {
+            format!(
+                "Line {line:02} {}",
+                "this is a long wrapped markdown-style paragraph ".repeat(8)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn wrapped_long_line_harness(line_count: usize) -> EditorHarness {
+    let buffer = Buffer::new(None, wrapped_long_line_content(line_count));
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    EditorHarness::with_config_and_size(buffer, config, 48, 12)
+}
+
+#[tokio::test]
+async fn vim_parity_default_big_word_motion_treats_punctuation_as_part_of_a_word() {
+    for (contents, keys, expected_x) in [("foo.bar baz", "W", 8), ("foo.bar baz qux", "2W", 12)] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(contents);
+        harness.assert_cursor_at(expected_x, 0);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_paragraph_motions_land_on_empty_lines_and_honor_counts() {
+    for (contents, keys, expected_x, expected_y) in [
+        ("alpha\n\nbeta\n\n\ngamma", "}", 0, 1),
+        ("alpha\n\nbeta\n\n\ngamma", "2}", 0, 3),
+        ("alpha\n\nbeta\n\n\ngamma", "3}", 4, 5),
+        ("alpha\n\nbeta\n\n\ngamma", "j}", 0, 3),
+        ("alpha\n\nbeta\n\n\ngamma", "G{", 0, 4),
+        ("alpha\n\nbeta\n\n\ngamma", "G2{", 0, 1),
+        ("alpha\n   \nbeta\n\ngamma", "}", 0, 3),
+        ("alpha\nbeta", "}", 3, 1),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(contents);
+        harness.assert_cursor_at(expected_x, expected_y);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_sentence_motions_handle_closers_paragraphs_and_unicode() {
+    for (contents, keys, expected_x, expected_y) in [
+        ("One.  Two! Three? End", ")", 6, 0),
+        ("One.  Two! Three? End", "2)", 11, 0),
+        ("One.  Two! Three? End", "3)", 18, 0),
+        ("One.  Two! Three? End", "4)", 20, 0),
+        ("One.  Two! Three? End", "2)(", 6, 0),
+        ("One.)\"  Two! [Next]? End", ")", 8, 0),
+        ("One.)\"  Two! [Next]? End", "2)", 13, 0),
+        ("One.\nTwo\ncontinued!\n\nNext?\nFinal", "2)", 0, 3),
+        ("One.\nTwo\ncontinued!\n\nNext?\nFinal", "3)", 0, 4),
+        ("Olá! 👨‍👩‍👧 e\u{301}lan. Fim", ")", 5, 0),
+        ("Olá! 👨‍👩‍👧 e\u{301}lan. Fim", "2)", 13, 0),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(contents);
+        assert_eq!(
+            harness.cursor_position(),
+            (expected_x, expected_y),
+            "sentence keys {keys:?} on {contents:?}"
+        );
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn paragraph_and_sentence_motions_are_visual_and_jump_aware() {
+    for (contents, keys, expected_x, expected_y) in [
+        ("alpha\n\nbeta", "v}", 0, 1),
+        ("One. Two! Last", "v)", 5, 0),
+        ("One. Two! Last", "v2)", 10, 0),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_cursor_at(expected_x, expected_y);
+        harness.assert_mode(Mode::Visual);
+    }
+
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "alpha\n\nbeta".to_string()),
+        default_key_config(),
+    );
+    type_normal_keys(&mut harness, "}").await;
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn vim_parity_screen_motions_target_the_visible_top_middle_and_bottom() {
+    for (keys, expected_y) in [("jjH", 0), ("M", 2), ("L", 4)] {
+        let contents = "one\ntwo\nthree\nfour\nfive";
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(None, contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(contents);
+        harness.assert_cursor_at(0, expected_y);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn vim_parity_screen_motions_respect_a_scrolled_viewport_and_counts() {
+    let contents = (0..40)
+        .map(|line| format!("  line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for (keys, expected_line) in [("H", 16), ("2H", 17), ("M", 19), ("L", 23), ("2L", 22)] {
+        let mut harness = EditorHarness::with_config_and_size(
+            Buffer::new(None, contents.clone()),
+            default_key_config(),
+            80,
+            10,
+        );
+        harness
+            .execute_action(Action::SetCursor(0, 20))
+            .await
+            .unwrap();
+        type_normal_keys(&mut harness, "zz").await;
+        assert_eq!(harness.viewport_top(), 16);
+
+        type_normal_keys(&mut harness, keys).await;
+
+        harness.assert_buffer_contents(&contents);
+        harness.assert_cursor_at(2, expected_line);
+        harness.assert_mode(Mode::Normal);
+    }
+}
+
+#[tokio::test]
+async fn test_basic_cursor_movement() {
+    let mut harness = EditorHarness::with_content("Hello, World!\nThis is a test\nThird line");
+
+    // Initial position
+    harness.assert_cursor_at(0, 0);
+
+    // Move right (l)
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness.assert_cursor_at(1, 0);
+
+    // Move down (j)
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_cursor_at(1, 1);
+
+    // Move left (h)
+    harness.execute_action(Action::MoveLeft).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+
+    // Move up (k)
+    harness.execute_action(Action::MoveUp).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn visual_modes_inherit_move_to_bottom() {
+    for mode in [Mode::Visual, Mode::VisualLine, Mode::VisualBlock] {
+        let buffer = Buffer::new(None, "one\ntwo\nthree\n".to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        harness
+            .execute_action(Action::EnterMode(mode))
+            .await
+            .unwrap();
+
+        type_normal_keys(&mut harness, "G").await;
+
+        harness.assert_cursor_at(0, 2);
+        assert_eq!(harness.selection(), Some((0, 0, 0, 2)));
+    }
+}
+
+#[tokio::test]
+async fn visual_mode_inherits_nested_normal_motions() {
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut config = default_key_config();
+    config.keys.visual.insert(
+        "g".to_string(),
+        KeyAction::Nested(HashMap::from([(
+            "%".to_string(),
+            KeyAction::Single(Action::MatchitBackward),
+        )])),
+    );
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "gg").await;
+
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.selection(), Some((0, 0, 0, 2)));
+}
+
+#[tokio::test]
+async fn inherited_word_motion_extends_visual_selection() {
+    let buffer = Buffer::new(None, "one two three".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "w").await;
+
+    harness.assert_cursor_at(4, 0);
+    assert_eq!(harness.selection(), Some((0, 0, 4, 0)));
+}
+
+#[tokio::test]
+async fn visual_mode_inherits_normal_motion_counts() {
+    let content = (0..10)
+        .map(|line| format!("line-{line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "3j").await;
+
+    harness.assert_cursor_at(0, 3);
+    assert_eq!(harness.selection(), Some((0, 0, 0, 3)));
+}
+
+#[tokio::test]
+async fn inherited_page_motion_extends_visual_selection() {
+    let content = (0..50)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config_and_size(buffer, default_key_config(), 80, 10);
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(0, 8);
+    assert_eq!(harness.selection(), Some((0, 0, 0, 8)));
+}
+
+#[tokio::test]
+async fn inherited_screen_line_motion_extends_visual_selection() {
+    let buffer = Buffer::new(None, "abcdefghijklmnopqrstuvwxyz".to_string());
+    let mut config = default_key_config();
+    config.wrap = Some(true);
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 12, 5);
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "gj").await;
+
+    let (x, y) = harness.cursor_position();
+    assert_eq!(y, 0);
+    assert!(x > 0, "screen-line motion should advance on a wrapped line");
+    assert_eq!(harness.selection(), Some((0, 0, x, 0)));
+}
+
+#[tokio::test]
+async fn visual_keymaps_override_inherited_motions_by_mode() {
+    let mut config = default_key_config();
+    config
+        .keys
+        .normal
+        .insert("Q".to_string(), KeyAction::Single(Action::MoveToBottom));
+    config
+        .keys
+        .visual
+        .insert("Q".to_string(), KeyAction::Single(Action::MoveToTop));
+    config
+        .keys
+        .visual_block
+        .insert("Q".to_string(), KeyAction::Single(Action::MoveToBottom));
+
+    let buffer = Buffer::new(None, "one\ntwo\nthree".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "Q").await;
+    harness.assert_cursor_at(0, 0);
+
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::VisualBlock))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "Q").await;
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn visual_mode_does_not_inherit_non_motion_bindings() {
+    let mut config = default_key_config();
+    config.keys.normal.insert(
+        "Q".to_string(),
+        KeyAction::Single(Action::DeleteCharAtCursorPos),
+    );
+    let buffer = Buffer::new(None, "one".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness
+        .execute_action(Action::EnterMode(Mode::Visual))
+        .await
+        .unwrap();
+
+    type_normal_keys(&mut harness, "Q").await;
+
+    harness.assert_buffer_contents("one");
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.selection(), Some((0, 0, 0, 0)));
+}
+
+#[tokio::test]
+async fn test_line_movement() {
+    let mut harness = EditorHarness::with_content("Hello, World!");
+
+    // Move to end of line ($)
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness.assert_cursor_at(12, 0); // "Hello, World!" is 13 chars, cursor on '!'
+
+    // Move to start of line (0)
+    harness
+        .execute_action(Action::MoveToLineStart)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn test_wrap_renders_long_line_across_screen_rows() {
+    let buffer = Buffer::new(None, "abcdefghijklmnop".to_string());
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+    let first_row = harness.render_row(0).unwrap();
+    let second_row = harness.render_row(1).unwrap();
+
+    assert_eq!(
+        first_row.chars().skip(4).take(6).collect::<String>(),
+        "abcdef"
+    );
+    assert_eq!(second_row.chars().take(4).collect::<String>(), "    ");
+    assert_eq!(
+        second_row.chars().skip(4).take(6).collect::<String>(),
+        "ghijkl"
+    );
+}
+
+#[tokio::test]
+async fn test_wrap_renders_final_line_at_viewport_bottom_when_enabled_by_default() {
+    for trailing_newline in [false, true] {
+        let ending = if trailing_newline { "\n" } else { "" };
+        let contents = format!("one\ntwo\nthree\nabcdefghijklmnop{ending}");
+        let buffer = Buffer::new(None, contents);
+        let mut harness = EditorHarness::with_config_and_size(buffer, Config::default(), 10, 6);
+        assert!(harness.wrap());
+
+        harness.execute_action(Action::MoveToBottom).await.unwrap();
+
+        let screen = (0..4)
+            .map(|row| harness.render_row(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("ghijkl"),
+            "final line should wrap below its first segment \
+             (trailing newline: {trailing_newline}): {screen:?}"
+        );
+        assert!(
+            screen.contains("mnop"),
+            "final line should remain visible through its last segment \
+             (trailing newline: {trailing_newline}): {screen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_wrap_renders_final_line_at_viewport_bottom_when_toggled_on() {
+    for trailing_newline in [false, true] {
+        let ending = if trailing_newline { "\n" } else { "" };
+        let contents = format!("one\ntwo\nthree\nabcdefghijklmnop{ending}");
+        let buffer = Buffer::new(None, contents);
+        let config = Config {
+            wrap: Some(false),
+            ..Default::default()
+        };
+        let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+        harness.execute_action(Action::MoveToBottom).await.unwrap();
+        harness.execute_action(Action::ToggleWrap).await.unwrap();
+
+        let screen = (0..4)
+            .map(|row| harness.render_row(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("ghijkl"),
+            "final line should wrap below its first segment after toggling \
+             (trailing newline: {trailing_newline}): {screen:?}"
+        );
+        assert!(
+            screen.contains("mnop"),
+            "final line should remain visible through its last segment after toggling \
+             (trailing newline: {trailing_newline}): {screen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_wrap_keeps_cursor_visible_when_final_line_exceeds_viewport_height() {
+    let contents = "one\ntwo\nthree\nabcdefghijklmnopqrstuvwxyz0123456789\n";
+    let buffer = Buffer::new(None, contents.to_string());
+    let mut harness = EditorHarness::with_config_and_size(buffer, Config::default(), 10, 6);
+
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+
+    let screen = (0..4)
+        .map(|row| harness.render_row(row).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        harness.render_cursor_position(),
+        Some((4, 0)),
+        "the first segment should remain visible: {screen:?}"
+    );
+    for (row, expected) in [(0, "abcdef"), (1, "ghijkl"), (2, "mnopqr"), (3, "stuvwx")] {
+        assert_eq!(
+            harness
+                .render_row(row)
+                .unwrap()
+                .chars()
+                .skip(4)
+                .take(6)
+                .collect::<String>(),
+            expected,
+            "final line should fill the viewport without hiding its cursor"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_nowrap_scrolls_horizontally_as_cursor_moves() {
+    let buffer = Buffer::new(None, "abcdefghijklmnopqrstuvwxyz".to_string());
+    let config = Config {
+        wrap: Some(false),
+        sidescroll: Some(1),
+        sidescrolloff: Some(0),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+    for _ in 0..12 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    assert_eq!(harness.cursor_position(), (12, 0));
+    assert_eq!(harness.viewport_left(), 7);
+    let row = harness.render_row(0).unwrap();
+    assert_eq!(row.chars().skip(4).take(6).collect::<String>(), "hijklm");
+
+    for _ in 0..10 {
+        harness.execute_action(Action::MoveLeft).await.unwrap();
+    }
+
+    assert_eq!(harness.cursor_position(), (2, 0));
+    assert_eq!(harness.viewport_left(), 2);
+}
+
+#[tokio::test]
+async fn test_screen_line_start_and_end_use_wrapped_segment() {
+    let buffer = Buffer::new(None, "abcdefghijklmnop".to_string());
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+    for _ in 0..10 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    harness
+        .execute_action(Action::MoveToScreenLineStart)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(6, 0);
+
+    harness
+        .execute_action(Action::MoveToScreenLineEnd)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(11, 0);
+}
+
+#[tokio::test]
+async fn test_wrap_uses_skipcol_for_deep_wrapped_cursor() {
+    let buffer = Buffer::new(None, "abcdefghijklmnopqrstuvwxyz0123456789".to_string());
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+    for _ in 0..24 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+
+    assert!(harness.skipcol() > 0);
+    assert_eq!(harness.viewport_left(), 0);
+    assert!(harness.render_cursor_position().is_some());
+
+    harness
+        .execute_action(Action::MoveScreenLineDown)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(30, 0);
+    assert!(harness.skipcol() > 0);
+}
+
+#[tokio::test]
+async fn test_screen_line_down_updates_rendered_cursor_without_lag() {
+    let content = format!(
+        "{}\n{}",
+        (1..=7)
+            .map(|line| format!("Line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "When this skill is invoked, the PR(s) to update may be specified explicitly, but in the common case, the PR(s) to update will be inferred from the branch / commit that the user is currently working on. "
+            .repeat(3)
+    );
+    let buffer = Buffer::new(None, content);
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 80, 20);
+
+    for _ in 0..7 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+
+    let before = harness.render_cursor_position().unwrap();
+    harness
+        .execute_action(Action::MoveScreenLineDown)
+        .await
+        .unwrap();
+    let after = harness.render_cursor_position().unwrap();
+
+    harness.assert_cursor_at(76, 7);
+    assert_eq!(after.1, before.1 + 1);
+}
+
+#[tokio::test]
+async fn test_screen_line_down_reveals_hidden_wrapped_segment() {
+    let content = format!("one\ntwo\nthree\n{}\nlast", "abcdefghijklmnop");
+    let buffer = Buffer::new(None, content);
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+    for _ in 0..3 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+    assert_eq!(harness.render_cursor_position(), Some((4, 3)));
+
+    harness
+        .execute_action(Action::MoveScreenLineDown)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(6, 3);
+    assert_eq!(harness.render_cursor_position(), Some((4, 3)));
+}
+
+#[tokio::test]
+async fn test_screen_line_up_returns_from_hidden_wrapped_segment() {
+    let content = format!("one\ntwo\nthree\n{}\nlast", "abcdefghijklmnop");
+    let buffer = Buffer::new(None, content);
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 6);
+
+    for _ in 0..3 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+    harness
+        .execute_action(Action::MoveScreenLineDown)
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::MoveScreenLineUp)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(0, 3);
+    assert_eq!(harness.render_cursor_position(), Some((4, 2)));
+}
+
+#[tokio::test]
+async fn test_screen_line_up_from_blank_line_paints_wrapped_target_segment() {
+    let content = format!(
+        "{}\n\nshort",
+        "Make use of Markdown to format the pull request professionally. ".repeat(5)
+    );
+    let buffer = Buffer::new(None, content);
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 30, 8);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+
+    harness
+        .execute_action(Action::MoveScreenLineUp)
+        .await
+        .unwrap();
+
+    let (cx, cy) = harness.cursor_position();
+    let rendered = harness.render_cursor_position().unwrap();
+
+    assert_eq!(cy, 0);
+    assert!(
+        cx > 0,
+        "screen-line up should land in the last wrapped segment"
+    );
+    assert!(
+        rendered.1 > 0,
+        "rendered cursor should be on the wrapped target segment, not the first segment"
+    );
+}
+
+#[tokio::test]
+async fn test_current_line_highlight_covers_all_visible_wrapped_segments() {
+    let buffer = Buffer::new(
+        None,
+        "Make use of Markdown to format the pull request professionally. ".repeat(3),
+    );
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 30, 8);
+    let highlight = Color::Rgb {
+        r: 12,
+        g: 34,
+        b: 56,
+    };
+    harness.editor.theme.line_highlight_style = Some(Style {
+        bg: Some(highlight),
+        ..Style::default()
+    });
+
+    for row in 0..3 {
+        assert_eq!(
+            harness.render_cell_bg(10, row).unwrap(),
+            Some(highlight),
+            "wrapped row {row} should use the current-line background"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_nowrap_screen_line_start_after_toggle_moves_to_physical_line_start() {
+    let buffer = Buffer::new(
+        None,
+        "When this skill is invoked, the PR(s) to update may be specified explicitly, but in the common case, the PR(s) to update will be inferred from the branch / commit that the user is currently working on. For ordinary Git usage, you may have to use a combination of `git branch` and `gh pr view <branch> --repo openai/codex --json number --jq '.number'` to determine the PR associated with the current branch / commit.".to_string(),
+    );
+    let config = Config {
+        wrap: Some(true),
+        sidescroll: Some(1),
+        sidescrolloff: Some(0),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 40, 8);
+
+    for _ in 0..6 {
+        harness
+            .execute_action(Action::MoveScreenLineDown)
+            .await
+            .unwrap();
+    }
+    let wrapped_cursor = harness.cursor_position().0;
+    assert!(wrapped_cursor > 0);
+
+    harness.execute_action(Action::ToggleWrap).await.unwrap();
+    assert!(!harness.wrap());
+
+    harness
+        .execute_action(Action::MoveToScreenLineStart)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.viewport_left(), 0);
+}
+
+#[tokio::test]
+async fn test_next_word_keeps_cursor_visible_on_deep_wrapped_line() {
+    let buffer = Buffer::new(
+        None,
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa".to_string(),
+    );
+    let config = Config {
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 10, 4);
+
+    for _ in 0..7 {
+        harness
+            .execute_action(Action::MoveToNextWord)
+            .await
+            .unwrap();
+    }
+
+    harness.assert_cursor_at(40, 0);
+    assert!(harness.skipcol() > 0);
+    assert!(harness.render_cursor_position().is_some());
+}
+
+#[tokio::test]
+async fn test_word_movement() {
+    let mut harness = EditorHarness::with_content("Hello world this is test");
+
+    // Move to next word (w)
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(6, 0); // Should be at 'w' of 'world'
+
+    // Move to next word again
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(12, 0); // Should be at 't' of 'this'
+
+    // Move to previous word (b)
+    harness
+        .execute_action(Action::MoveToPreviousWord)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(6, 0); // Back at 'w' of 'world'
+}
+
+#[tokio::test]
+async fn test_next_word_matches_nvim_on_delimiters() {
+    let mut harness = EditorHarness::with_content("foo:bar baz");
+
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(3, 0); // foo -> :
+
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(4, 0); // : -> bar
+}
+
+#[tokio::test]
+async fn test_next_word_from_prefix_punctuation_moves_to_keyword() {
+    let mut harness = EditorHarness::with_content("&Config::path");
+
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(1, 0); // & -> Config
+}
+
+#[tokio::test]
+async fn test_word_movement_preserves_visible_viewport() {
+    let content = (1..=20)
+        .map(|line| {
+            if line == 8 {
+                "alpha beta gamma".to_string()
+            } else {
+                format!("Line {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = EditorHarness::with_content(&content);
+    harness.execute_action(Action::GoToLine(8)).await.unwrap();
+    let viewport_top = harness.viewport_top();
+
+    harness
+        .execute_action(Action::MoveToNextWord)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(6, 7);
+    assert_eq!(harness.viewport_top(), viewport_top);
+
+    harness
+        .execute_action(Action::MoveToPreviousWord)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 7);
+    assert_eq!(harness.viewport_top(), viewport_top);
+}
+
+#[tokio::test]
+async fn test_search_word_under_cursor_moves_to_next_match() {
+    let mut harness = EditorHarness::with_content("alpha beta alpha gamma alpha");
+
+    harness
+        .execute_action(Action::SearchWordUnderCursor)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(11, 0);
+
+    harness.execute_action(Action::FindNext).await.unwrap();
+    harness.assert_cursor_at(23, 0);
+
+    harness.execute_action(Action::FindPrevious).await.unwrap();
+    harness.assert_cursor_at(11, 0);
+}
+
+#[tokio::test]
+async fn search_navigation_without_previous_search_reports_no_op() {
+    let mut harness = EditorHarness::with_content("alpha beta");
+
+    for action in [
+        Action::FindNext,
+        Action::FindPrevious,
+        Action::RepeatSearch,
+        Action::RepeatSearchOpposite,
+    ] {
+        harness.execute_action(action).await.unwrap();
+        assert!(harness.commandline_row().contains("no previous search"));
+        assert_eq!(
+            harness
+                .editor
+                .notifications()
+                .records()
+                .next_back()
+                .unwrap()
+                .severity,
+            Severity::Warning
+        );
+    }
+}
+
+#[tokio::test]
+async fn wrapped_search_reports_the_boundary_it_crossed() {
+    let mut harness = EditorHarness::with_content("alpha beta alpha");
+
+    harness.execute_action(Action::MoveTo(11, 1)).await.unwrap();
+    harness
+        .execute_action(Action::SearchWordUnderCursor)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(
+        harness.last_error(),
+        Some("search hit BOTTOM, continuing at TOP")
+    );
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
+
+    harness.execute_action(Action::FindPrevious).await.unwrap();
+
+    harness.assert_cursor_at(11, 0);
+    assert_eq!(
+        harness.last_error(),
+        Some("search hit TOP, continuing at BOTTOM")
+    );
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
+}
+
+#[tokio::test]
+async fn search_preview_moves_while_typing_and_escape_restores_origin() {
+    let mut harness = EditorHarness::with_content("start\nalpha\nmiddle\nalpha");
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "alp").await;
+
+    harness.assert_cursor_at(0, 1);
+    assert_eq!(harness.commandline_text(), "alp");
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn search_prompt_cursor_follows_active_draft() {
+    let mut harness = EditorHarness::with_content("wrap\nother");
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "wrap").await;
+
+    assert_eq!(harness.commandline_text(), "wrap");
+    assert_eq!(harness.render_cursor_position(), Some((5, 23)));
+}
+
+#[tokio::test]
+async fn search_enter_commits_preview_and_n_repeats_direction() {
+    let mut harness = EditorHarness::with_content("alpha\nbeta\nalpha\nbeta\nalpha");
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "alpha").await;
+    harness.assert_cursor_at(0, 2);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(0, 2);
+
+    harness.execute_action(Action::RepeatSearch).await.unwrap();
+    harness.assert_cursor_at(0, 4);
+
+    harness
+        .execute_action(Action::RepeatSearchOpposite)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn search_enter_without_match_exits_and_warns() {
+    let mut harness = EditorHarness::with_content("alpha\nbeta");
+    harness
+        .execute_action(Action::SetCursor(0, 1))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "missing").await;
+    harness.assert_mode(Mode::Search);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(0, 1);
+    assert!(harness
+        .commandline_row()
+        .contains("Pattern not found: missing"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
+}
+
+#[tokio::test]
+async fn failed_search_becomes_the_most_recent_search() {
+    let mut harness = EditorHarness::with_content("alpha\nbeta\nalpha");
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "alpha").await;
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 2);
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "missing").await;
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::RepeatSearch).await.unwrap();
+
+    harness.assert_cursor_at(0, 2);
+    assert!(harness
+        .commandline_row()
+        .contains("Pattern not found: missing"));
+}
+
+#[tokio::test]
+async fn invalid_search_pattern_exits_and_reports_error() {
+    let mut harness = EditorHarness::with_content("alpha\nbeta");
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "[").await;
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+
+    harness.assert_mode(Mode::Normal);
+    harness.assert_cursor_at(0, 0);
+    assert!(harness
+        .commandline_row()
+        .starts_with("invalid search pattern:"));
+}
+
+#[tokio::test]
+async fn backward_search_previews_previous_match() {
+    let mut harness = EditorHarness::with_content("alpha\nbeta\nalpha\nbeta\nalpha");
+    harness
+        .execute_action(Action::SetCursor(0, 4))
+        .await
+        .unwrap();
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Backward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "beta").await;
+
+    harness.assert_cursor_at(0, 3);
+    assert!(harness.commandline_row().starts_with("?beta"));
+}
+
+#[tokio::test]
+async fn search_mouse_scroll_is_ignored_while_prompt_is_active() {
+    let content = (0..80)
+        .map(|line| format!("Line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config(buffer, Config::default());
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    let viewport_top = harness.viewport_top();
+    let cursor = harness.cursor_position();
+
+    harness
+        .execute_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.viewport_top(), viewport_top);
+    assert_eq!(harness.cursor_position(), cursor);
+}
+
+#[tokio::test]
+async fn search_highlights_visible_matches_and_nohlsearch_clears_them() {
+    let mut harness = EditorHarness::with_content("alpha beta\nmiddle\nalpha gamma");
+
+    harness
+        .execute_action(Action::SearchWordUnderCursor)
+        .await
+        .unwrap();
+
+    let first_row = harness.render_row(0).unwrap();
+    let first_match_x = first_row.find("alpha").unwrap();
+    let non_match_x = first_row.find("beta").unwrap();
+    let default_bg = harness.render_cell_bg(non_match_x, 0).unwrap();
+    assert_ne!(
+        harness.render_cell_bg(first_match_x, 0).unwrap(),
+        default_bg
+    );
+
+    harness
+        .execute_action(Action::Command("noh".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.render_cell_bg(first_match_x, 0).unwrap(),
+        default_bg
+    );
+}
+
+#[tokio::test]
+async fn search_uses_rust_regex_and_case_options() {
+    let mut config = Config::default();
+    config.search.ignorecase = true;
+    let buffer = Buffer::new(None, "start\nFOO\nf12".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "foo").await;
+    harness.assert_cursor_at(0, 1);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, r"f\d+").await;
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn search_preview_and_highlight_handle_wide_prefix_text() {
+    let mut harness = EditorHarness::with_content("👋 alpha\nplain alpha");
+
+    harness
+        .execute_action(Action::EnterSearch(SearchDirection::Forward))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "alpha").await;
+
+    harness.assert_cursor_at(2, 0);
+    let row = harness.render_row(0).unwrap();
+    let match_x = row.find("alpha").unwrap();
+    let default_x = row.find("👋").unwrap();
+    let default_bg = harness.render_cell_bg(default_x, 0).unwrap();
+    assert_ne!(harness.render_cell_bg(match_x, 0).unwrap(), default_bg);
+}
+
+#[tokio::test]
+async fn test_search_word_under_cursor_keeps_underscore_in_keyword() {
+    let mut harness = EditorHarness::with_content("foo_bar foo bar foo_bar");
+
+    harness
+        .execute_action(Action::SearchWordUnderCursor)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(16, 0);
+}
+
+#[tokio::test]
+async fn test_search_word_under_cursor_ignores_punctuation() {
+    let mut harness = EditorHarness::with_content("alpha ! alpha");
+    harness.execute_action(Action::MoveTo(6, 0)).await.unwrap();
+
+    harness
+        .execute_action(Action::SearchWordUnderCursor)
+        .await
+        .unwrap();
+
+    harness.assert_cursor_at(6, 0);
+}
+
+#[tokio::test]
+async fn test_file_movement() {
+    let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3\nLine 4\nLine 5");
+
+    // Move to bottom of file (G)
+    // buffer.len() returns len_lines() - 1, which is 4 for 5 lines
+    // Last line index = buffer.len() = 4
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+    harness.assert_cursor_at(0, 4); // Last line is at index 4
+
+    // Move to top of file (gg)
+    harness.execute_action(Action::MoveToTop).await.unwrap();
+    harness.assert_cursor_at(0, 0); // First line
+}
+
+#[tokio::test]
+async fn counted_g_targets_an_absolute_line_and_records_the_jump() {
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour\nfive".to_string());
+    let mut harness = EditorHarness::with_config(buffer, default_key_config());
+
+    type_normal_keys(&mut harness, "3G").await;
+    harness.assert_cursor_at(0, 2);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn stationary_jump_still_leaves_a_return_destination() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree\nfour\nfive");
+
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+    harness.execute_action(Action::MoveUp).await.unwrap();
+    harness.execute_action(Action::JumpBack).await.unwrap();
+
+    harness.assert_cursor_at(0, 4);
+}
+
+#[tokio::test]
+async fn jump_back_records_current_position_for_jump_forward() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree\nfour\nfive");
+
+    harness.execute_action(Action::MoveTo(0, 3)).await.unwrap();
+    harness.assert_cursor_at(0, 2);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+
+    harness.execute_action(Action::JumpForward).await.unwrap();
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn jump_list_boundaries_report_no_op() {
+    let mut harness = EditorHarness::with_content("one\ntwo");
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    assert!(harness.commandline_row().contains("at start of jump list"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
+
+    harness.execute_action(Action::JumpForward).await.unwrap();
+    assert!(harness.commandline_row().contains("at end of jump list"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
+}
+
+#[tokio::test]
+async fn repeated_jump_back_and_forward_do_not_skip_entries() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree\nfour\nfive");
+
+    harness.execute_action(Action::MoveTo(0, 2)).await.unwrap();
+    harness.execute_action(Action::MoveTo(0, 4)).await.unwrap();
+    harness.execute_action(Action::MoveTo(0, 5)).await.unwrap();
+    harness.assert_cursor_at(0, 4);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 3);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+
+    harness.execute_action(Action::JumpForward).await.unwrap();
+    harness.assert_cursor_at(0, 3);
+
+    harness.execute_action(Action::JumpForward).await.unwrap();
+    harness.assert_cursor_at(0, 4);
+}
+
+#[tokio::test]
+async fn new_jump_from_middle_preserves_forward_entries_like_neovim_default() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree\nfour\nfive");
+
+    harness.execute_action(Action::MoveTo(0, 2)).await.unwrap();
+    harness.execute_action(Action::MoveTo(0, 4)).await.unwrap();
+    harness.assert_cursor_at(0, 3);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+
+    harness.execute_action(Action::MoveTo(0, 5)).await.unwrap();
+    harness.assert_cursor_at(0, 4);
+
+    harness.execute_action(Action::JumpForward).await.unwrap();
+    harness.assert_cursor_at(0, 4);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 3);
+}
+
+#[tokio::test]
+async fn default_normal_keys_map_ctrl_o_ctrl_i_and_tab_to_jumplist_navigation() {
+    let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+    assert_eq!(
+        config.keys.normal.get("Ctrl-i"),
+        Some(&KeyAction::Single(Action::JumpForward))
+    );
+    assert_eq!(
+        config.keys.normal.get("Tab"),
+        Some(&KeyAction::Single(Action::JumpForward))
+    );
+    let buffer = Buffer::new(None, "one\ntwo\nthree\nfour\nfive".to_string());
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    harness.execute_action(Action::MoveTo(0, 3)).await.unwrap();
+    harness.assert_cursor_at(0, 2);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 0);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('i'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 2);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::from(KeyCode::Tab)))
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn jumplist_keeps_only_the_newest_column_for_each_buffer_line() {
+    let mut harness = EditorHarness::with_content("abcdef\nsecond\nthird");
+
+    harness.execute_action(Action::MoveTo(3, 1)).await.unwrap();
+    harness.execute_action(Action::MoveTo(0, 3)).await.unwrap();
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(3, 0);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(3, 0);
+    assert!(harness.commandline_row().contains("at start of jump list"));
+}
+
+#[tokio::test]
+async fn jumplist_positions_follow_lines_inserted_before_them() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree\nfour\nfive");
+
+    harness.execute_action(Action::MoveTo(0, 3)).await.unwrap();
+    harness.execute_action(Action::MoveTo(0, 5)).await.unwrap();
+    harness.execute_action(Action::MoveTo(0, 1)).await.unwrap();
+    harness
+        .execute_action(Action::InsertLineAtCursor)
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Normal))
+        .await
+        .unwrap();
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 5);
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 3);
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+}
+
+#[tokio::test]
+async fn split_windows_copy_then_independently_traverse_their_jumplists() {
+    let mut harness = EditorHarness::with_content("one\ntwo\nthree\nfour\nfive");
+
+    harness.execute_action(Action::MoveTo(0, 2)).await.unwrap();
+    harness.execute_action(Action::MoveTo(0, 4)).await.unwrap();
+    harness.execute_action(Action::SplitVertical).await.unwrap();
+    harness.execute_action(Action::MoveTo(0, 5)).await.unwrap();
+
+    harness.execute_action(Action::NextWindow).await.unwrap();
+    harness.assert_cursor_at(0, 3);
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+
+    harness.execute_action(Action::NextWindow).await.unwrap();
+    harness.assert_cursor_at(0, 4);
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn per_window_jumplists_round_trip_through_session_recovery() {
+    let contents = "one\ntwo\nthree\nfour\nfive";
+    let mut source = EditorHarness::with_content(contents);
+
+    source.execute_action(Action::MoveTo(0, 2)).await.unwrap();
+    source.execute_action(Action::MoveTo(0, 4)).await.unwrap();
+    source.execute_action(Action::SplitVertical).await.unwrap();
+    source.execute_action(Action::MoveTo(0, 5)).await.unwrap();
+    let snapshot = source.editor.test_session_snapshot();
+
+    assert_eq!(snapshot.window_jumps.len(), 2);
+    let mut buffers = Editor::buffers_from_session_snapshot(&snapshot);
+    let mut restored = EditorHarness::with_buffer(buffers.remove(0));
+    restored.editor.restore_session_snapshot(&snapshot).unwrap();
+
+    restored.execute_action(Action::JumpBack).await.unwrap();
+    restored.assert_cursor_at(0, 0);
+    restored.execute_action(Action::NextWindow).await.unwrap();
+    restored.assert_cursor_at(0, 3);
+    restored.execute_action(Action::JumpBack).await.unwrap();
+    restored.assert_cursor_at(0, 1);
+}
+
+#[tokio::test]
+async fn previous_context_mark_round_trips_through_session_recovery() {
+    let contents = "one\ntwo\nthree\nfour\nfive";
+    let mut source = EditorHarness::with_content(contents);
+    source.execute_action(Action::MoveTo(0, 5)).await.unwrap();
+    let snapshot = source.editor.test_session_snapshot();
+
+    let mut buffers = Editor::buffers_from_session_snapshot(&snapshot);
+    let mut restored = EditorHarness::with_buffer(buffers.remove(0));
+    restored.editor.restore_session_snapshot(&snapshot).unwrap();
+    restored
+        .execute_action(Action::JumpToMark {
+            mark: '\'',
+            linewise: true,
+        })
+        .await
+        .unwrap();
+
+    restored.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn viewport_motions_record_jumps_but_page_scrolling_does_not() {
+    let contents = (1..=60)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut viewport_harness = EditorHarness::with_content(&contents);
+    for _ in 0..30 {
+        viewport_harness
+            .execute_action(Action::MoveDown)
+            .await
+            .unwrap();
+    }
+    viewport_harness
+        .execute_action(Action::MoveToViewportTop(1))
+        .await
+        .unwrap();
+    viewport_harness
+        .execute_action(Action::JumpBack)
+        .await
+        .unwrap();
+    viewport_harness.assert_cursor_at(0, 30);
+
+    let mut page_harness = EditorHarness::with_content(&contents);
+    page_harness.execute_action(Action::PageDown).await.unwrap();
+    let cursor_after_page = page_harness.cursor_position();
+    page_harness.execute_action(Action::JumpBack).await.unwrap();
+    assert_eq!(page_harness.cursor_position(), cursor_after_page);
+    assert!(page_harness
+        .commandline_row()
+        .contains("at start of jump list"));
+}
+
+#[tokio::test]
+async fn test_movement_boundaries() {
+    let mut harness = EditorHarness::with_content("abc\ndef");
+
+    // Try to move left at start of buffer
+    harness.assert_cursor_at(0, 0);
+    harness.execute_action(Action::MoveLeft).await.unwrap();
+    harness.assert_cursor_at(0, 0); // Should stay at (0, 0)
+
+    // Try to move up at start of buffer
+    harness.execute_action(Action::MoveUp).await.unwrap();
+    harness.assert_cursor_at(0, 0); // Should stay at (0, 0)
+
+    // Move to end of file
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    // MoveToBottom goes to line 1 (last line) for "abc\ndef"
+    // MoveToLineEnd on "def" puts us on the last character
+    harness.assert_cursor_at(2, 1); // On 'f' in "def"
+
+    // Try to move right at end of line
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness.assert_cursor_at(2, 1); // Should stay on 'f' in normal mode
+
+    // Try to move down at end of buffer (already at last line)
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_cursor_at(2, 1); // Should stay at line 1
+}
+
+#[tokio::test]
+async fn test_normal_cursor_clamps_when_moving_to_shorter_line() {
+    let mut harness = EditorHarness::with_content("abcdef\nxy");
+
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness.assert_cursor_at(5, 0);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    harness.assert_cursor_at(1, 1); // On 'y', not one past the line
+}
+
+#[tokio::test]
+async fn test_vertical_movement_restores_cursor_goal_after_empty_line() {
+    let mut harness = EditorHarness::with_content("abcdef\n\nabcdefghijkl");
+
+    for _ in 0..5 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    harness.assert_cursor_at(5, 0);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_cursor_at(5, 2);
+}
+
+#[tokio::test]
+async fn test_vertical_movement_restores_cursor_goal_after_short_line() {
+    let mut harness = EditorHarness::with_content("abcdef\nxy\nabcdefghijkl");
+
+    for _ in 0..5 {
+        harness.execute_action(Action::MoveRight).await.unwrap();
+    }
+    harness.assert_cursor_at(5, 0);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_cursor_at(1, 1);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_cursor_at(5, 2);
+}
+
+#[tokio::test]
+async fn test_line_end_goal_tracks_each_target_line_end() {
+    let mut harness = EditorHarness::with_content("x\na much longer line");
+
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    harness.assert_cursor_at(17, 1);
+}
+
+#[tokio::test]
+async fn test_line_end_goal_survives_shorter_intermediate_line() {
+    let mut harness =
+        EditorHarness::with_content("abcdefghijklmnop\nabcdefghijkl\nabcdefghijklmnop");
+
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness.assert_cursor_at(15, 0);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_cursor_at(11, 1);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+    harness.assert_cursor_at(15, 2);
+}
+
+#[tokio::test]
+async fn test_line_end_goal_survives_shorter_intermediate_line_from_keys() {
+    let mut config = Config {
+        scrolloff: Some(3),
+        ..Default::default()
+    };
+    config.keys.normal.extend(HashMap::from([
+        (
+            "g".to_string(),
+            KeyAction::Nested(HashMap::from([(
+                "g".to_string(),
+                KeyAction::Single(Action::MoveToTop),
+            )])),
+        ),
+        ("j".to_string(), KeyAction::Single(Action::MoveDown)),
+        ("$".to_string(), KeyAction::Single(Action::MoveToLineEnd)),
+    ]));
+    let buffer = Buffer::new(
+        None,
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nabcdefghijklmnop\nabcdefghijkl\nabcdefghijklmnop\ntail"
+            .to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    type_normal_keys(&mut harness, "gg8j$jj").await;
+
+    harness.assert_cursor_at(15, 10);
+}
+
+#[tokio::test]
+async fn test_last_line_char_resets_line_end_goal_to_display_column() {
+    let mut harness = EditorHarness::with_content("abc   \nabcdefghijkl");
+
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness
+        .execute_action(Action::MoveToLastLineChar)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(2, 0);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    harness.assert_cursor_at(2, 1);
+}
+
+#[tokio::test]
+async fn test_vertical_goal_can_render_inside_wide_grapheme() {
+    let mut harness = EditorHarness::with_content("abc\n你");
+
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness.assert_cursor_at(2, 0);
+
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    harness.assert_cursor_at(0, 1);
+    assert_eq!(harness.render_cursor_position(), Some((5, 1)));
+}
+
+#[tokio::test]
+async fn test_line_end_goal_renders_on_final_wide_grapheme_cell() {
+    let mut harness = EditorHarness::with_content("x\na你");
+
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    harness.assert_cursor_at(1, 1);
+    assert_eq!(harness.render_cursor_position(), Some((6, 1)));
+}
+
+#[tokio::test]
+async fn test_first_last_line_char_movement() {
+    let mut harness = EditorHarness::with_content("    Hello, World!    ");
+
+    // Move to first non-whitespace character (^)
+    harness
+        .execute_action(Action::MoveToFirstLineChar)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(4, 0); // Should be at 'H'
+
+    // Move to end, then to last non-whitespace character (g_)
+    harness.execute_action(Action::MoveToLineEnd).await.unwrap();
+    harness
+        .execute_action(Action::MoveToLastLineChar)
+        .await
+        .unwrap();
+    // "    Hello, World!    " - last non-whitespace is at position 16 (!)
+    harness.assert_cursor_at(16, 0); // Should be at '!' (excluding trailing spaces)
+}
+
+#[tokio::test]
+async fn test_page_movement() {
+    // Create content with many lines
+    let content = (0..50)
+        .map(|i| format!("Line {}", i))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = EditorHarness::with_content(&content);
+
+    // Page down
+    harness.execute_action(Action::PageDown).await.unwrap();
+    // Exact position depends on viewport size, but cursor should have moved down
+    let (_, y1) = harness.cursor_position();
+
+    // Page down again
+    harness.execute_action(Action::PageDown).await.unwrap();
+    let (_, y2) = harness.cursor_position();
+    assert!(y2 > y1, "Cursor should move down on PageDown");
+
+    // Page up
+    harness.execute_action(Action::PageUp).await.unwrap();
+    let (_, y3) = harness.cursor_position();
+    assert!(y3 < y2, "Cursor should move up on PageUp");
+}
+
+#[tokio::test]
+async fn test_page_movement_uses_partial_pages_at_file_edges() {
+    let content = (1..=10)
+        .map(|line| format!("Line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = EditorHarness::with_content(&content);
+    harness.editor.test_set_size(80, 7);
+
+    harness.execute_action(Action::GoToLine(8)).await.unwrap();
+    harness.execute_action(Action::PageDown).await.unwrap();
+    harness.assert_cursor_at(0, 9);
+    assert_eq!(harness.current_line(), Some("Line 10".to_string()));
+
+    harness.execute_action(Action::GoToLine(3)).await.unwrap();
+    harness.execute_action(Action::PageUp).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.current_line(), Some("Line 1\n".to_string()));
+}
+
+#[tokio::test]
+async fn test_page_render_applies_scrolloff_before_first_frame() {
+    let content = (0..20)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = Config {
+        scrolloff: Some(2),
+        ..Default::default()
+    };
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.editor.test_set_size(80, 7);
+    harness.set_viewport_cursor(1, 0, 4);
+
+    let first_row = harness.render_row(0).unwrap();
+
+    assert!(
+        first_row.contains("line-03"),
+        "first rendered frame should use the scrolloff-corrected viewport"
+    );
+    assert!(
+        !first_row.contains("line-01"),
+        "first rendered frame should not paint the stale pre-scrolloff viewport"
+    );
+}
+
+#[tokio::test]
+async fn test_ctrl_page_keys_apply_scrolloff_immediately() {
+    let content = (0..40)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut config = Config {
+        scrolloff: Some(2),
+        ..Default::default()
+    };
+    config
+        .keys
+        .normal
+        .insert("Ctrl-f".to_string(), KeyAction::Single(Action::PageDown));
+    config
+        .keys
+        .normal
+        .insert("Ctrl-b".to_string(), KeyAction::Single(Action::PageUp));
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config(buffer, config);
+    harness.editor.test_set_size(80, 7);
+
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(harness.buffer_line(), 5);
+    assert_eq!(harness.viewport_top(), 3);
+    assert_eq!(harness.buffer_line() - harness.viewport_top(), 2);
+
+    harness
+        .execute_action(Action::SetCursor(0, 12))
+        .await
+        .unwrap();
+    harness
+        .execute_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    assert_eq!(harness.buffer_line(), 7);
+    assert_eq!(harness.viewport_top(), 5);
+    assert_eq!(harness.buffer_line() - harness.viewport_top(), 2);
+}
+
+#[tokio::test]
+async fn test_goto_line() {
+    let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3\nLine 4\nLine 5");
+
+    // GoToLine appears to be 1-based like vim
+    // Go to line 3
+    harness.execute_action(Action::GoToLine(3)).await.unwrap();
+    harness.assert_cursor_at(0, 2);
+
+    // Go to line 5
+    harness.execute_action(Action::GoToLine(5)).await.unwrap();
+    harness.assert_cursor_at(0, 4);
+
+    // Go to line 1
+    harness.execute_action(Action::GoToLine(1)).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+}
+
+#[tokio::test]
+async fn test_movement_clamps_to_last_real_line_with_trailing_newline() {
+    let mut harness = EditorHarness::with_content("Line 1\nLine 2\nLine 3\n");
+
+    for _ in 0..10 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+    harness.assert_cursor_at(0, 2);
+    assert_eq!(harness.current_line(), Some("Line 3\n".to_string()));
+
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+    harness.assert_cursor_at(0, 2);
+    assert_eq!(harness.current_line(), Some("Line 3\n".to_string()));
+
+    harness.execute_action(Action::GoToLine(999)).await.unwrap();
+    harness.assert_cursor_at(0, 2);
+    assert_eq!(harness.current_line(), Some("Line 3\n".to_string()));
+
+    harness
+        .execute_action(Action::MoveTo(0, 999))
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 2);
+    assert_eq!(harness.current_line(), Some("Line 3\n".to_string()));
+
+    harness
+        .execute_action(Action::SetCursor(0, 999))
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 2);
+    assert_eq!(harness.current_line(), Some("Line 3\n".to_string()));
+}
+
+#[tokio::test]
+async fn test_scrolling_clamps_to_last_real_line() {
+    let content = (1..=8)
+        .map(|line| format!("Line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let mut harness = EditorHarness::with_content(&content);
+    harness.editor.test_set_size(80, 6);
+
+    for _ in 0..10 {
+        harness.execute_action(Action::PageDown).await.unwrap();
+    }
+    assert!(harness.buffer_line() <= 7);
+    assert_ne!(harness.current_line(), Some(String::new()));
+
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+    assert_eq!(harness.buffer_line(), 7);
+    assert_eq!(harness.current_line(), Some("Line 8\n".to_string()));
+
+    for _ in 0..10 {
+        harness.execute_action(Action::ScrollDown).await.unwrap();
+    }
+    assert_eq!(harness.buffer_line(), 7);
+    assert_eq!(harness.current_line(), Some("Line 8\n".to_string()));
+}
+
+#[tokio::test]
+async fn test_wrapped_move_to_bottom_reaches_visible_last_line() {
+    let mut harness = wrapped_long_line_harness(86);
+
+    harness.execute_action(Action::MoveToBottom).await.unwrap();
+
+    assert_eq!(harness.buffer_line(), 85);
+    assert!(harness
+        .current_line()
+        .as_deref()
+        .is_some_and(|line| line.starts_with("Line 86 ")));
+    assert!(
+        harness.render_cursor_position().is_some(),
+        "last logical line should also be visible after G"
+    );
+}
+
+#[tokio::test]
+async fn test_wrapped_go_to_last_line_reaches_visible_last_line() {
+    let mut harness = wrapped_long_line_harness(86);
+
+    harness.execute_action(Action::GoToLine(86)).await.unwrap();
+
+    assert_eq!(harness.buffer_line(), 85);
+    assert!(
+        harness.render_cursor_position().is_some(),
+        ":$ should leave the last line visible in wrapped files"
+    );
+}
+
+#[tokio::test]
+async fn test_wrapped_page_down_reaches_end_of_large_wrapped_file() {
+    let mut harness = wrapped_long_line_harness(86);
+
+    for _ in 0..20 {
+        harness.execute_action(Action::PageDown).await.unwrap();
+    }
+
+    assert_eq!(harness.buffer_line(), 85);
+    assert!(
+        harness.render_cursor_position().is_some(),
+        "Ctrl-f should not stop before the visible end of a wrapped file"
+    );
+}
+
+#[tokio::test]
+async fn test_wrapped_move_down_reaches_end_of_large_wrapped_file() {
+    let mut harness = wrapped_long_line_harness(86);
+
+    for _ in 0..160 {
+        harness.execute_action(Action::MoveDown).await.unwrap();
+    }
+
+    assert_eq!(harness.buffer_line(), 85);
+    assert!(
+        harness.render_cursor_position().is_some(),
+        "holding j should not loop before the end of a wrapped file"
+    );
+}
+
+#[tokio::test]
+async fn test_wrapped_move_down_keeps_cursor_bottom_anchored() {
+    let content = (0..30)
+        .map(|line| {
+            if matches!(line, 2 | 5) {
+                format!("Line {line} {}", "wrapped segment ".repeat(8))
+            } else {
+                format!("Line {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for scrolloff in [None, Some(2)] {
+        let buffer = Buffer::new(None, content.clone());
+        let config = Config {
+            wrap: Some(true),
+            scrolloff,
+            ..Default::default()
+        };
+        let mut harness = EditorHarness::with_config_and_size(buffer, config, 40, 12);
+        let mut previous_screen_row = harness.render_cursor_position().unwrap().1;
+
+        for _ in 0..15 {
+            harness.execute_action(Action::MoveDown).await.unwrap();
+            let screen_row = harness.render_cursor_position().unwrap().1;
+            if scrolloff.is_none() {
+                assert!(
+                    screen_row >= previous_screen_row,
+                    "wrapped j motion moved the cursor from screen row \
+                     {previous_screen_row} to {screen_row} at buffer line {} with vtop {}",
+                    harness.buffer_line(),
+                    harness.viewport_top()
+                );
+            } else if harness.viewport_top() > 0 {
+                assert_ne!(
+                    screen_row,
+                    0,
+                    "wrapped j motion snapped the cursor to the top at buffer line {} \
+                     with vtop {} and scrolloff {scrolloff:?}",
+                    harness.buffer_line(),
+                    harness.viewport_top()
+                );
+            }
+            previous_screen_row = screen_row;
+        }
+
+        assert!(harness.viewport_top() > 0);
+
+        for _ in 0..15 {
+            harness.execute_action(Action::MoveUp).await.unwrap();
+            let screen_row = harness.render_cursor_position().unwrap().1;
+            if scrolloff.is_none() {
+                assert!(
+                    screen_row <= previous_screen_row,
+                    "wrapped k motion moved the cursor from screen row \
+                     {previous_screen_row} to {screen_row} at buffer line {} with vtop {}",
+                    harness.buffer_line(),
+                    harness.viewport_top()
+                );
+            }
+            previous_screen_row = screen_row;
+        }
+
+        assert_eq!(harness.buffer_line(), 0);
+        assert_eq!(harness.viewport_top(), 0);
+    }
+}
+
+#[tokio::test]
+async fn test_movement_preserves_mode() {
+    let mut harness = EditorHarness::with_content("Hello\nWorld");
+
+    // Verify we start in normal mode
+    harness.assert_mode(red::editor::Mode::Normal);
+
+    // Move around
+    harness.execute_action(Action::MoveRight).await.unwrap();
+    harness.execute_action(Action::MoveDown).await.unwrap();
+
+    // Should still be in normal mode
+    harness.assert_mode(red::editor::Mode::Normal);
+}
+
+#[tokio::test]
+async fn test_scroll_movement() {
+    let content = (0..30)
+        .map(|i| format!("Line {}", i))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = EditorHarness::with_content(&content);
+
+    // Scroll down
+    harness.execute_action(Action::ScrollDown).await.unwrap();
+    // Viewport should have scrolled, but exact behavior depends on implementation
+
+    // Scroll up
+    harness.execute_action(Action::ScrollUp).await.unwrap();
+    // Viewport should have scrolled back
+}
+
+#[tokio::test]
+async fn test_mouse_scroll_continues_after_cursor_reaches_scrolloff() {
+    let content = (0..80)
+        .map(|line| format!("Line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = Config {
+        mouse_scroll_lines: Some(3),
+        scrolloff: Some(3),
+        ..Default::default()
+    };
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config(buffer, config);
+
+    harness
+        .execute_action(Action::SetCursor(0, 48))
+        .await
+        .unwrap();
+
+    for _ in 0..8 {
+        harness.execute_action(Action::ScrollDown).await.unwrap();
+    }
+
+    assert!(
+        harness.viewport_top() > 44,
+        "scroll down should continue once the cursor reaches scrolloff"
+    );
+    assert_eq!(
+        harness.buffer_line() - harness.viewport_top(),
+        3,
+        "cursor should stay at the top scrolloff margin while scrolling down"
+    );
+
+    for _ in 0..9 {
+        harness.execute_action(Action::ScrollUp).await.unwrap();
+    }
+
+    assert!(
+        harness.viewport_top() < 30,
+        "scroll up should continue once the cursor reaches scrolloff"
+    );
+    assert_eq!(
+        harness.buffer_line() - harness.viewport_top(),
+        18,
+        "cursor should stay at the bottom scrolloff margin while scrolling up"
+    );
+}
+
+#[tokio::test]
+async fn test_mouse_scroll_down_at_wrapped_eof_does_not_underflow() {
+    let content = (0..30)
+        .map(|line| format!("Line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = Config {
+        mouse_scroll_lines: Some(3),
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 20, 8);
+    let last_line = harness.line_count();
+
+    harness.set_viewport_cursor(last_line, 0, 0);
+    harness.execute_action(Action::ScrollDown).await.unwrap();
+
+    assert_eq!(harness.viewport_top(), last_line);
+}
+
+#[tokio::test]
+async fn distant_mark_jump_centers_the_destination_like_neovim() {
+    let content = (0..100)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = Config {
+        scrolloff: Some(3),
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 80, 24);
+    harness
+        .execute_action(Action::SetCursor(0, 69))
+        .await
+        .unwrap();
+    harness.execute_action(Action::SetMark('a')).await.unwrap();
+    harness.set_viewport_cursor(9, 0, 10);
+
+    harness
+        .execute_action(Action::JumpToMark {
+            mark: 'a',
+            linewise: false,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_line(), 69);
+    assert_eq!(harness.viewport_top(), 59);
+    assert_eq!(harness.buffer_line() - harness.viewport_top(), 10);
+}
+
+#[tokio::test]
+async fn nearby_cursor_reveal_scrolls_only_enough_for_scrolloff() {
+    let content = (0..100)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = Config {
+        scrolloff: Some(3),
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 80, 24);
+    harness
+        .execute_action(Action::SetCursor(0, 31))
+        .await
+        .unwrap();
+    harness.execute_action(Action::SetMark('a')).await.unwrap();
+    harness.set_viewport_cursor(9, 0, 10);
+
+    harness
+        .execute_action(Action::JumpToMark {
+            mark: 'a',
+            linewise: false,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_line(), 31);
+    assert_eq!(harness.viewport_top(), 13);
+    assert_eq!(harness.buffer_line() - harness.viewport_top(), 18);
+}
+
+#[tokio::test]
+async fn distant_cursor_reveal_backfills_the_viewport_at_eof() {
+    let content = (0..80)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = Config {
+        scrolloff: Some(3),
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 80, 24);
+    harness
+        .execute_action(Action::SetCursor(0, 79))
+        .await
+        .unwrap();
+    harness.execute_action(Action::SetMark('a')).await.unwrap();
+    harness.set_viewport_cursor(9, 0, 10);
+
+    harness
+        .execute_action(Action::JumpToMark {
+            mark: 'a',
+            linewise: false,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(harness.buffer_line(), 79);
+    assert_eq!(harness.viewport_top(), 58);
+    assert_eq!(harness.buffer_line() - harness.viewport_top(), 21);
+}
+
+#[tokio::test]
+async fn distant_insert_centers_a_wrapped_segment() {
+    let content = "\ntail".to_string();
+    let config = Config {
+        scrolloff: Some(2),
+        wrap: Some(true),
+        ..Default::default()
+    };
+    let buffer = Buffer::new(None, content);
+    let mut harness = EditorHarness::with_config_and_size(buffer, config, 30, 10);
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::InsertPastedText("x".repeat(600)))
+        .await
+        .unwrap();
+
+    let (_, screen_row) = harness.render_cursor_position().unwrap();
+    assert_eq!(harness.buffer_line(), 0);
+    harness.assert_cursor_at(600, 0);
+    assert!(harness.skipcol() > 0);
+    assert!(
+        (2..=6).contains(&screen_row),
+        "wrapped destination should land away from the viewport edges, got row {screen_row}"
+    );
+}
+
+#[tokio::test]
+async fn test_move_to_specific_position() {
+    let mut harness = EditorHarness::with_content("Hello\nWorld\nTest");
+
+    // MoveTo(x, y) where y is 1-based line number (like vim)
+    // Move to position (3, 1) - line 1 (0-indexed = 0), column 3
+    harness.execute_action(Action::MoveTo(3, 1)).await.unwrap();
+    harness.assert_cursor_at(3, 0); // At 'l' in "Hello" (line 0)
+
+    // Move to position (0, 3) - line 3 (0-indexed = 2), column 0
+    harness.execute_action(Action::MoveTo(0, 3)).await.unwrap();
+    harness.assert_cursor_at(0, 2); // At 'T' in "Test" (line 2)
+}
+
+#[tokio::test]
+async fn test_percent_matches_next_bracket_on_line() {
+    let mut harness = EditorHarness::with_content("if (a == (b * c) / d)");
+
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(20, 0);
+
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(3, 0);
+}
+
+#[tokio::test]
+async fn test_percent_matches_nested_bracket_under_cursor() {
+    let mut harness = EditorHarness::with_content("if (a == (b * c) / d)");
+
+    harness.execute_action(Action::MoveTo(9, 1)).await.unwrap();
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(15, 0);
+}
+
+#[tokio::test]
+async fn test_percent_matches_rust_method_with_lifetime() {
+    let contents = "impl Game {\n    fn update(&mut self, d: &mut DrawHandle<'_>) {\n        let values = [1, 2];\n    }\n}";
+    let opening_column = contents.lines().nth(1).unwrap().len() - 1;
+
+    for file in ["game.rs", "game.txt"] {
+        let buffer = Buffer::new(Some(file.to_string()), contents.to_string());
+        let mut harness = EditorHarness::with_config(buffer, default_key_config());
+        if file.ends_with(".txt") {
+            harness
+                .execute_action(Action::Command("syntax rust".to_string()))
+                .await
+                .unwrap();
+        }
+
+        harness
+            .execute_action(Action::MoveTo(opening_column, 2))
+            .await
+            .unwrap();
+        type_normal_keys(&mut harness, "%").await;
+        harness.assert_cursor_at(4, 3);
+        type_normal_keys(&mut harness, "%").await;
+        harness.assert_cursor_at(opening_column, 1);
+        type_normal_keys(&mut harness, "g%").await;
+        harness.assert_cursor_at(4, 3);
+    }
+}
+
+#[tokio::test]
+async fn test_counted_percent_jumps_to_file_percentage() {
+    let content = (1..=100)
+        .map(|line| format!("Line {line:03}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut harness = EditorHarness::with_content(&content);
+
+    type_normal_keys(&mut harness, "50%").await;
+    harness.assert_cursor_at(0, 49);
+}
+
+#[tokio::test]
+async fn test_percent_matches_c_comment_delimiters() {
+    let mut harness = EditorHarness::with_content("alpha /* beta */ gamma");
+
+    harness.execute_action(Action::MoveTo(6, 1)).await.unwrap();
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(14, 0);
+
+    harness
+        .execute_action(Action::MatchitBackward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(6, 0);
+}
+
+#[tokio::test]
+async fn test_percent_cycles_preprocessor_groups_linewise() {
+    let mut harness = EditorHarness::with_content("#if FOO\nbody\n#else\nother\n#endif");
+
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 2);
+
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 4);
+
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 2);
+}
+
+#[tokio::test]
+async fn test_percent_cycles_bash_matchit_groups() {
+    let buffer = Buffer::new(
+        Some("script.sh".to_string()),
+        "if foo\nthen\n  echo yes\nelse\n  echo no\nfi".to_string(),
+    );
+    let mut harness = EditorHarness::with_config(buffer, Config::default());
+
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 3);
+
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(0, 5);
+}
+
+#[tokio::test]
+async fn test_percent_matches_html_like_tags() {
+    let mut harness = EditorHarness::with_content("<section><div>hello</div></section>");
+
+    harness.execute_action(Action::MoveTo(9, 1)).await.unwrap();
+    harness
+        .execute_action(Action::MatchitForward)
+        .await
+        .unwrap();
+    harness.assert_cursor_at(19, 0);
+}
+
+#[tokio::test]
+async fn test_operator_delete_percent_deletes_through_match() {
+    let mut harness = EditorHarness::with_content("(alpha) beta");
+
+    type_normal_keys(&mut harness, "d%").await;
+    harness.assert_buffer_contents(" beta");
+}
+
+#[tokio::test]
+async fn percent_without_a_match_warns_for_motion_and_operator_forms() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "alpha beta".to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "%").await;
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.last_error(), Some("match not found"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
+
+    type_normal_keys(&mut harness, "d%").await;
+    harness.assert_buffer_contents("alpha beta");
+    assert_eq!(harness.last_error(), Some("match not found"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
+}
+
+#[tokio::test]
+async fn structural_function_motions_support_counts_and_window_jumps() {
+    let contents = "// heading\nfn first() {}\nfn second() {}\nfn third() {}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "2]f").await;
+    harness.assert_cursor_at(0, 2);
+
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+    harness.execute_action(Action::JumpBack).await.unwrap();
+    harness.assert_cursor_at(0, 0);
+    harness.execute_action(Action::JumpForward).await.unwrap();
+    harness.assert_cursor_at(0, 1);
+
+    type_normal_keys(&mut harness, "]f[f").await;
+    harness.assert_cursor_at(0, 1);
+}
+
+#[tokio::test]
+async fn structural_call_and_class_motions_resolve_nested_captures() {
+    let contents = "struct First {}\nfn ready() { alpha(); beta(); }\nstruct Second {}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "]c").await;
+    harness.assert_cursor_at(0, 2);
+
+    harness
+        .execute_action(Action::SetCursor(0, 1))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "]m").await;
+    harness.assert_cursor_at(13, 1);
+    type_normal_keys(&mut harness, "]m").await;
+    harness.assert_cursor_at(22, 1);
+    type_normal_keys(&mut harness, "[m").await;
+    harness.assert_cursor_at(13, 1);
+}
+
+#[tokio::test]
+async fn structural_motions_extend_visual_selection() {
+    let contents = "fn first() {}\nfn second() {}\nfn third() {}\n";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "v]f").await;
+
+    harness.assert_mode(Mode::Visual);
+    harness.assert_cursor_at(0, 1);
+    assert_eq!(harness.selection(), Some((0, 0, 0, 1)));
+}
+
+#[tokio::test]
+async fn structural_motions_respect_disabled_syntax_and_no_wrap_boundaries() {
+    let contents = "fn only() {}";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "]f").await;
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.last_error(), Some("No more functions to move to"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
+
+    harness
+        .execute_action(Action::Command("syntax off".to_string()))
+        .await
+        .unwrap();
+    type_normal_keys(&mut harness, "[f").await;
+    harness.assert_cursor_at(0, 0);
+    assert_eq!(harness.last_error(), Some("No more functions to move to"));
+}
+
+#[tokio::test]
+async fn closing_bracket_structural_motions_name_the_missing_target() {
+    for (contents, keys, expected) in [
+        ("fn only() {}", "]f", "No more functions to move to"),
+        ("struct Only {}", "]c", "No more classes to move to"),
+        (
+            "fn only() { call(); }",
+            "]m]m",
+            "No more function calls to move to",
+        ),
+    ] {
+        let mut harness = EditorHarness::with_config(
+            Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+            default_key_config(),
+        );
+
+        type_normal_keys(&mut harness, keys).await;
+
+        assert_eq!(harness.last_error(), Some(expected));
+        assert_eq!(
+            harness
+                .editor
+                .notifications()
+                .records()
+                .next_back()
+                .unwrap()
+                .severity,
+            Severity::Warning
+        );
+    }
+}
+
+#[tokio::test]
+async fn closing_bracket_matchit_motion_warns_at_the_boundary() {
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(None, "(balanced)".to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "]%]%").await;
+
+    harness.assert_cursor_at(9, 0);
+    assert_eq!(harness.last_error(), Some("No more matches to move to"));
+    assert_eq!(
+        harness
+            .editor
+            .notifications()
+            .records()
+            .next_back()
+            .unwrap()
+            .severity,
+        Severity::Warning
+    );
+}
+
+#[tokio::test]
+async fn closing_bracket_operator_motion_warns_without_editing() {
+    let contents = "fn only() {}";
+    let mut harness = EditorHarness::with_config(
+        Buffer::new(Some("sample.rs".to_string()), contents.to_string()),
+        default_key_config(),
+    );
+
+    type_normal_keys(&mut harness, "d]f").await;
+
+    harness.assert_buffer_contents(contents);
+    assert_eq!(harness.last_error(), Some("No more functions to move to"));
+}

@@ -1,0 +1,238 @@
+//! Optional plugin identity, dependency, compatibility, and capability metadata.
+//!
+//! Metadata is loaded before source activation so the registry can order dependencies
+//! and quarantine incompatible plugins without executing them. Missing metadata produces
+//! a minimal local description, while malformed supplied metadata is a quarantine error.
+//! Capability flags describe intent and discovery; process permissions remain an
+//! independently enforced configuration boundary.
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+use super::package::PluginPackageManifest;
+
+/// Plugin metadata structure based on package.json format
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginMetadata {
+    /// Plugin name (required)
+    pub name: String,
+
+    /// Plugin version following semver
+    #[serde(default = "default_version")]
+    pub version: String,
+
+    /// Plugin description
+    pub description: Option<String>,
+
+    /// Plugin author as a name or `name <email>` string.
+    pub author: Option<String>,
+
+    /// Plugin license
+    pub license: Option<String>,
+
+    /// Main entry point (defaults to index.hk)
+    #[serde(default = "default_main")]
+    pub main: String,
+
+    /// Plugin homepage URL
+    pub homepage: Option<String>,
+
+    /// Repository information
+    pub repository: Option<Repository>,
+
+    /// Keywords for plugin discovery
+    #[serde(default)]
+    pub keywords: Vec<String>,
+
+    /// Red editor compatibility
+    pub engines: Option<Engines>,
+
+    /// Plugin dependencies (other plugins)
+    #[serde(default)]
+    pub dependencies: HashMap<String, String>,
+
+    /// Red API version compatibility
+    pub red_api_version: Option<String>,
+
+    /// Plugin configuration schema
+    pub config_schema: Option<serde_json::Value>,
+
+    /// Activation events (when to load the plugin)
+    #[serde(default)]
+    pub activation_events: Vec<String>,
+
+    /// Plugin capabilities
+    #[serde(default)]
+    pub capabilities: PluginCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Repository {
+    #[serde(rename = "type")]
+    pub repo_type: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Engines {
+    pub red: Option<String>,
+    pub node: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginCapabilities {
+    /// Whether the plugin provides commands
+    #[serde(default)]
+    pub commands: bool,
+
+    /// Whether the plugin uses event handlers
+    #[serde(default)]
+    pub events: bool,
+
+    /// Whether the plugin modifies buffers
+    #[serde(default)]
+    pub buffer_manipulation: bool,
+
+    /// Whether the plugin provides UI components
+    #[serde(default)]
+    pub ui_components: bool,
+
+    /// Whether the plugin integrates with LSP
+    #[serde(default)]
+    pub lsp_integration: bool,
+}
+
+fn default_version() -> String {
+    "0.1.0".to_string()
+}
+
+fn default_main() -> String {
+    "index.hk".to_string()
+}
+
+impl PluginMetadata {
+    /// Load metadata from a package.json file
+    pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let metadata: PluginMetadata = serde_json::from_str(&content)?;
+        Ok(metadata)
+    }
+
+    /// Adapts the external package manifest to the legacy registry metadata view.
+    pub fn from_package(package: &PluginPackageManifest) -> Self {
+        Self {
+            name: package.plugin.id.to_string(),
+            version: package.plugin.version.to_string(),
+            description: package.plugin.description.clone(),
+            author: None,
+            license: package.plugin.license.clone(),
+            main: package
+                .plugin
+                .entry
+                .as_ref()
+                .or(package.plugin.husk_manifest.as_ref())
+                .map_or_else(default_main, |path| path.to_string_lossy().into_owned()),
+            homepage: None,
+            repository: package.plugin.repository.as_ref().map(|url| Repository {
+                repo_type: "git".to_string(),
+                url: url.clone(),
+            }),
+            keywords: vec![],
+            engines: None,
+            dependencies: HashMap::new(),
+            red_api_version: Some(package.plugin.red_api.to_string()),
+            config_schema: None,
+            activation_events: package
+                .activation
+                .events
+                .iter()
+                .cloned()
+                .chain(
+                    package
+                        .activation
+                        .commands
+                        .iter()
+                        .map(|command| format!("onCommand:{command}")),
+                )
+                .collect(),
+            capabilities: PluginCapabilities {
+                commands: !package.activation.commands.is_empty(),
+                events: !package.activation.events.is_empty(),
+                buffer_manipulation: false,
+                ui_components: true,
+                lsp_integration: false,
+            },
+        }
+    }
+
+    /// Create minimal metadata with just a name
+    pub fn minimal(name: String) -> Self {
+        Self {
+            name,
+            version: default_version(),
+            description: None,
+            author: None,
+            license: None,
+            main: default_main(),
+            homepage: None,
+            repository: None,
+            keywords: vec![],
+            engines: None,
+            dependencies: HashMap::new(),
+            red_api_version: None,
+            config_schema: None,
+            activation_events: vec![],
+            capabilities: PluginCapabilities::default(),
+        }
+    }
+
+    /// Check if the plugin is compatible with the current Red version
+    pub fn is_compatible(&self, red_version: &str) -> bool {
+        if let Some(engines) = &self.engines {
+            if let Some(required_red) = &engines.red {
+                // Simple version check - could be enhanced with semver
+                return required_red == "*" || red_version.starts_with(required_red);
+            }
+        }
+        true // If no version specified, assume compatible
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_minimal_metadata() {
+        let metadata = PluginMetadata::minimal("test-plugin".to_string());
+        assert_eq!(metadata.name, "test-plugin");
+        assert_eq!(metadata.version, "0.1.0");
+        assert_eq!(metadata.main, "index.hk");
+    }
+
+    #[test]
+    fn test_deserialize_metadata() {
+        let json = r#"{
+            "name": "awesome-plugin",
+            "version": "1.0.0",
+            "description": "An awesome plugin for Red editor",
+            "author": "John Doe <john@example.com>",
+            "keywords": ["productivity", "tools"],
+            "capabilities": {
+                "commands": true,
+                "events": true
+            }
+        }"#;
+
+        let metadata: PluginMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(metadata.name, "awesome-plugin");
+        assert_eq!(metadata.version, "1.0.0");
+        assert_eq!(
+            metadata.description,
+            Some("An awesome plugin for Red editor".to_string())
+        );
+        assert_eq!(metadata.keywords.len(), 2);
+        assert!(metadata.capabilities.commands);
+        assert!(metadata.capabilities.events);
+    }
+}

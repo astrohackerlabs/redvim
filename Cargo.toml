@@ -1,0 +1,148 @@
+[package]
+name = "red"
+version = "0.7.0"
+edition = "2021"
+default-run = "redvim"
+autobins = false
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "redvim"
+path = "src/main.rs"
+
+[workspace]
+members = [
+    ".",
+    "crates/husk",
+    "crates/husk-analysis",
+    "crates/husk-ast",
+    "crates/husk-cli",
+    "crates/husk-diagnostics",
+    "crates/husk-extension",
+    "crates/husk-hir",
+    "crates/husk-lexer",
+    "crates/husk-lsp",
+    "crates/husk-parser",
+    "crates/husk-package",
+    "crates/husk-runtime",
+    "crates/husk-semantic",
+    "crates/husk-stdlib",
+    "crates/husk-types",
+    "crates/husk-value",
+    "crates/husk-wasm",
+]
+resolver = "2"
+exclude = ["vendor/crossterm"]
+
+[patch.crates-io]
+# Crossterm 0.27 plus the documented xterm keyboard-decoder compatibility patch.
+crossterm = { path = "vendor/crossterm" }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/codersauce/red"
+
+[workspace.dependencies]
+husk-analysis = { version = "0.1.0", path = "crates/husk-analysis" }
+husk-ast = { version = "0.1.0", path = "crates/husk-ast" }
+husk-cli = { version = "0.1.0", path = "crates/husk-cli" }
+husk-diagnostics = { version = "0.1.0", path = "crates/husk-diagnostics" }
+husk-extension = { version = "0.1.0", path = "crates/husk-extension" }
+husk-hir = { version = "0.1.0", path = "crates/husk-hir" }
+husk-lexer = { version = "0.1.0", path = "crates/husk-lexer" }
+husk-lsp = { version = "0.1.0", path = "crates/husk-lsp" }
+husk-parser = { version = "0.1.0", path = "crates/husk-parser" }
+husk-package = { version = "0.1.0", path = "crates/husk-package" }
+husk-runtime = { version = "0.1.0", path = "crates/husk-runtime", default-features = false }
+husk-semantic = { version = "0.1.0", path = "crates/husk-semantic" }
+husk-stdlib = { version = "0.1.0", path = "crates/husk-stdlib" }
+husk-types = { version = "0.1.0", path = "crates/husk-types" }
+husk-value = { version = "0.1.0", path = "crates/husk-value" }
+husk-wasm = { version = "0.1.0", path = "crates/husk-wasm" }
+
+[dependencies]
+anyhow = "1.0.79"
+arboard = "3.4.1"
+async-recursion = "1.0.5"
+async-trait = "0.1.77"
+bon = "3.3.2"
+chrono = "0.4.45"
+clap = { version = "4.5.26", features = ["derive", "env"] }
+crossterm = { version = "0.27.0", features = ["event-stream", "serde"] }
+futures = "0.3.30"
+fuzzy-matcher = "0.3.7"
+flate2 = "1.0"
+husk-ast.workspace = true
+husk-cli.workspace = true
+husk-diagnostics.workspace = true
+husk-lexer.workspace = true
+husk-parser.workspace = true
+husk-runtime.workspace = true
+husk-semantic.workspace = true
+include_dir = "0.7.4"
+ignore = "0.4.25"
+json_comments = "0.2.2"
+lazy_static = "1.5.0"
+libloading = "0.8.9"
+nix = { version = "0.28.0", features = ["fs", "process", "signal"] }
+notify = "8.2.0"
+once_cell = "1.19.0"
+path-absolutize = "3.1.1"
+pulldown-cmark = "0.13"
+rayon = "1.12.0"
+regex = "1.11.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ropey = "1.6.1"
+serde = { version = "1.0.196", features = ["derive"] }
+serde_json = "1.0.113"
+semver = "1.0"
+sha2 = "0.10"
+same-file = "1.0.6"
+similar = "2.6.0"
+tar = "0.4"
+textwrap = "0.16"
+tempfile = "3.15.0"
+thiserror = "1.0"
+tokio = { version = "1.41.0", features = ["full"] }
+toml = "0.8.23"
+toml_edit = "0.22.27"
+trash = "5.2.2"
+tree-sitter = "0.25"
+tree-sitter-language = "0.1.7"
+tree-sitter-bash = "0.25.1"
+tree-sitter-fish = "3.6.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-json = "0.24.8"
+tree-sitter-lua = "0.5.0"
+tree-sitter-md = "0.5.3"
+tree-sitter-nu = { git = "https://github.com/nushell/tree-sitter-nu", rev = "bb3f533e5792260291945e1f329e1f0a779def6e" }
+tree-sitter-powershell = "0.26.4"
+tree-sitter-rust = "0.24.2"
+tree-sitter-toml-ng = "0.7.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-yaml = "0.7.2"
+unicode-ident = "1.0"
+unicode-linebreak = "0.1"
+unicode-segmentation = "1.12.0"
+unicode-width = "0.2"
+uuid = { version = "1.12.0", features = ["v4", "v5"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+base64 = "0.22.1"
+core-foundation = "0.9.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
