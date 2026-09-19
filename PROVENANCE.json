@@ -1,20 +1,20 @@
 {
-  "version": "0.7.2",
+  "version": "0.7.3",
   "fork": {
     "name": "red",
     "checkout": "forks/red",
     "base": "9e0952767d35d5b8dddd3fa3bb90087938692c52",
-    "branch": "issue-26091823140848-exp7-storage-paths",
-    "expected_head": "b56e93d5d809d3e77b6a0eb24889d7304fb00afc",
-    "expected_tree": "1ca2868dc0507ba7868de5bcc935354efef5fe1f",
+    "branch": "issue-26091823140848-exp8-common-languages",
+    "expected_head": "b3225c268c0b8734e5e3cbb55e9b1eda57b9560e",
+    "expected_tree": "66a35c300b223517fe26c5e25b27e14947ba5db0",
     "patch_directories": [
       "patches/red/patches/issue-26091823140848"
     ],
-    "patch_count": 8,
-    "archive_sha256": "5c0ab7f14ba970a4b899d189c24af3a4a8b945438e8a6844af6ca29120f3db00",
+    "patch_count": 10,
+    "archive_sha256": "8d3f3f5e3587c44c17f7fb50ab05dcb87a43bdaaef977bf20af73915f0deb582",
     "allowed_untracked": []
   },
-  "monorepo_commit": "1f132eecc6ca2a67458c02ffffc4d61ac85782cd",
+  "monorepo_commit": "83b24d53ece183cd7c77de86194d80a34dad1b1c",
   "grammar_revision": "bb3f533e5792260291945e1f329e1f0a779def6e",
   "query_revision": "4d9466677a5ceadef104eaa0fe08d60d91c4e9a7",
   "deployment_target": "26.0"

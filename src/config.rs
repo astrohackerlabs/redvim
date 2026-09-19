@@ -737,6 +737,11 @@ fn default_comment_templates() -> HashMap<String, String> {
         ("markdown", "<!-- %s -->"),
         ("nu", "# %s"),
         ("powershell", "# %s"),
+        ("python", "# %s"),
+        ("ruby", "# %s"),
+        ("make", "# %s"),
+        ("swift", "// %s"),
+        ("zig", "// %s"),
         ("rust", "// %s"),
         ("scss", "/* %s */"),
         ("sql", "-- %s"),
@@ -4359,7 +4364,7 @@ input_position = "left"
         assert!(config.commenting.continue_on_open_line);
         assert_eq!(config.commenting.languages["fish"], "# %s");
         assert_eq!(config.commenting.languages["rust"], "// %s");
-        assert!(!config.commenting.languages.contains_key("python"));
+        assert_eq!(config.commenting.languages["python"], "# %s");
         assert_eq!(config.commenting.languages["lua"], "-- %s");
         assert_eq!(config.commenting.languages["html"], "<!-- %s -->");
         assert_eq!(config.commenting.languages["css"], "/* %s */");

@@ -5277,7 +5277,8 @@ fn command_tab_ignores_non_file_commands() {
 #[test]
 fn command_tab_completes_syntax_names_and_aliases() {
     for (command, expected) in [
-        ("syntax ru", "syntax rust"),
+        ("syntax ru", "syntax ruby"),
+        ("syntax rus", "syntax rust"),
         ("syn ym", "syn yaml"),
         ("ft rs", "ft rust"),
         ("syntax ", "syntax auto"),
@@ -5624,7 +5625,7 @@ async fn test_enter_on_opened_indented_blank_line_moves_generated_indentation() 
 }
 
 #[tokio::test]
-async fn python_autoindent_requires_the_language_pack() {
+async fn python_autoindent_is_bundled_without_a_language_pack() {
     let buffer = Buffer::new(
         Some("sample.py".to_string()),
         "def something(x):".to_string(),
@@ -5636,8 +5637,24 @@ async fn python_autoindent_requires_the_language_pack() {
         .await
         .unwrap();
 
-    harness.assert_cursor_at(0, 1);
-    harness.assert_buffer_contents("def something(x):\n");
+    harness.assert_cursor_at(4, 1);
+    harness.assert_buffer_contents("def something(x):\n    ");
+}
+
+#[tokio::test]
+async fn make_insert_tab_preserves_recipe_whitespace() {
+    let mut harness = comment_harness("Makefile", "all:");
+    harness
+        .execute_action(Action::InsertLineBelowCursor)
+        .await
+        .unwrap();
+    harness
+        .execute_action(Action::EnterMode(Mode::Insert))
+        .await
+        .unwrap();
+    command_key(&mut harness, KeyCode::Tab).await;
+    harness.type_text("@echo hello").await.unwrap();
+    harness.assert_buffer_contents("all:\n\t@echo hello");
 }
 
 #[tokio::test]

@@ -119,14 +119,9 @@ async fn run() -> anyhow::Result<()> {
         let report = run_self_check().await?;
         println!("{}", report.format());
         let theme = parse_vscode_theme_contents(include_str!("../themes/mocha.json"))?;
-        let mut highlighter = red::highlighter::Highlighter::new(&theme)?;
-        let fixture = include_str!("queries/highlights/nu-smoke.nu");
-        anyhow::ensure!(
-            highlighter.language_id_for_source(Some("example.nu"), fixture) == Some("nu")
-                && !highlighter.highlight("nu", fixture)?.is_empty(),
-            "bundled Nushell highlighting failed"
-        );
-        println!("language nu: bundled highlighting ok");
+        for language in red::highlighter::check_bundled_languages(&theme)? {
+            println!("language {language}: bundled highlighting ok");
+        }
         println!("redvim self-check ok");
         return Ok(());
     }

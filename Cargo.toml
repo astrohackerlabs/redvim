@@ -1,6 +1,6 @@
 [package]
 name = "red"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2021"
 default-run = "redvim"
 autobins = false
@@ -128,6 +128,16 @@ unicode-linebreak = "0.1"
 unicode-segmentation = "1.12.0"
 unicode-width = "0.2"
 uuid = { version = "1.12.0", features = ["v4", "v5"] }
+tree-sitter-c = "=0.24.2"
+tree-sitter-cpp = "=0.23.4"
+tree-sitter-python = "=0.25.0"
+tree-sitter-html = "=0.23.2"
+tree-sitter-css = "=0.25.0"
+tree-sitter-ruby = "=0.23.1"
+tree-sitter-zig = "=1.1.2"
+tree-sitter-swift = "=0.7.3"
+tree-sitter-xml = "=0.7.0"
+tree-sitter-make = "=1.1.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 base64 = "0.22.1"

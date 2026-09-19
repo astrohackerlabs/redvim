@@ -6649,6 +6649,15 @@ impl Editor {
                 ("zsh", 2),
                 ("fish", 4),
                 ("nu", 2),
+                ("c", 4),
+                ("cpp", 4),
+                ("python", 4),
+                ("html", 2),
+                ("css", 2),
+                ("ruby", 2),
+                ("zig", 4),
+                ("swift", 4),
+                ("xml", 2),
             ]
             .map(|(file_type, shift_width)| {
                 (
@@ -6657,6 +6666,7 @@ impl Editor {
                 )
             }),
         );
+        indentation.insert("make".into(), Indentation::new(8, 8, false));
         for (language, definition) in &config.languages {
             if let Some(width) = definition.indent_width {
                 let settings = Indentation::new(width, width, true);
@@ -34481,6 +34491,38 @@ builtin = "rust"
             .current_buffer()
             .contents()
             .starts_with("# custom let answer"));
+    }
+
+    #[test]
+    fn common_language_defaults_and_make_recipe_tabs() {
+        let mut editor = test_editor(80, 12);
+        for (file, width, comment) in [
+            ("example.c", 4, "//"),
+            ("example.cpp", 4, "//"),
+            ("example.py", 4, "#"),
+            ("example.html", 2, "<!--"),
+            ("example.css", 2, "/*"),
+            ("formula.rb.in", 2, "#"),
+            ("example.zig", 4, "//"),
+            ("example.swift", 4, "//"),
+            ("example.svg", 2, "<!--"),
+            ("Makefile", 8, "#"),
+        ] {
+            editor.buffer_manager[0] = Buffer::new(Some(file.into()), "sample\n".into());
+            assert_eq!(editor.indentation().shift_width, width, "{file}");
+            assert!(editor.toggle_comment_lines(0, 0), "{file}");
+            assert!(
+                editor.current_buffer().contents().starts_with(comment),
+                "{file}"
+            );
+            assert!(editor.toggle_comment_lines(0, 0), "{file}");
+            assert_eq!(editor.current_buffer().contents(), "sample\n", "{file}");
+        }
+        editor.buffer_manager[0] =
+            Buffer::new(Some("Makefile".into()), "all:\n\t@echo hello\n".into());
+        assert!(!editor.indentation().expand_tab);
+        assert_eq!(editor.indentation().whitespace_for_columns(8), "\t");
+        assert_eq!(editor.current_buffer().contents(), "all:\n\t@echo hello\n");
     }
 
     #[test]

@@ -58,6 +58,14 @@ fn assert_self_check_report(output: Output) {
 
     let lines = stdout.lines().collect::<Vec<_>>();
     assert_eq!(lines.last(), Some(&"redvim self-check ok"), "{stdout}");
+    for language in [
+        "nu", "c", "cpp", "python", "html", "css", "ruby", "zig", "swift", "xml", "make",
+    ] {
+        assert!(
+            lines.contains(&format!("language {language}: bundled highlighting ok").as_str()),
+            "{stdout}"
+        );
+    }
     let plugins = lines
         .iter()
         .filter_map(|line| line.strip_prefix("plugin "))

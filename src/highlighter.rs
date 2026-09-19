@@ -20,6 +20,9 @@ use libloading::Library;
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator, Tree};
 use tree_sitter_language::LanguageFn;
 
+mod bundled_checks;
+pub use bundled_checks::check_bundled_languages;
+
 use crate::{
     config::{LanguageConfig, LanguageGrammarConfig},
     editor::StyleInfo,
@@ -71,6 +74,7 @@ struct RuntimeLanguageDefinition {
     indent_queries: Vec<String>,
     injection_query: Option<String>,
     specialized: Option<SpecializedHighlighter>,
+    semantic_refinements: bool,
 }
 
 /// Immutable language routing and grammar definitions shared by all render surfaces.
@@ -133,6 +137,18 @@ impl LanguageRegistry {
                     .collect(),
                 injection_query: definition.injection_query.map(ToString::to_string),
                 specialized: definition.specialized,
+                semantic_refinements: matches!(
+                    definition.id,
+                    "c" | "cpp"
+                        | "python"
+                        | "html"
+                        | "css"
+                        | "ruby"
+                        | "zig"
+                        | "swift"
+                        | "xml"
+                        | "make"
+                ),
             });
         }
         registry
@@ -180,6 +196,7 @@ impl LanguageRegistry {
             indent_queries: Vec::new(),
             injection_query: None,
             specialized: None,
+            semantic_refinements: false,
         });
         if !config.extensions.is_empty() {
             definition.extensions = config
@@ -220,6 +237,7 @@ impl LanguageRegistry {
                 definition
                     .injection_query
                     .clone_from(&bundled.injection_query);
+                definition.semantic_refinements = bundled.semantic_refinements;
                 definition.specialized = None;
             }
             if let Some(path) = grammar_path(grammar, config_dir)? {
@@ -580,6 +598,21 @@ const MAX_CACHED_HIGHLIGHT_BYTES: usize = 64 * 1024;
 const MAX_CACHED_HIGHLIGHT_SPANS: usize = 4_096;
 
 const LANGUAGE_NAMES: &[(&str, &str)] = &[
+    ("c", "c"),
+    ("cpp", "cpp"),
+    ("c++", "cpp"),
+    ("python", "python"),
+    ("py", "python"),
+    ("html", "html"),
+    ("css", "css"),
+    ("ruby", "ruby"),
+    ("rb", "ruby"),
+    ("zig", "zig"),
+    ("swift", "swift"),
+    ("xml", "xml"),
+    ("svg", "xml"),
+    ("make", "make"),
+    ("makefile", "make"),
     ("rs", "rust"),
     ("rust", "rust"),
     ("js", "javascript"),
@@ -1419,7 +1452,13 @@ impl Highlighter {
                                 end,
                                 style: style.clone(),
                             };
-                            if capture_refines_equal_range(capture_name) {
+                            if capture_refines_equal_range(capture_name)
+                                || (definition.semantic_refinements
+                                    && matches!(
+                                        capture_name.split('.').next(),
+                                        Some("function" | "type" | "constructor" | "constant")
+                                    ))
+                            {
                                 refinement_colors.push(captured);
                             } else {
                                 colors.push(captured);
@@ -2179,6 +2218,8 @@ pub(crate) const MAX_SHEBANG_CHARS: usize = 512;
 
 fn bundled_shebangs(id: &str) -> &'static [&'static str] {
     match id {
+        "python" => &["python", "python3"],
+        "ruby" => &["ruby"],
         "bash" => &["sh", "bash", "dash", "ash", "zsh"],
         "fish" => &["fish"],
         "nu" => &["nu"],
@@ -2236,6 +2277,109 @@ fn file_extension(file: &str) -> Option<String> {
 
 fn language_definitions() -> Vec<BundledLanguageDefinition> {
     vec![
+        BundledLanguageDefinition {
+            id: "c",
+            extensions: &["c", "h"],
+            filenames: &[],
+            language: Some(|| tree_sitter_c::LANGUAGE.into()),
+            highlight_queries: &[tree_sitter_c::HIGHLIGHT_QUERY],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "cpp",
+            extensions: &["cc", "cpp", "cxx", "hpp", "hxx", "hh"],
+            filenames: &[],
+            language: Some(|| tree_sitter_cpp::LANGUAGE.into()),
+            highlight_queries: &[
+                tree_sitter_c::HIGHLIGHT_QUERY,
+                tree_sitter_cpp::HIGHLIGHT_QUERY,
+            ],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "python",
+            extensions: &["py", "pyi"],
+            filenames: &[],
+            language: Some(|| tree_sitter_python::LANGUAGE.into()),
+            highlight_queries: &[tree_sitter_python::HIGHLIGHTS_QUERY],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "html",
+            extensions: &["html", "htm"],
+            filenames: &[],
+            language: Some(|| tree_sitter_html::LANGUAGE.into()),
+            highlight_queries: &[tree_sitter_html::HIGHLIGHTS_QUERY],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "css",
+            extensions: &["css"],
+            filenames: &[],
+            language: Some(|| tree_sitter_css::LANGUAGE.into()),
+            highlight_queries: &[tree_sitter_css::HIGHLIGHTS_QUERY],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "ruby",
+            extensions: &["rb"],
+            filenames: &["Gemfile", "Rakefile", "formula.rb.in"],
+            language: Some(|| tree_sitter_ruby::LANGUAGE.into()),
+            highlight_queries: &[include_str!("queries/highlights/ruby.scm")],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "zig",
+            extensions: &["zig"],
+            filenames: &[],
+            language: Some(|| tree_sitter_zig::LANGUAGE.into()),
+            highlight_queries: &[include_str!("queries/highlights/zig.scm")],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "swift",
+            extensions: &["swift"],
+            filenames: &[],
+            language: Some(|| tree_sitter_swift::LANGUAGE.into()),
+            highlight_queries: &[tree_sitter_swift::HIGHLIGHTS_QUERY],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "xml",
+            extensions: &["xml", "svg", "plist"],
+            filenames: &[],
+            language: Some(|| tree_sitter_xml::LANGUAGE_XML.into()),
+            highlight_queries: &[tree_sitter_xml::XML_HIGHLIGHT_QUERY],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "make",
+            extensions: &["mk"],
+            filenames: &["Makefile", "makefile", "GNUmakefile"],
+            language: Some(|| tree_sitter_make::LANGUAGE.into()),
+            highlight_queries: &[tree_sitter_make::HIGHLIGHTS_QUERY],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
         BundledLanguageDefinition {
             id: "nu",
             extensions: &["nu"],
@@ -4474,7 +4618,7 @@ mod tests {
             ),
             ("#!/usr/bin/env -- /bin/dash", Some("bash")),
             ("\u{feff}#! /usr/bin/lua5.4\r\nprint(1)", Some("lua")),
-            ("#!/usr/bin/env python3.12", None),
+            ("#!/usr/bin/env python3.12", Some("python")),
             ("#!/usr/bin/env missing bash", None),
             ("#!/usr/bin/env --unknown bash", None),
             ("#!/usr/bin/env -u", None),
@@ -4613,7 +4757,10 @@ mod tests {
             highlighter.language_id_for_name("commit"),
             Some("gitcommit")
         );
-        assert_eq!(highlighter.language_id_for_file(Some("main.py")), None);
+        assert_eq!(
+            highlighter.language_id_for_file(Some("main.py")),
+            Some("python")
+        );
         assert_eq!(highlighter.language_id_for_file(Some("LICENSE")), None);
     }
 
@@ -5014,7 +5161,7 @@ mod tests {
         let highlighter = highlighter();
 
         assert_eq!(highlighter.language_id_for_name("rs"), Some("rust"));
-        assert_eq!(highlighter.language_id_for_name("py"), None);
+        assert_eq!(highlighter.language_id_for_name("py"), Some("python"));
         assert_eq!(highlighter.language_id_for_name("yml"), Some("yaml"));
         assert_eq!(highlighter.language_id_for_name("ts"), Some("typescript"));
         assert_eq!(highlighter.language_id_for_name("jsx"), Some("jsx"));
@@ -5138,21 +5285,31 @@ mod tests {
             highlighter.language_ids(),
             vec![
                 "bash",
+                "c",
+                "cpp",
+                "css",
                 "fish",
                 "gitcommit",
+                "html",
                 "husk",
                 "javascript",
                 "json",
                 "jsx",
                 "lua",
+                "make",
                 "markdown",
                 "nu",
                 "powershell",
+                "python",
+                "ruby",
                 "rust",
+                "swift",
                 "toml",
                 "tsx",
                 "typescript",
+                "xml",
                 "yaml",
+                "zig",
             ]
         );
     }
@@ -5162,7 +5319,10 @@ mod tests {
         let highlighter = highlighter();
 
         assert_eq!(highlighter.matching_language_ids("fi"), vec!["fish"]);
-        assert_eq!(highlighter.matching_language_ids("ru"), vec!["rust"]);
+        assert_eq!(
+            highlighter.matching_language_ids("ru"),
+            vec!["ruby", "rust"]
+        );
         assert_eq!(highlighter.matching_language_ids("ym"), vec!["yaml"]);
         assert_eq!(highlighter.matching_language_ids(".rs"), vec!["rust"]);
         assert_eq!(

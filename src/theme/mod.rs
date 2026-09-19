@@ -529,7 +529,12 @@ fn compatible_scopes(scope: &str) -> Vec<String> {
     // numeric constants and read/write variables. Preserve explicit captures
     // and their parent styles before trying the compatibility fallback.
     match scope {
-        "number" | "number.float" => push_scope_with_parents(&mut scopes, "constant.builtin"),
+        "number" | "number.float" | "float" | "boolean" | "constant" | "constant.macro" => {
+            push_scope_with_parents(&mut scopes, "constant.builtin");
+        }
+        "conditional" | "repeat" | "include" | "exception" => {
+            push_scope_with_parents(&mut scopes, "keyword");
+        }
         "variable" => push_scope_with_parents(&mut scopes, "variable.other.readwrite"),
         _ => {}
     }
