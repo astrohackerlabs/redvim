@@ -10,6 +10,19 @@ struct Fixture {
 
 const FIXTURES: &[Fixture] = &[
     Fixture {
+        language: "sql",
+        filename: "example.SQL",
+        source: include_str!("../queries/highlights/smoke/example.sql"),
+        tokens: &[
+            ("-- café", "comment"),
+            ("SELECT", "keyword"),
+            ("'hello'", "string"),
+            ("42", "number"),
+            ("3.14", "float"),
+            ("TRUE", "boolean"),
+        ],
+    },
+    Fixture {
         language: "c",
         filename: "example.c",
         source: include_str!("../queries/highlights/smoke/example.c"),
@@ -147,6 +160,7 @@ const FIXTURES: &[Fixture] = &[
 /// Validate bundled parsers, filename detection and effective token colors without
 /// reading user configuration, loading external grammars or entering raw mode.
 pub fn check_bundled_languages(theme: &Theme) -> anyhow::Result<Vec<&'static str>> {
+    super::sql_checks::check(theme)?;
     let registry = Arc::new(LanguageRegistry::bundled());
     let mut highlighter = Highlighter::with_registry(theme, Arc::clone(&registry))?;
     let mut checked = Vec::new();
@@ -210,7 +224,7 @@ mod tests {
     fn common_languages_parse_and_render_with_embedded_mocha() {
         let theme = parse_vscode_theme_contents(include_str!("../../themes/mocha.json")).unwrap();
         let checked = check_bundled_languages(&theme).unwrap();
-        assert_eq!(checked.len(), 11);
+        assert_eq!(checked.len(), 12);
     }
 
     #[test]
@@ -220,7 +234,7 @@ mod tests {
             LanguageRegistry::from_config(&HashMap::new(), directory.path()).unwrap();
         let theme = Theme::default();
         let highlighter = Highlighter::with_registry(&theme, Arc::new(registry.clone())).unwrap();
-        for definition in language_definitions().iter().take(10) {
+        for definition in language_definitions().iter().take(11) {
             for extension in definition.extensions {
                 assert_eq!(
                     highlighter.language_id_for_file(Some(&format!("example.{extension}"))),

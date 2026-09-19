@@ -1,6 +1,6 @@
 [package]
 name = "red"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2021"
 default-run = "redvim"
 autobins = false
@@ -63,6 +63,7 @@ husk-value = { version = "0.1.0", path = "crates/husk-value" }
 husk-wasm = { version = "0.1.0", path = "crates/husk-wasm" }
 
 [dependencies]
+tree-sitter-sequel = "=0.3.11"
 anyhow = "1.0.79"
 arboard = "3.4.1"
 async-recursion = "1.0.5"

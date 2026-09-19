@@ -1,20 +1,20 @@
 {
-  "version": "0.7.3",
+  "version": "0.7.4",
   "fork": {
     "name": "red",
     "checkout": "forks/red",
     "base": "9e0952767d35d5b8dddd3fa3bb90087938692c52",
-    "branch": "issue-26091823140848-exp8-common-languages",
-    "expected_head": "b3225c268c0b8734e5e3cbb55e9b1eda57b9560e",
-    "expected_tree": "66a35c300b223517fe26c5e25b27e14947ba5db0",
+    "branch": "issue-26091823140848-exp9-sql-support",
+    "expected_head": "8f821591a7d2e43147fb52dcfdf91959f0304412",
+    "expected_tree": "1d2fb9f88553de2f460a696e50899bf4fa5004f7",
     "patch_directories": [
       "patches/red/patches/issue-26091823140848"
     ],
-    "patch_count": 10,
-    "archive_sha256": "8d3f3f5e3587c44c17f7fb50ab05dcb87a43bdaaef977bf20af73915f0deb582",
+    "patch_count": 12,
+    "archive_sha256": "0ffe86dd2d768fd1b9a4e0548fe76feaa6d765d854bf80905babf1648ecb8ef3",
     "allowed_untracked": []
   },
-  "monorepo_commit": "83b24d53ece183cd7c77de86194d80a34dad1b1c",
+  "monorepo_commit": "06408a41b0331eaa4ef85370c4c2be9515a24dfa",
   "grammar_revision": "bb3f533e5792260291945e1f329e1f0a779def6e",
   "query_revision": "4d9466677a5ceadef104eaa0fe08d60d91c4e9a7",
   "deployment_target": "26.0"

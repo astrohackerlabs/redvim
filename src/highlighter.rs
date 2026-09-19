@@ -21,6 +21,8 @@ use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator, Tree}
 use tree_sitter_language::LanguageFn;
 
 mod bundled_checks;
+mod sql_checks;
+mod sql_recovery;
 pub use bundled_checks::check_bundled_languages;
 
 use crate::{
@@ -148,6 +150,7 @@ impl LanguageRegistry {
                         | "swift"
                         | "xml"
                         | "make"
+                        | "sql"
                 ),
             });
         }
@@ -598,6 +601,7 @@ const MAX_CACHED_HIGHLIGHT_BYTES: usize = 64 * 1024;
 const MAX_CACHED_HIGHLIGHT_SPANS: usize = 4_096;
 
 const LANGUAGE_NAMES: &[(&str, &str)] = &[
+    ("sql", "sql"),
     ("c", "c"),
     ("cpp", "cpp"),
     ("c++", "cpp"),
@@ -1474,6 +1478,16 @@ impl Highlighter {
                 colors.extend(refinement_colors);
             }
 
+            // The pinned general SQL grammar has known MySQL/SQLite recovery
+            // gaps. Add narrowly scoped token colors without changing its tree
+            // or treating recovery as successful dialect validation.
+            if tree.root_node().has_error()
+                && matches!(grammar, GrammarSource::Bundled(language) if language() == tree_sitter_sequel::LANGUAGE.into())
+                && definition.highlight_queries == [include_str!("queries/highlights/sql.scm")]
+            {
+                sql_recovery::fill_gaps(code, tree.root_node(), &self.theme, &mut colors);
+            }
+
             if depth < MAX_INJECTION_DEPTH {
                 if let Some(injection_query) = &highlighter.injection_query {
                     raw_injections = collect_injections(injection_query, tree.root_node(), code);
@@ -2277,6 +2291,16 @@ fn file_extension(file: &str) -> Option<String> {
 
 fn language_definitions() -> Vec<BundledLanguageDefinition> {
     vec![
+        BundledLanguageDefinition {
+            id: "sql",
+            extensions: &["sql"],
+            filenames: &[],
+            language: Some(|| tree_sitter_sequel::LANGUAGE.into()),
+            highlight_queries: &[include_str!("queries/highlights/sql.scm")],
+            textobject_queries: &[],
+            injection_query: None,
+            specialized: None,
+        },
         BundledLanguageDefinition {
             id: "c",
             extensions: &["c", "h"],
@@ -5303,6 +5327,7 @@ mod tests {
                 "python",
                 "ruby",
                 "rust",
+                "sql",
                 "swift",
                 "toml",
                 "tsx",

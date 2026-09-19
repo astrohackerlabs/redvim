@@ -1,7 +1,7 @@
 # RedVim
 
 Astrohacker's modal editor, based on [Red](https://github.com/codersauce/red).
-Nushell, C, C++, Python, HTML, CSS, Ruby, Zig, Swift, XML/SVG and Makefile syntax
+SQL, Nushell, C, C++, Python, HTML, CSS, Ruby, Zig, Swift, XML/SVG and Makefile syntax
 highlighting are built in alongside Red's existing languages. No external parser, query file, or
 grammar trust command is required.
 

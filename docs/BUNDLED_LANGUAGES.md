@@ -1,6 +1,6 @@
 # Bundled language expansion
 
-RedVim compiles C, C++, Python, HTML, CSS, Ruby, Zig, Swift, XML/SVG and Make
+RedVim compiles SQL, C, C++, Python, HTML, CSS, Ruby, Zig, Swift, XML/SVG and Make
 parsers into the executable and embeds their highlighting queries. Existing
 languages, including Nushell, remain available. No Neovim installation, external
 parser/query files, trust command or runtime download is needed.
@@ -8,6 +8,7 @@ parser/query files, trust command or runtime download is needed.
 | Language | Files | Default indentation |
 | --- | --- | --- |
 | C | .c, .h | 4 spaces |
+| SQL | .sql (case-insensitive), explicit sql syntax, Markdown sql fences | 4 spaces |
 | C++ | .cc, .cpp, .cxx, .hpp, .hxx, .hh | 4 spaces |
 | Python | .py, .pyi; python/python3 shebang | 4 spaces |
 | HTML | .html, .htm | 2 spaces |
@@ -33,7 +34,7 @@ is not a compiler or dialect conformance check.
 
 Cargo.toml pins exact crate versions and Cargo.lock pins archive checksums.
 `languages-provenance.json` records crate checksums, upstream source revisions,
-query paths/hashes and license hashes. All ten crates declare MIT; their license
+query paths/hashes and license hashes. All eleven crates declare MIT; their license
 texts are in docs/licenses and distributed in the binary archive. When the crate
 omits its license file, the recorded source URL identifies the exact upstream
 revision used to retrieve it.
@@ -58,3 +59,29 @@ built-ins without reading external grammar configuration. Tests additionally
 cover detection overrides, default comments/indentation and Make tabs.
 
 Nushell's independently pinned provenance remains in docs/NUSHELL.md.
+
+## SQL dialect boundary
+
+SQL uses the checksummed `tree-sitter-sequel =0.3.11` crate. Its published VCS
+metadata reports a dirty source tree; the crate checksum, not its Git revision
+alone, is the exact parser authority. The copied query translates Lua numeric
+patterns to Rust regexes and maps field/parameter/storageclass captures to
+property/variable.parameter/keyword. Normal configuration and theme overrides
+remain supported; comments use `--` and indentation defaults to four spaces.
+
+The general grammar recovers with ERROR nodes on MySQL DATETIME precision,
+charset/collation assignments, session-variable SET statements, prepared
+statements and some Drizzle named UNIQUE constraints, and SQLite AUTOINCREMENT.
+The tree is preserved, including those errors. A narrow supplemental pass colors
+uncovered PREPARE, DEALLOCATE, AUTOINCREMENT, UNIQUE and ASCII-named @session variables
+inside recovery regions. It skips quoted strings/identifiers and comments and
+does not override query colors. It applies only to the bundled SQL grammar and
+its default query, including configured aliases of that built-in grammar.
+
+The self-check verifies concrete MySQL/SQLite token colors, including statements
+after recovery, alongside an error-free basic SQL fixture. Tests cover overrides,
+fences, Unicode, incomplete edits, undo, and quoted/commented lookalikes. The
+developer example `check_sql_files` reports recovery nodes and asserts token
+colors against real migration files without executing them. Syntax highlighting
+is provided; dialect conformance, SQL execution, formatting, language servers
+and SQL embedded inside other host languages are not part of this support.

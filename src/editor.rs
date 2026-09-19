@@ -6657,6 +6657,7 @@ impl Editor {
                 ("ruby", 2),
                 ("zig", 4),
                 ("swift", 4),
+                ("sql", 4),
                 ("xml", 2),
             ]
             .map(|(file_type, shift_width)| {
@@ -34505,6 +34506,7 @@ builtin = "rust"
             ("formula.rb.in", 2, "#"),
             ("example.zig", 4, "//"),
             ("example.swift", 4, "//"),
+            ("example.sql", 4, "--"),
             ("example.svg", 2, "<!--"),
             ("Makefile", 8, "#"),
         ] {
@@ -34523,6 +34525,61 @@ builtin = "rust"
         assert!(!editor.indentation().expand_tab);
         assert_eq!(editor.indentation().whitespace_for_columns(8), "\t");
         assert_eq!(editor.current_buffer().contents(), "all:\n\t@echo hello\n");
+    }
+
+    #[tokio::test]
+    async fn sql_manual_syntax_overrides_and_undo_refresh_colors() {
+        let mut editor = rust_test_editor(100, 120, 22);
+        editor.buffer_manager[0] = Buffer::new(Some("notes.txt".into()), "SELECT 'café';\n".into());
+        editor
+            .current_buffer_mut()
+            .set_syntax_selection(SyntaxSelection::Language("sql".into()));
+        assert_eq!(editor.current_language_id().as_deref(), Some("sql"));
+        let shape = |spans: Vec<HighlightSpan>| {
+            spans
+                .into_iter()
+                .map(|s| (s.start, s.end, s.style))
+                .collect::<Vec<_>>()
+        };
+        let before = shape(editor.viewport_highlight_spans(0, 0, 10).unwrap());
+        assert!(!before.is_empty());
+        for action in [
+            Action::EnterMode(Mode::Insert),
+            Action::InsertCharAtCursorPos('-'),
+            Action::InsertCharAtCursorPos('-'),
+            Action::EnterMode(Mode::Normal),
+        ] {
+            editor.test_execute_production_action(action).await.unwrap();
+        }
+        assert_ne!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), "SELECT 'café';\n");
+        assert_eq!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[languages.sql]\nindent_width = 2\ncomment = '-- custom %s'\n",
+        )
+        .unwrap();
+        editor.set_language_reload_source(path, Vec::new());
+        editor.reload_languages().await.unwrap();
+        assert_eq!(editor.indentation().shift_width, 2);
+        assert!(editor.toggle_comment_lines(0, 0));
+        assert!(editor
+            .current_buffer()
+            .contents()
+            .starts_with("-- custom SELECT"));
     }
 
     #[test]

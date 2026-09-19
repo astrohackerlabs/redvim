@@ -138,5 +138,21 @@
     "license_file": "tree-sitter-make.txt",
     "license_sha256": "28eecdb75b6de2d9020603531461444bf54db827ee2fb345a8fcf4dbee7c2ad1",
     "license_source": "https://raw.githubusercontent.com/tree-sitter-grammars/tree-sitter-make/5e9e8f8ff3387b0edcaa90f46ddf3629f4cfeb1d/LICENSE"
+  },
+  {
+    "name": "tree-sitter-sequel",
+    "version": "0.3.11",
+    "crate_sha256": "9d198ad3c319c02e43c21efa1ec796b837afcb96ffaef1a40c1978fbdcec7d17",
+    "repository": "https://github.com/DerekStride/tree-sitter-sql",
+    "revision": "7b51ecda191d36b92f5a90a8d1bc3faef1c7b8b8",
+    "published_vcs_dirty": true,
+    "source_authority": "The checksummed published crate; its VCS metadata reports dirty, so the revision alone is not an exact source reconstruction.",
+    "query": "queries/highlights.scm",
+    "upstream_query_sha256": "80e726903b67fbe471bf1272a447ab6a6758e95654f9e9c8f5c2e4af729af8de",
+    "bundled_query_sha256": "caf961cb96ba197956556a2e60c4759cf7a7a4b844ab295d6a934bd0e82224b5",
+    "license": "MIT",
+    "license_file": "tree-sitter-sequel.txt",
+    "license_sha256": "3b3e4e4252d5d7d1c18e1257005f23242bf0580ad619204fd093c99b8c56748d",
+    "license_source": "https://raw.githubusercontent.com/DerekStride/tree-sitter-sql/7b51ecda191d36b92f5a90a8d1bc3faef1c7b8b8/LICENSE"
   }
 ]
