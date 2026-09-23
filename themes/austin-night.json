@@ -1641,6 +1641,72 @@
       "settings": {
         "foreground": "#7aa2f7"
       }
+    },
+    {
+      "name": "Markdown - Level 1",
+      "scope": [
+        "heading.1.markdown",
+        "punctuation.definition.heading.h1.markdown"
+      ],
+      "settings": {
+        "fontStyle": "bold",
+        "foreground": "#7dcfff"
+      }
+    },
+    {
+      "name": "Markdown - Level 2",
+      "scope": [
+        "heading.2.markdown",
+        "punctuation.definition.heading.h2.markdown"
+      ],
+      "settings": {
+        "fontStyle": "bold",
+        "foreground": "#7aa2f7"
+      }
+    },
+    {
+      "name": "Markdown - Level 3",
+      "scope": [
+        "heading.3.markdown",
+        "punctuation.definition.heading.h3.markdown"
+      ],
+      "settings": {
+        "fontStyle": "bold",
+        "foreground": "#bb9af7"
+      }
+    },
+    {
+      "name": "Markdown - Level 4",
+      "scope": [
+        "heading.4.markdown",
+        "punctuation.definition.heading.h4.markdown"
+      ],
+      "settings": {
+        "fontStyle": "bold",
+        "foreground": "#9ece6a"
+      }
+    },
+    {
+      "name": "Markdown - Level 5",
+      "scope": [
+        "heading.5.markdown",
+        "punctuation.definition.heading.h5.markdown"
+      ],
+      "settings": {
+        "fontStyle": "bold",
+        "foreground": "#e8a84a"
+      }
+    },
+    {
+      "name": "Markdown - Level 6",
+      "scope": [
+        "heading.6.markdown",
+        "punctuation.definition.heading.h6.markdown"
+      ],
+      "settings": {
+        "fontStyle": "bold",
+        "foreground": "#9aa5ce"
+      }
     }
   ]
 }

@@ -3096,36 +3096,36 @@ const TSX_HIGHLIGHT_QUERIES: &[&str] = &[
 
 const MARKDOWN_HIGHLIGHT_QUERY: &str = r#"
 (atx_heading
-  (atx_h1_marker) @punctuation.definition.heading.markdown
+  (atx_h1_marker) @punctuation.definition.heading.h1.markdown
   (inline) @heading.1.markdown)
 
 (atx_heading
-  (atx_h2_marker) @punctuation.definition.heading.markdown
+  (atx_h2_marker) @punctuation.definition.heading.h2.markdown
   (inline) @heading.2.markdown)
 
 (atx_heading
-  (atx_h3_marker) @punctuation.definition.heading.markdown
+  (atx_h3_marker) @punctuation.definition.heading.h3.markdown
   (inline) @heading.3.markdown)
 
 (atx_heading
-  (atx_h4_marker) @punctuation.definition.heading.markdown
+  (atx_h4_marker) @punctuation.definition.heading.h4.markdown
   (inline) @heading.4.markdown)
 
 (atx_heading
-  (atx_h5_marker) @punctuation.definition.heading.markdown
+  (atx_h5_marker) @punctuation.definition.heading.h5.markdown
   (inline) @heading.5.markdown)
 
 (atx_heading
-  (atx_h6_marker) @punctuation.definition.heading.markdown
+  (atx_h6_marker) @punctuation.definition.heading.h6.markdown
   (inline) @heading.6.markdown)
 
 (setext_heading
-  (paragraph) @markup.heading.setext.1.markdown
-  (setext_h1_underline) @punctuation.definition.heading.markdown)
+  (paragraph) @heading.1.markdown
+  (setext_h1_underline) @punctuation.definition.heading.h1.markdown)
 
 (setext_heading
-  (paragraph) @markup.heading.setext.2.markdown
-  (setext_h2_underline) @punctuation.definition.heading.markdown)
+  (paragraph) @heading.2.markdown
+  (setext_h2_underline) @punctuation.definition.heading.h2.markdown)
 
 [
   (list_marker_plus)
@@ -5804,6 +5804,58 @@ describe("StateStore", async () => {
     }
 
     #[test]
+    fn markdown_colors_each_heading_level_with_austin_night() {
+        let theme = parse_vscode_theme("themes/austin-night.json").unwrap();
+        let mut highlighter = Highlighter::new(&theme).unwrap();
+        let code = "# Alpha\n## Bravo\n### Charlie\n#### Delta\n##### Echo\n###### Foxtrot\n\nplain\n\n# Mix *em* tail\n\nUnderline\n==========\n\nDashed\n----------\n";
+        let styles = highlighter
+            .highlight_for_file(Some("note.md"), code)
+            .unwrap();
+        let levels = [
+            ("Alpha", "#", "heading.1.markdown", 0x7d, 0xcf, 0xff),
+            ("Bravo", "##", "heading.2.markdown", 0x7a, 0xa2, 0xf7),
+            ("Charlie", "###", "heading.3.markdown", 0xbb, 0x9a, 0xf7),
+            ("Delta", "####", "heading.4.markdown", 0x9e, 0xce, 0x6a),
+            ("Echo", "#####", "heading.5.markdown", 0xe8, 0xa8, 0x4a),
+            ("Foxtrot", "######", "heading.6.markdown", 0x9a, 0xa5, 0xce),
+        ];
+        let mut foregrounds = Vec::new();
+        for (title, marker, scope, r, g, b) in levels {
+            let style = theme.get_style(scope).unwrap();
+            assert!(style.bold, "{scope} should be bold");
+            assert_eq!(style.fg, Some(Color::Rgb { r, g, b }), "{scope} foreground");
+            assert_eq!(style_covering(&styles, code, title), Some(&style));
+            assert_eq!(style_covering(&styles, code, marker), Some(&style));
+            assert!(
+                foregrounds.iter().all(|earlier| earlier != &style.fg),
+                "{scope} repeats an earlier heading color"
+            );
+            foregrounds.push(style.fg);
+        }
+
+        let h1 = theme.get_style("heading.1.markdown").unwrap();
+        let h2 = theme.get_style("heading.2.markdown").unwrap();
+        assert_eq!(style_covering(&styles, code, "Mix"), Some(&h1));
+        assert_eq!(style_covering(&styles, code, "tail"), Some(&h1));
+        assert_eq!(
+            style_covering(&styles, code, "em"),
+            Some(&theme.get_style("markup.italic").unwrap())
+        );
+        assert_eq!(style_covering(&styles, code, "Underline"), Some(&h1));
+        assert_eq!(style_covering(&styles, code, "=========="), Some(&h1));
+        assert_eq!(style_covering(&styles, code, "Dashed"), Some(&h2));
+        assert_eq!(style_covering(&styles, code, "----------"), Some(&h2));
+
+        let plain = code.find("plain").unwrap();
+        assert!(
+            styles
+                .iter()
+                .all(|style| style.end <= plain || style.start >= plain + "plain".len()),
+            "plain paragraph words should stay unstyled"
+        );
+    }
+
+    #[test]
     fn markdown_highlights_inline_spans_with_austin_night() {
         let theme = parse_vscode_theme("themes/austin-night.json").unwrap();
         let mut highlighter = Highlighter::new(&theme).unwrap();
@@ -5832,19 +5884,9 @@ describe("StateStore", async () => {
                 .all(|style| style.end <= plain || style.start >= plain + "plain".len()),
             "plain paragraph words should stay unstyled"
         );
-        assert!(
-            styles
-                .iter()
-                .any(|style| style.start == 0 && style.end == 1),
-            "markdown heading marker should still be highlighted"
-        );
-        let title = code.find("Title").unwrap();
-        assert!(
-            styles
-                .iter()
-                .all(|style| style.end <= title || style.start >= title + "Title".len()),
-            "plain heading words stay unstyled"
-        );
+        let heading = theme.get_style("heading.1.markdown").unwrap();
+        assert_eq!(style_covering(&styles, code, "#"), Some(&heading));
+        assert_eq!(style_covering(&styles, code, "Title"), Some(&heading));
     }
 
     fn style_covering<'a>(styles: &'a [StyleInfo], code: &str, token: &str) -> Option<&'a Style> {
