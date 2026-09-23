@@ -593,6 +593,9 @@ fn markdown_scope_aliases(scope: &str) -> &'static [&'static str] {
         "markup.underline.link.markdown" => {
             &["string.other.link.title.markdown", "markup.underline"]
         }
+        "text.emphasis" => &["markup.italic"],
+        "text.strong" => &["markup.bold"],
+        "text.uri" | "text.reference" => &["markup.underline.link"],
         _ => &[],
     }
 }
@@ -1389,6 +1392,35 @@ mod tests {
 
         assert_eq!(resolved.bg, token_style.bg);
         assert!(resolved.italic);
+    }
+
+    #[test]
+    fn get_style_matches_markdown_inline_aliases() {
+        let italic = style(192, 202, 245);
+        let bold = style(192, 202, 246);
+        let link = style(125, 207, 255);
+        let theme = theme_with_token_styles(vec![
+            TokenStyle {
+                name: None,
+                scope: vec!["markup.italic".to_string()],
+                style: italic.clone(),
+            },
+            TokenStyle {
+                name: None,
+                scope: vec!["markup.bold".to_string()],
+                style: bold.clone(),
+            },
+            TokenStyle {
+                name: None,
+                scope: vec!["markup.underline.link".to_string()],
+                style: link.clone(),
+            },
+        ]);
+
+        assert_eq!(theme.get_style("text.emphasis"), Some(italic));
+        assert_eq!(theme.get_style("text.strong"), Some(bold));
+        assert_eq!(theme.get_style("text.uri"), Some(link.clone()));
+        assert_eq!(theme.get_style("text.reference"), Some(link));
     }
 
     #[test]
