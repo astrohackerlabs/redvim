@@ -556,9 +556,10 @@ const FIXTURES: &[Fixture] = &[
 /// reading user configuration, loading external grammars or entering raw mode.
 pub fn check_bundled_languages(theme: &Theme) -> anyhow::Result<Vec<&'static str>> {
     super::sql_checks::check(theme)?;
+    super::typst_checks::check(theme)?;
     let registry = Arc::new(LanguageRegistry::bundled());
     let mut highlighter = Highlighter::with_registry(theme, Arc::clone(&registry))?;
-    let mut checked = Vec::new();
+    let mut checked = vec!["typst"];
     for fixture in FIXTURES {
         let id = fixture.language;
         anyhow::ensure!(
@@ -1759,7 +1760,7 @@ mod tests {
     fn common_languages_parse_and_render_with_embedded_mocha() {
         let theme = parse_vscode_theme_contents(include_str!("../../themes/mocha.json")).unwrap();
         let checked = check_bundled_languages(&theme).unwrap();
-        assert_eq!(checked.len(), 20);
+        assert_eq!(checked.len(), 21);
     }
 
     #[test]

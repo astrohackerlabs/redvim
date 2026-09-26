@@ -23,6 +23,9 @@ use tree_sitter_language::LanguageFn;
 mod bundled_checks;
 mod sql_checks;
 mod sql_recovery;
+mod typst_checks;
+#[cfg(test)]
+mod typst_tests;
 pub use bundled_checks::check_bundled_languages;
 
 use crate::{
@@ -668,6 +671,8 @@ const LANGUAGE_NAMES: &[(&str, &str)] = &[
     ("fish", "fish"),
     ("nu", "nu"),
     ("nushell", "nu"),
+    ("typst", "typst"),
+    ("typ", "typst"),
     ("powershell", "powershell"),
     ("pwsh", "powershell"),
     ("ps1", "powershell"),
@@ -2630,6 +2635,16 @@ fn language_definitions() -> Vec<BundledLanguageDefinition> {
             highlight_queries: &[include_str!("queries/highlights/nu.scm")],
             textobject_queries: &[],
             injection_query: None,
+            specialized: None,
+        },
+        BundledLanguageDefinition {
+            id: "typst",
+            extensions: &["typ"],
+            filenames: &[],
+            language: Some(|| tree_sitter_typst::LANGUAGE.into()),
+            highlight_queries: &[include_str!("queries/highlights/typst.scm")],
+            textobject_queries: &[],
+            injection_query: Some(include_str!("queries/injections/typst.scm")),
             specialized: None,
         },
         BundledLanguageDefinition {
@@ -5575,6 +5590,7 @@ mod tests {
                 "toml",
                 "tsx",
                 "typescript",
+                "typst",
                 "wgsl",
                 "xml",
                 "yaml",

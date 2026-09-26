@@ -489,5 +489,78 @@
     "license_file": "tree-sitter-applescript.txt",
     "license_source": "https://raw.githubusercontent.com/HelgeSverre/tree-sitter-applescript/1676f5fe99eee6b6532ab6d13559323c48d26190/LICENSE",
     "license_sha256": "a65a537295910b776a8b2edb2e7410c3b0e975ca6388994e032c4d1842b4952d"
+  },
+  {
+    "name": "tree-sitter-typst",
+    "version": "0.1.0",
+    "repository": "https://github.com/SeniorMars/tree-sitter-typst",
+    "revision": "1acd48c90d260bc9f8a99f903d3e2a8031bc7aae",
+    "license": "MIT",
+    "license_file": "tree-sitter-typst.txt",
+    "license_sha256": "1d1d91dd869aa375e732fbec41560408072c021812f2a4a16d5b572c7620d56d",
+    "query": "queries/typst/highlights.scm",
+    "upstream_query_sha256": "397b4db9ef7a52bc394c37b2c65b3c5a4c9c83207fd2292488a0dc7caff25532",
+    "bundled_query_sha256": "341c4cb681118400de3a1b8f53baf7d521bf0c1d00ed956d6f49394a9516d27e",
+    "upstream_injections_sha256": "6722beb22f591393cb0ddab8f0836c343f06d6dd880085d94c2feb4303a67026",
+    "bundled_injections_sha256": "6722beb22f591393cb0ddab8f0836c343f06d6dd880085d94c2feb4303a67026",
+    "native_files": [
+      {
+        "path": "src/parser.c",
+        "sha256": "cc0d291d4f3dcb65fb15ee68577eab77013f9dd0148e6916df76fa3da8e3fb8b"
+      },
+      {
+        "path": "src/scanner.c",
+        "sha256": "19695f8792acd9ee417102366d56ab05ff05f1d5648c19d154ef8f1a1acb6e64"
+      },
+      {
+        "path": "src/external_tokens.h",
+        "sha256": "2cf015f8838a3f08c3dcf434e7097f3be532e7ab52fdc531bb45819426ea8e3c"
+      },
+      {
+        "path": "src/unicode_tables.h",
+        "sha256": "69724162ca485ad065d321d4d2d4de71bba2958e9a1fb04cc7bc4710f9352cd3"
+      },
+      {
+        "path": "src/node-types.json",
+        "sha256": "2a97b516d665adcf09e282cbc1ef9fd9fe213415558f96bb92c72e876e19b991"
+      },
+      {
+        "path": "src/grammar.json",
+        "sha256": "fa834dc7ace411a6f41ed5c5c792394388f61071e3e5a4f34661fc434bdec7fe"
+      },
+      {
+        "path": "src/tree_sitter/parser.h",
+        "sha256": "180b893c8734778fd32f372dfbc27bd6ad1cd2221f26150b31256ff6716320d2"
+      },
+      {
+        "path": "src/tree_sitter/alloc.h",
+        "sha256": "b29c1c9fb7cc82f58c84b376df1297d6e2737a1d655fd356db0859e3c29c2fea"
+      },
+      {
+        "path": "src/tree_sitter/array.h",
+        "sha256": "31e60a1bff6f715afacce03b5b70efe42b58371b4f9595dd4af52a577ff9608c"
+      },
+      {
+        "path": "bindings/rust/lib.rs",
+        "sha256": "cd763cc30ab75d928ca467be89aac8b324f25dd57de0fe5907bf10f97d93e616"
+      },
+      {
+        "path": "bindings/rust/build.rs",
+        "sha256": "7434693e50cbd559854647978fc5afd2d12628815a41551d8b036c9dc812eafa"
+      },
+      {
+        "path": "Cargo.toml",
+        "sha256": "dbec8983de4592bc26eb5948adfb316c7a165fcb02f374c118ed06c34b0973ae"
+      },
+      {
+        "path": "grammar.js",
+        "sha256": "27aee083fe78fdcee90d6b053049d5c0d8a278414d7e18c31a63a084aa6bbf7f"
+      },
+      {
+        "path": "tree-sitter.json",
+        "sha256": "8ababff6621c741b4e1ce4a2965c7a72c1738b57fc9960dcd6cc6e764cb0c728"
+      }
+    ],
+    "adaptations": "Highlight captures map to RedVim scopes; all raw content receives a string fallback before supported language injections. Injection query unchanged. Native sources unchanged."
   }
 ]

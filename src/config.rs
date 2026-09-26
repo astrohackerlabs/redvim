@@ -736,6 +736,7 @@ fn default_comment_templates() -> HashMap<String, String> {
         ("lua", "-- %s"),
         ("markdown", "<!-- %s -->"),
         ("nu", "# %s"),
+        ("typst", "// %s"),
         ("hcl", "# %s"),
         ("objc", "// %s"),
         ("proto", "// %s"),

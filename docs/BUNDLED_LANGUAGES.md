@@ -1,12 +1,13 @@
 # Bundled language expansion
 
-RedVim compiles AppleScript, Caddyfile, WGSL, GN, Dockerfile, Protocol Buffers, Objective-C, Terraform/HCL, SQL, C, C++, Python, HTML, CSS, Ruby, Zig, Swift, XML/SVG and Make
+RedVim compiles Typst, AppleScript, Caddyfile, WGSL, GN, Dockerfile, Protocol Buffers, Objective-C, Terraform/HCL, SQL, C, C++, Python, HTML, CSS, Ruby, Zig, Swift, XML/SVG and Make
 parsers into the executable and embeds their highlighting queries. Existing
 languages, including Nushell, remain available. No Neovim installation, external
 parser/query files, trust command or runtime download is needed.
 
 | Language | Files | Default indentation |
 | --- | --- | --- |
+| Typst | .typ (case-insensitive); typst/typ syntax and fences | 2 spaces |
 | Caddyfile | Caddyfile/caddyfile and their dot variants; .caddy/.caddyfile; caddyfile/caddy syntax and fences | tabs, width 4 |
 | WGSL | .wgsl (case-insensitive), wgsl syntax and fences | 2 spaces |
 | GN | .gn, .gni (case-insensitive), exact .gn filename; gn/gni syntax and fences | 2 spaces |
@@ -66,6 +67,35 @@ built-ins without reading external grammar configuration. Tests additionally
 cover detection overrides, default comments/indentation and Make tabs.
 
 Nushell's independently pinned provenance remains in docs/NUSHELL.md.
+
+## Typst
+
+Typst uses SeniorMars/tree-sitter-typst revision
+`1acd48c90d260bc9f8a99f903d3e2a8031bc7aae` (MIT), compiled through its
+LanguageFn Rust binding with the existing Tree-sitter 0.25 runtime. The checked-in
+native parser, scanner, headers and build script are unchanged. No generator or
+Node installation is required. Cargo fetches the pinned dependency at build time;
+normal editor use needs no grammar or query downloads.
+
+The query adapts Neovim captures to existing RedVim scopes: heading levels use
+the existing heading styles, strong/emphasis use text.strong/text.emphasis,
+links use text.uri/text.reference, raw text and unclassified math text use string,
+members use property, modules use type, labels use constant, malformed/incomplete
+syntax uses token.error-token. Original predicates remain standard Tree-sitter
+predicates. Query and native-file hashes are in languages-provenance.json.
+
+Raw blocks use the unchanged upstream injection query. Registered language tags
+use their bundled highlighting; unknown languages retain the raw string style.
+The typ/typst tags select the default markup parser, which also handles embedded
+code and math. Companion typc/typm parsers are not bundled. The existing injection
+depth limit applies to recursive blocks.
+
+Comments use // and indentation defaults to two spaces with ordinary inherited
+indentation. User detection, theme, comment and width overrides remain effective.
+This support does not supply structural indentation, Typst textobjects, Tinymist,
+completion, semantic diagnostics, compilation, formatting or PDF preview.
+Upstream recovery nodes are checked alongside ERROR/MISSING in complete fixtures;
+tolerating incomplete edits is not a claim of full Typst compiler conformance.
 
 ## Terraform/HCL
 

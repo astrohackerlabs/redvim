@@ -6649,6 +6649,7 @@ impl Editor {
                 ("zsh", 2),
                 ("fish", 4),
                 ("nu", 2),
+                ("typst", 2),
                 ("c", 4),
                 ("cpp", 4),
                 ("python", 4),
@@ -34523,6 +34524,7 @@ builtin = "rust"
             ("example.wgsl", 2, "//"),
             ("Caddyfile", 4, "#"),
             ("example.applescript", 4, "--"),
+            ("example.typ", 2, "//"),
             ("example.tf", 2, "#"),
             ("example.svg", 2, "<!--"),
             ("Makefile", 8, "#"),
@@ -34818,6 +34820,77 @@ builtin = "rust"
             .current_buffer()
             .contents()
             .starts_with("# custom FROM"));
+    }
+
+    #[tokio::test]
+    async fn typst_manual_syntax_overrides_and_undo_refresh_colors() {
+        let mut editor = rust_test_editor(100, 120, 22);
+        let source = "#let message = \"café\"\n";
+        editor.buffer_manager[0] = Buffer::new(Some("notes.txt".into()), source.into());
+        editor
+            .current_buffer_mut()
+            .set_syntax_selection(SyntaxSelection::Language("typst".into()));
+        assert_eq!(editor.current_language_id().as_deref(), Some("typst"));
+        assert_eq!(editor.indentation().shift_width, 2);
+        assert!(editor.indentation().expand_tab);
+        for action in [
+            Action::EnterMode(Mode::Insert),
+            Action::InsertTab,
+            Action::EnterMode(Mode::Normal),
+        ] {
+            editor.test_execute_production_action(action).await.unwrap();
+        }
+        assert!(editor.current_buffer().contents().starts_with("  "));
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), source);
+        let shape = |spans: Vec<HighlightSpan>| {
+            spans
+                .into_iter()
+                .map(|s| (s.start, s.end, s.style))
+                .collect::<Vec<_>>()
+        };
+        let before = shape(editor.viewport_highlight_spans(0, 0, 10).unwrap());
+        assert!(!before.is_empty());
+        for action in [
+            Action::EnterMode(Mode::Insert),
+            Action::InsertCharAtCursorPos('/'),
+            Action::InsertCharAtCursorPos('/'),
+            Action::EnterMode(Mode::Normal),
+        ] {
+            editor.test_execute_production_action(action).await.unwrap();
+        }
+        assert_ne!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), source);
+        assert_eq!(
+            shape(editor.viewport_highlight_spans(0, 0, 10).unwrap()),
+            before
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[languages.typst]\nindent_width = 6\ncomment = '// custom %s'\n",
+        )
+        .unwrap();
+        editor.set_language_reload_source(path, Vec::new());
+        editor.reload_languages().await.unwrap();
+        assert_eq!(editor.indentation().shift_width, 6);
+        assert!(editor.indentation().expand_tab);
+        assert!(editor.toggle_comment_lines(0, 0));
+        assert!(editor
+            .current_buffer()
+            .contents()
+            .starts_with("// custom #let message"));
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 [package]
 name = "red"
-version = "0.7.8"
+version = "0.7.9"
 edition = "2021"
 default-run = "redvim"
 autobins = false
@@ -124,6 +124,7 @@ tree-sitter-json = "0.24.8"
 tree-sitter-lua = "0.5.0"
 tree-sitter-md = "0.5.3"
 tree-sitter-nu = { git = "https://github.com/nushell/tree-sitter-nu", rev = "bb3f533e5792260291945e1f329e1f0a779def6e" }
+tree-sitter-typst = { git = "https://github.com/SeniorMars/tree-sitter-typst", rev = "1acd48c90d260bc9f8a99f903d3e2a8031bc7aae" }
 tree-sitter-powershell = "0.26.4"
 tree-sitter-rust = "0.24.2"
 tree-sitter-toml-ng = "0.7.0"
