@@ -34465,7 +34465,8 @@ builtin = "rust"
         let contents = editor.buffer_manager[0].contents();
         editor.set_language_reload_source(config_path, Vec::new());
 
-        assert_eq!(editor.reload_languages().await.unwrap(), 1);
+        assert_eq!(editor.reload_languages().await.unwrap(), 2);
+        assert!(editor.config.languages.contains_key("markdown"));
         assert_eq!(editor.current_language_id().as_deref(), Some("buildspec"));
         assert_eq!(editor.buffer_manager[0].contents(), contents);
         assert_eq!(editor.indentation().shift_width, 2);
@@ -35257,7 +35258,7 @@ builtin = "rust"
         assert!(editor.config.languages.contains_key("buildspec"));
         assert_eq!(
             editor.last_error.as_deref(),
-            Some("reloaded 1 configured language")
+            Some("reloaded 2 configured languages")
         );
     }
 
@@ -43073,6 +43074,84 @@ builtin = "rust"
         assert_eq!(editor.current_buffer().contents(), "HELLO\n");
         assert_eq!(std::fs::read_to_string(path).unwrap(), "HELLO\n");
         assert!(!editor.current_buffer().is_dirty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires an installed Prettier; run explicitly during release qualification"]
+    async fn markdown_prettier_formats_unsaved_buffer_and_save_with_embedded_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("document with spaces.md");
+        let input = include_str!("../tests/fixtures/markdown-formatting.md");
+        std::fs::write(&path, "").unwrap();
+        // Conflicting project settings must not override the requested CLI policy.
+        std::fs::write(
+            root.path().join(".prettierrc"),
+            r#"{"printWidth":120,"proseWrap":"never"}"#,
+        )
+        .unwrap();
+        let mut loaded = Config::load_user_file(&root.path().join("config.toml"), &[]).unwrap();
+        crate::language::finalize_language_configuration(&mut loaded, root.path()).unwrap();
+        assert!(loaded.is_clean(), "{:?}", loaded.diagnostics);
+        loaded.config.lsp.enabled = false;
+        let formatter = loaded.config.languages["markdown"]
+            .formatter
+            .as_ref()
+            .unwrap();
+        assert!(
+            crate::formatter::is_available(formatter, &path),
+            "Prettier is required for this qualification test"
+        );
+        let expected = crate::formatter::format_document(formatter, &path, input)
+            .await
+            .unwrap()
+            .unwrap()
+            .contents;
+        assert_ne!(input, expected);
+        assert!(expected.lines().all(|line| line.chars().count() <= 80));
+        assert_eq!(
+            input.split_whitespace().collect::<Vec<_>>(),
+            expected.split_whitespace().collect::<Vec<_>>()
+        );
+        let lsp = Box::new(crate::lsp::LspManager::new(loaded.config.lsp.clone()));
+        let buffer = Buffer::new(Some(path.to_string_lossy().into_owned()), String::new());
+        let mut editor =
+            Editor::with_size(lsp, 80, 24, loaded.config, Theme::default(), vec![buffer]).unwrap();
+        editor.test_disable_terminal_output();
+        editor.current_buffer_mut().insert_str(0, 0, input);
+        editor
+            .test_execute_production_action(Action::FormatDocument)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), expected);
+        assert_eq!(
+            editor.last_error.as_deref(),
+            Some("formatted with Prettier")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        editor
+            .test_execute_production_action(Action::FormatDocument)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), expected);
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), input);
+        editor.config.formatting.on_save = false;
+        editor
+            .test_execute_production_action(Action::Save)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), input);
+        editor.config.formatting.on_save = true;
+        editor
+            .test_execute_production_action(Action::Save)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        assert_eq!(editor.current_buffer().contents(), expected);
     }
 
     #[cfg(unix)]

@@ -1084,11 +1084,6 @@ fn finalize_runtime_config(
     {
         let manifest = red::plugin::package::PluginPackageManifest::load(&installed.package_root)?;
         apply_plugin_default_keymaps(&mut loaded.config.keys, &manifest.keymaps);
-        red::language::merge_package_languages(
-            &mut loaded.config,
-            &manifest,
-            &installed.package_root,
-        );
         let Some(entrypoint) = manifest.husk_entry(&installed.package_root) else {
             continue;
         };

@@ -224,6 +224,14 @@ waiting = "steady_underscore"
 # language_id = "javascript"
 # file_extensions = ["js", "mjs", "cjs"]
 
+# Markdown formatting is available out of the box with Homebrew's Prettier.
+# Override this table in config.toml to choose different arguments or a tool.
+[languages.markdown.formatter]
+name = "Prettier"
+command = "prettier"
+args = ["--stdin-filepath", "{file}", "--print-width", "80", "--prose-wrap", "always"]
+root_markers = ["package.json", ".git"]
+
 # Unified language definitions can configure syntax, exact filenames, comments,
 # indentation, trusted Tree-sitter grammars, and LSP from one table. Exact
 # filenames are case-sensitive; file extensions are case-insensitive.

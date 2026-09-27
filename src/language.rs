@@ -81,6 +81,17 @@ pub fn merge_package_languages(
 pub fn finalize_language_configuration(loaded: &mut LoadedConfig, config_dir: &Path) -> Result<()> {
     let explicit_servers = loaded.explicit_language_server_names();
     let explicit_comments = loaded.explicit_comment_language_names();
+    let explicit_languages = loaded.explicit_language_names();
+    // Defaults must not masquerade as explicit user definitions and block packs.
+    let mut defaults = std::collections::HashMap::new();
+    loaded.config.languages.retain(|id, definition| {
+        if explicit_languages.contains(id) {
+            true
+        } else {
+            defaults.insert(id.clone(), definition.clone());
+            false
+        }
+    });
     let manager = PluginPackageManager::new(config_dir);
     for package in manager
         .list()?
@@ -89,6 +100,12 @@ pub fn finalize_language_configuration(loaded: &mut LoadedConfig, config_dir: &P
     {
         let manifest = PluginPackageManifest::load(&package.package_root)?;
         merge_package_languages(&mut loaded.config, &manifest, &package.package_root);
+    }
+    for (id, default) in defaults {
+        let definition = loaded.config.languages.entry(id).or_insert(default.clone());
+        if definition.formatter.is_none() {
+            definition.formatter = default.formatter;
+        }
     }
 
     let mut accepted = std::collections::HashMap::new();
@@ -388,6 +405,71 @@ fn inspect_native_grammar(path: &Path) -> Result<(PathBuf, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn markdown_prettier_defaults_do_not_shadow_language_packs() {
+        let root = tempfile::tempdir().unwrap();
+        let package = tempfile::tempdir().unwrap();
+        fs::write(
+            package.path().join("red-plugin.toml"),
+            format!(
+                r#"
+schema_version = 1
+[plugin]
+id = "markdown-tools"
+name = "Markdown tools"
+version = "1.0.0"
+red_api = "^{}"
+[languages.markdown]
+extensions = ["md", "markdown", "mdown"]
+indent_width = 4
+"#,
+                crate::plugin::RED_HOST_API_VERSION
+            ),
+        )
+        .unwrap();
+        let installed = PluginPackageManager::new(root.path())
+            .install_path(package.path())
+            .await
+            .unwrap();
+        let path = root.path().join("config.toml");
+        let mut loaded = Config::load_user_toml("", &path, &[]).unwrap();
+        finalize_language_configuration(&mut loaded, root.path()).unwrap();
+        assert!(loaded.is_clean(), "{:?}", loaded.diagnostics);
+        assert_eq!(loaded.config.languages["markdown"].indent_width, Some(4));
+        assert_eq!(
+            loaded.config.languages["markdown"]
+                .formatter
+                .as_ref()
+                .unwrap()
+                .command,
+            "prettier"
+        );
+        for overrides in [false, true] {
+            let source = "[languages.markdown]\nindent_width = 3";
+            let mut loaded = if overrides {
+                Config::load_user_toml("", &path, &[source.to_string()]).unwrap()
+            } else {
+                Config::load_user_toml(source, &path, &[]).unwrap()
+            };
+            finalize_language_configuration(&mut loaded, root.path()).unwrap();
+            assert_eq!(loaded.config.languages["markdown"].indent_width, Some(3));
+        }
+        let manifest = installed.package_root.join("red-plugin.toml");
+        let mut source = fs::read_to_string(&manifest).unwrap();
+        source.push_str("\n[languages.markdown.formatter]\nname = \"Pack formatter\"\ncommand = \"pack-format\"\n");
+        fs::write(&manifest, source).unwrap();
+        let mut loaded = Config::load_user_toml("", &path, &[]).unwrap();
+        finalize_language_configuration(&mut loaded, root.path()).unwrap();
+        assert_eq!(
+            loaded.config.languages["markdown"]
+                .formatter
+                .as_ref()
+                .unwrap()
+                .command,
+            "pack-format"
+        );
+    }
 
     #[test]
     fn empty_language_lsp_commands_are_quarantined_without_rejecting_valid_languages() {

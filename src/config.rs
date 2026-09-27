@@ -136,7 +136,7 @@ impl LoadedConfig {
     /// Returns legacy server definitions explicitly supplied by the user or CLI.
     #[must_use]
     pub fn explicit_language_server_names(&self) -> HashSet<String> {
-        self.explicit_names_at_path("lsp", "servers")
+        self.explicit_names_at_path(&["lsp", "servers"])
             .into_iter()
             .filter(|name| self.config.lsp.servers.contains_key(name))
             .collect()
@@ -145,10 +145,16 @@ impl LoadedConfig {
     /// Returns legacy comment templates explicitly supplied by the user or CLI.
     #[must_use]
     pub fn explicit_comment_language_names(&self) -> HashSet<String> {
-        self.explicit_names_at_path("commenting", "languages")
+        self.explicit_names_at_path(&["commenting", "languages"])
     }
 
-    fn explicit_names_at_path(&self, section: &str, entries: &str) -> HashSet<String> {
+    /// Returns language definitions explicitly supplied by the user or CLI.
+    #[must_use]
+    pub fn explicit_language_names(&self) -> HashSet<String> {
+        self.explicit_names_at_path(&["languages"])
+    }
+
+    fn explicit_names_at_path(&self, path: &[&str]) -> HashSet<String> {
         let mut names = HashSet::new();
         for source in std::iter::once(self.source_text.as_str())
             .chain(self.override_fragments.iter().map(String::as_str))
@@ -156,9 +162,9 @@ impl LoadedConfig {
             let Ok(value) = source.parse::<toml::Value>() else {
                 continue;
             };
-            if let Some(table) = value
-                .get(section)
-                .and_then(|section| section.get(entries))
+            if let Some(table) = path
+                .iter()
+                .try_fold(&value, |value, key| value.get(*key))
                 .and_then(toml::Value::as_table)
             {
                 names.extend(table.keys().cloned());
@@ -5170,6 +5176,64 @@ workspace_name = "frontend"
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn markdown_prettier_defaults_and_user_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        let fresh = Config::load_user_file(&path, &[]).unwrap();
+        assert!(fresh.is_clean());
+        assert!(!path.exists());
+        let expected = fresh.config.languages["markdown"]
+            .formatter
+            .clone()
+            .unwrap();
+        assert_eq!(expected.command, "prettier");
+        assert_eq!(expected.name, "Prettier");
+        assert_eq!(
+            expected.args,
+            [
+                "--stdin-filepath",
+                "{file}",
+                "--print-width",
+                "80",
+                "--prose-wrap",
+                "always"
+            ]
+        );
+        assert_eq!(expected.root_markers, ["package.json", ".git"]);
+        assert!(fresh.config.formatting.on_save);
+        assert_eq!(fresh.config.formatting.provider, FormattingProvider::Auto);
+        let theme_only = Config::load_user_toml("scrolloff = 9", &path, &[]).unwrap();
+        assert!(theme_only.is_clean());
+        assert_eq!(
+            theme_only.config.languages["markdown"].formatter.as_ref(),
+            Some(&expected)
+        );
+        let source = r#"
+[formatting]
+on_save = false
+provider = "lsp"
+[languages.markdown.formatter]
+name = "Custom Prettier"
+command = "custom-prettier"
+args = ["--parser", "markdown"]
+"#;
+        std::fs::write(&path, source).unwrap();
+        for _ in 0..2 {
+            let loaded = Config::load_user_file(&path, &[]).unwrap();
+            assert!(loaded.is_clean(), "{:?}", loaded.diagnostics);
+            let formatter = loaded.config.languages["markdown"]
+                .formatter
+                .as_ref()
+                .unwrap();
+            assert_eq!(formatter.command, "custom-prettier");
+            assert_eq!(formatter.args, ["--parser", "markdown"]);
+            assert!(!loaded.config.formatting.on_save);
+            assert_eq!(loaded.config.formatting.provider, FormattingProvider::Lsp);
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
     }
 
     #[test]

@@ -31,6 +31,38 @@ development override. Normal installations use embedded runtime assets.
 Language servers and optional agent integrations require their own setup;
 basic editing and bundled highlighting do not.
 
+## Markdown formatting
+
+Homebrew installs Prettier (and its Node dependency) alongside RedVim. Press
+Space f in normal mode to format Markdown, or save to use the default automatic
+formatting. Paragraphs wrap to an 80-column target; long unbreakable words or
+URLs can exceed it. No personal formatter configuration is required.
+
+The embedded settings are:
+
+```toml
+[languages.markdown.formatter]
+name = "Prettier"
+command = "prettier"
+args = ["--stdin-filepath", "{file}", "--print-width", "80", "--prose-wrap", "always"]
+root_markers = ["package.json", ".git"]
+```
+
+Project-local Prettier takes precedence over PATH. These CLI wrapping flags
+override project Prettier wrapping options. Override the formatter args in your
+config.toml to choose another width or follow project settings. Copy the complete
+formatter table above before editing it: explicit language definitions replace
+the embedded language entry. For manual-only
+formatting, add:
+
+```toml
+[formatting]
+on_save = false
+```
+
+User settings are preserved on upgrade. Source/archive users must install
+Prettier separately if they want this formatter.
+
 ## Build
 
 Use Rust with edition 2024 support and Apple's C/C++ command line tools.
