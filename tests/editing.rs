@@ -2715,7 +2715,7 @@ async fn substitute_preserves_unicode_marks_across_undo_and_redo() {
 }
 
 #[tokio::test]
-async fn format_on_save_restores_save_as_identity_and_insert_transaction_after_sync_failure() {
+async fn format_on_save_preserves_save_as_and_insert_transaction_after_lsp_failure() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source.rs");
     let target = temp.path().join("target.py");
@@ -2747,12 +2747,15 @@ async fn format_on_save_restores_save_as_identity_and_insert_transaction_after_s
         .undo_history
         .is_transaction_active());
 
-    let error = editor
+    editor
         .test_execute_production_action(Action::SaveAs(target_file.clone()))
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert!(error.to_string().contains("injected didOpen failure"));
+    assert!(editor
+        .test_last_error()
+        .unwrap()
+        .contains("injected didOpen failure"));
     assert!(editor.test_is_insert());
     assert!(editor
         .test_current_buffer()
@@ -2760,18 +2763,15 @@ async fn format_on_save_restores_save_as_identity_and_insert_transaction_after_s
         .is_transaction_active());
     assert_eq!(
         editor.test_current_buffer().file.as_deref(),
-        Some(source_file.as_str())
+        Some(target_file.as_str())
     );
     assert_eq!(editor.test_current_buffer().contents(), "unsaved source\n");
     assert_eq!(fs::read_to_string(&source).unwrap(), "disk source\n");
-    assert!(!target.exists());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "unsaved source\n");
     let events = events.lock().unwrap();
     assert!(events
         .iter()
         .any(|event| matches!(event, LspEvent::DidOpen(file) if file == &target_file)));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, LspEvent::DidOpen(file) if file == &source_file)));
 }
 
 #[cfg(unix)]

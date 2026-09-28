@@ -224,6 +224,10 @@ waiting = "steady_underscore"
 # language_id = "javascript"
 # file_extensions = ["js", "mjs", "cjs"]
 
+# Prettier is the fallback external formatter for its built-in supported filenames
+# and extensions, including TypeScript/TSX, JavaScript/JSX, JSON, CSS, HTML, Vue,
+# YAML, GraphQL, Handlebars and Markdown/MDX (no syntax grammar required).
+# Explicit language formatters take precedence. Code uses project Prettier options.
 # Markdown formatting is available out of the box with Homebrew's Prettier.
 # Override this table in config.toml to choose different arguments or a tool.
 [languages.markdown.formatter]

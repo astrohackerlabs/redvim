@@ -23,6 +23,72 @@ const FORMAT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FORMATTED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 
+#[derive(serde::Deserialize)]
+struct PrettierLanguage {
+    name: String,
+    extensions: Vec<String>,
+    filenames: Option<Vec<String>>,
+}
+
+/// Snapshot of Prettier 3.9.9's built-in support-info, independent of syntax grammars.
+/// Let Prettier infer the parser and load project options from the actual filename.
+fn prettier_language(file: &str) -> Option<&'static PrettierLanguage> {
+    use std::sync::OnceLock;
+    static LANGUAGES: OnceLock<Vec<PrettierLanguage>> = OnceLock::new();
+    let filename = Path::new(file).file_name()?.to_str()?;
+    let languages = LANGUAGES.get_or_init(|| {
+        serde_json::from_str(include_str!("prettier-languages.json"))
+            .expect("embedded Prettier support matrix is valid")
+    });
+    languages.iter().find(|language| {
+        language
+            .filenames
+            .as_ref()
+            .is_some_and(|names| names.iter().any(|name| name == filename))
+            || language
+                .extensions
+                .iter()
+                .any(|extension| filename.ends_with(extension))
+    })
+}
+
+pub fn prettier_language_id(file: &str) -> Option<String> {
+    let name = &prettier_language(file)?.name;
+    Some(match name.as_str() {
+        "JSON with Comments" => "jsonc".into(),
+        "JSON.stringify" => "json".into(),
+        other => other.to_ascii_lowercase(),
+    })
+}
+
+pub fn prettier_default(file: &str) -> Option<&'static LanguageFormatterConfig> {
+    use std::sync::OnceLock;
+    static CODE: OnceLock<LanguageFormatterConfig> = OnceLock::new();
+    static MARKDOWN: OnceLock<LanguageFormatterConfig> = OnceLock::new();
+    let markdown = prettier_language(file)?.name == "Markdown";
+    let slot = if markdown { &MARKDOWN } else { &CODE };
+    Some(slot.get_or_init(|| LanguageFormatterConfig {
+        name: "Prettier".into(),
+        command: "prettier".into(),
+        args: if markdown {
+            [
+                "--stdin-filepath",
+                "{file}",
+                "--print-width",
+                "80",
+                "--prose-wrap",
+                "always",
+            ]
+            .map(String::from)
+            .to_vec()
+        } else {
+            ["--stdin-filepath", "{file}"].map(String::from).to_vec()
+        },
+        root_markers: ["package.json", ".git"].map(String::from).to_vec(),
+        ..Default::default()
+    }))
+}
+
 #[derive(Debug)]
 pub struct FormattedDocument {
     pub name: String,
@@ -222,6 +288,38 @@ pub async fn format_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prettier_filename_routing_covers_snapshot_without_claiming_other_languages() {
+        let languages: Vec<PrettierLanguage> =
+            serde_json::from_str(include_str!("prettier-languages.json")).unwrap();
+        for language in languages {
+            for extension in language.extensions {
+                assert!(
+                    prettier_default(&format!("/tmp/file{extension}")).is_some(),
+                    "{extension}"
+                );
+            }
+            for filename in language.filenames.unwrap_or_default() {
+                assert!(
+                    prettier_default(&format!("/tmp/{filename}")).is_some(),
+                    "{filename}"
+                );
+            }
+        }
+        for file in [
+            "main.rs",
+            "shell.nu",
+            "main.py",
+            "document.typ",
+            "component.svelte",
+            "file.unknown",
+        ] {
+            assert!(prettier_default(file).is_none(), "{file}");
+        }
+        assert_eq!(prettier_language_id("README").as_deref(), Some("markdown"));
+        assert_eq!(prettier_language_id("file.tsx").as_deref(), Some("tsx"));
+    }
 
     #[test]
     fn workspace_root_uses_nearest_marker() {

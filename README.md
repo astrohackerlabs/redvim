@@ -31,7 +31,24 @@ development override. Normal installations use embedded runtime assets.
 Language servers and optional agent integrations require their own setup;
 basic editing and bundled highlighting do not.
 
-## Markdown formatting
+## Formatting
+
+Space f formats the current document. Prettier is the default for its built-in
+supported file types: JavaScript/JSX, TypeScript/TSX, Flow, JSON/JSONC/JSON5,
+CSS/SCSS/Less/PostCSS, HTML/Angular, Vue, Markdown/MDX, YAML, GraphQL,
+Handlebars and MJML. Recognized configuration filenames work too. Formatting
+does not require a bundled syntax grammar or a working language server.
+
+Code follows project Prettier settings. Explicit user or language-pack formatters
+take precedence; `[formatting] provider = "lsp"` explicitly selects LSP instead.
+The built-in filename list comes from Prettier 3.9.9; third-party Prettier plugins
+are not installed automatically. Markdown has the wrapping policy below.
+
+Language-server failures appear inside the editor and leave your document open.
+If `gd` reports a missing or incompatible server, editing and saving remain
+available; definition navigation still requires a working server.
+
+### Markdown wrapping
 
 Homebrew installs Prettier (and its Node dependency) alongside RedVim. Press
 Space f in normal mode to format Markdown, or save to use the default automatic

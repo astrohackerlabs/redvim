@@ -3919,7 +3919,7 @@ impl DetachedEditorCore {
             .await?;
         editor.restore_agent_plugin_state(&mut runtime).await?;
         editor.notify_pane_restore_intents(&mut runtime).await?;
-        editor.ensure_current_buffer_lsp_opened().await?;
+        editor.open_current_lsp_nonfatal().await?;
         let mut render_buffer = RenderBuffer::new(
             editor.size.0 as usize,
             editor.size.1 as usize,
@@ -10209,7 +10209,7 @@ impl Editor {
             self.size.1 as usize,
             &Style::default(),
         );
-        self.ensure_current_buffer_lsp_opened().await?;
+        self.open_current_lsp_nonfatal().await?;
         let (columns, rows) = terminal::size()?;
         self.resize_terminal_surface(columns, rows, &mut buffer);
         self.prepare_startup_welcome();
@@ -10533,6 +10533,25 @@ impl Editor {
     }
 
     async fn service_background(
+        &mut self,
+        buffer: &mut RenderBuffer,
+        runtime: &mut Runtime,
+    ) -> anyhow::Result<()> {
+        match self.service_background_inner(buffer, runtime).await {
+            Err(error) if error.downcast_ref::<crate::lsp::LspError>().is_some() => {
+                self.report_lsp_failure(&error);
+                self.render(buffer)
+            }
+            result => result,
+        }
+    }
+
+    fn report_lsp_failure(&mut self, error: &anyhow::Error) {
+        log!("[lsp] operation failed: {error:#}");
+        self.set_routine_warning(Some(format!("Language server unavailable: {error}")));
+    }
+
+    async fn service_background_inner(
         &mut self,
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
@@ -11171,16 +11190,15 @@ impl Editor {
                         &msg,
                         InboundMessage::Notification(ParsedNotification::Progress(_))
                     );
-                    let completed_definition =
-                        if method.as_deref() == Some("textDocument/definition") {
-                            match &msg {
-                                InboundMessage::Message(response) => Some(response.id),
-                                InboundMessage::RequestError { id, .. } => Some(*id),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
+                    // IDs are globally unique. Errors can arrive without method
+                    // metadata, including transport-generated request failures.
+                    let completed_definition = match &msg {
+                        InboundMessage::Message(response) => Some(response.id),
+                        InboundMessage::RequestError { id, .. } => Some(*id),
+                        InboundMessage::Error(error) => error.id,
+                        _ => None,
+                    }
+                    .filter(|id| self.pending_definition_requests.contains(id));
                     if let Some(action) = self.handle_lsp_message(&msg, method) {
                         // TODO: handle quit
                         let generation_before = self.render_generation;
@@ -20219,8 +20237,17 @@ impl Editor {
         buffer: &mut RenderBuffer,
         runtime: &mut Runtime,
     ) -> anyhow::Result<bool> {
-        self.execute_with_tracking(action, buffer, runtime, true)
+        match self
+            .execute_with_tracking(action, buffer, runtime, true)
             .await
+        {
+            Err(error) if error.downcast_ref::<crate::lsp::LspError>().is_some() => {
+                self.report_lsp_failure(&error);
+                self.render(buffer)?;
+                Ok(false)
+            }
+            result => result,
+        }
     }
 
     #[async_recursion::async_recursion]
@@ -21930,7 +21957,12 @@ impl Editor {
                         .lsp
                         .goto_definition(&file, position.character, position.line)
                         .await?;
-                    self.pending_definition_requests.insert(request_id);
+                    if request_id > 0 {
+                        self.pending_definition_requests.insert(request_id);
+                    } else {
+                        self.set_routine_warning(Some("No language server is available for definition lookup; check the language-server configuration".into()));
+                        self.draw_commandline(buffer);
+                    }
                 } else {
                     self.set_routine_warning(Some("No definition found".to_string()));
                     self.draw_commandline(buffer);
@@ -25350,13 +25382,25 @@ impl Editor {
         let file = self.buffer_manager[index].file.clone();
         if self.config.lsp.enabled {
             if let Some(file) = &file {
-                self.ensure_buffer_lsp_opened(index).await?;
-                let snapshot = self.buffer_manager[index].contents_snapshot();
-                if let Some(change) = self.lsp_coordinator.pending_change(id, revision, snapshot) {
-                    self.lsp.did_change_edits(file, change).await?;
-                } else {
-                    let contents = self.buffer_manager[index].contents();
-                    self.lsp.did_change(file, contents).await?;
+                let result: anyhow::Result<()> = async {
+                    self.ensure_buffer_lsp_opened(index).await?;
+                    let snapshot = self.buffer_manager[index].contents_snapshot();
+                    if let Some(change) =
+                        self.lsp_coordinator.pending_change(id, revision, snapshot)
+                    {
+                        self.lsp.did_change_edits(file, change).await?;
+                    } else {
+                        let contents = self.buffer_manager[index].contents();
+                        self.lsp.did_change(file, contents).await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = result {
+                    if error.downcast_ref::<crate::lsp::LspError>().is_none() {
+                        return Err(error);
+                    }
+                    self.report_lsp_failure(&error);
                 }
             }
         }
@@ -25576,6 +25620,16 @@ impl Editor {
     async fn ensure_current_buffer_lsp_opened(&mut self) -> anyhow::Result<()> {
         self.ensure_buffer_lsp_opened(self.buffer_manager.active_index())
             .await
+    }
+
+    async fn open_current_lsp_nonfatal(&mut self) -> anyhow::Result<()> {
+        match self.ensure_current_buffer_lsp_opened().await {
+            Err(error) if error.downcast_ref::<crate::lsp::LspError>().is_some() => {
+                self.report_lsp_failure(&error);
+                Ok(())
+            }
+            result => result,
+        }
     }
 
     async fn ensure_buffer_lsp_opened(&mut self, buffer_index: usize) -> anyhow::Result<()> {
@@ -30352,11 +30406,17 @@ impl Editor {
             .highlighter
             .language_id_for_file(Some(file))
             .map(str::to_string)
-            .or_else(|| self.current_language_id())?;
-        self.config
-            .languages
-            .get(&language)
+            .or_else(|| self.current_language_id());
+        language
+            .as_ref()
+            .and_then(|language| self.config.languages.get(language))
             .and_then(|definition| definition.formatter.as_ref())
+            .or_else(|| {
+                crate::formatter::prettier_language_id(file)
+                    .and_then(|language| self.config.languages.get(&language))
+                    .and_then(|definition| definition.formatter.as_ref())
+            })
+            .or_else(|| crate::formatter::prettier_default(file))
     }
 
     fn formatter_for_file(&self, file: &str) -> Option<LanguageFormatterConfig> {
@@ -30563,13 +30623,7 @@ impl Editor {
             self.ensure_current_buffer_lsp_opened().await
         };
         if let Err(error) = open_result {
-            if matches!(
-                error.downcast_ref::<crate::lsp::LspError>(),
-                Some(
-                    crate::lsp::LspError::ProtocolError(_)
-                        | crate::lsp::LspError::RequestTimeout(_)
-                )
-            ) {
+            if error.downcast_ref::<crate::lsp::LspError>().is_some() {
                 log!(
                     "{}",
                     json!({
@@ -30604,10 +30658,7 @@ impl Editor {
             .await;
         let request_id = match request {
             Ok(request_id) => request_id,
-            Err(
-                error @ (crate::lsp::LspError::ProtocolError(_)
-                | crate::lsp::LspError::RequestTimeout(_)),
-            ) => {
+            Err(error) => {
                 let message = format!("format-on-save unavailable; saved unformatted: {error}");
                 log!(
                     "{}",
@@ -30622,13 +30673,6 @@ impl Editor {
                 return Ok(FormatOnSaveRequest::Save {
                     warning: Some(message),
                 });
-            }
-            Err(error) => {
-                if save_as.is_some() {
-                    self.restore_lsp_format_save_identity(buffer_id, &pending.uri, previous_file)
-                        .await;
-                }
-                return Err(error.into());
             }
         };
         if request_id == 0 {
@@ -42753,6 +42797,399 @@ builtin = "rust"
                 ),
                 Some(Action::PrintWarning(message)) if message == "No definition found"
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_lsp_initialization_keeps_navigation_editing_and_save_alive() {
+        use crate::lsp::{OutboundMessage, RealLspClient, ResponseError};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("document.ts");
+        std::fs::write(&path, "const x=1;\n").unwrap();
+        let (requests, mut outgoing) = tokio::sync::mpsc::channel(64);
+        let (incoming, responses) = tokio::sync::mpsc::channel(64);
+        let server = crate::config::default_language_servers()
+            .remove("typescript")
+            .unwrap();
+        let mut client =
+            RealLspClient::with_test_channels(requests, responses, server, root.path().into());
+        client.initialize().await.unwrap();
+        let OutboundMessage::Request(init) = outgoing.recv().await.unwrap() else {
+            panic!("initialize")
+        };
+        let mut config = Config::default();
+        config.formatting.provider = FormattingProvider::Lsp;
+        let mut editor = Editor::with_size(
+            Box::new(client),
+            80,
+            24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                "const x=1;\n".into(),
+            )],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        editor.current_buffer_mut().insert_str(0, 0, "// unsaved\n");
+        let before = editor.current_buffer().contents();
+        editor
+            .test_execute_production_action(Action::GoToDefinition)
+            .await
+            .unwrap();
+        incoming.send(InboundMessage::Error(ResponseError {
+            id: Some(init.id), code: -32603,
+            message: "TypeScript 7.0.2 provides no tsserver.js. No other valid TypeScript installation was found. Exiting.".into(),
+            data: None, request: None,
+        })).await.unwrap();
+        for _ in 0..3 {
+            editor.test_service_background().await.unwrap();
+        }
+        assert!(editor.pending_definition_requests.is_empty());
+        for action in [
+            Action::GoToDefinition,
+            Action::GoToDefinition,
+            Action::Hover,
+            Action::FormatDocument,
+        ] {
+            editor.test_execute_production_action(action).await.unwrap();
+            assert!(editor
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("tsserver.js"));
+            assert_eq!(editor.current_buffer().contents(), before);
+            assert!(editor.current_buffer().is_dirty());
+            assert!(editor.pending_definition_requests.is_empty());
+        }
+        editor
+            .test_execute_production_action(Action::InsertString("// still editing\n".into()))
+            .await
+            .unwrap();
+        assert_ne!(editor.current_buffer().contents(), before);
+        editor
+            .test_execute_production_action(Action::Undo)
+            .await
+            .unwrap();
+        assert_eq!(editor.current_buffer().contents(), before);
+        editor
+            .test_execute_production_action(Action::Save)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert!(!editor.current_buffer().is_dirty());
+    }
+
+    #[tokio::test]
+    async fn missing_lsp_does_not_queue_a_phantom_definition() {
+        let mut editor = test_editor(80, 24);
+        editor.current_buffer_mut().file = Some("/tmp/resilient-tooling.no-server".into());
+        for _ in 0..2 {
+            editor
+                .test_execute_production_action(Action::GoToDefinition)
+                .await
+                .unwrap();
+            assert!(editor.pending_definition_requests.is_empty());
+            assert!(editor
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("No language server"));
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_lsp_executable_keeps_definition_lookup_nonfatal() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.lsp.servers.get_mut("typescript").unwrap().command = root
+            .path()
+            .join("absent-language-server")
+            .to_string_lossy()
+            .into_owned();
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size(
+            lsp,
+            80,
+            24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(
+                Some(root.path().join("file.ts").to_string_lossy().into_owned()),
+                "const x = 1;\n".into(),
+            )],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        for _ in 0..2 {
+            editor
+                .test_execute_production_action(Action::GoToDefinition)
+                .await
+                .unwrap();
+            assert!(editor.pending_definition_requests.is_empty());
+            assert!(editor
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("No language server"));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires installed Prettier; run explicitly during qualification"]
+    async fn prettier_failure_and_missing_formatter_preserve_unsaved_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("invalid.ts");
+        std::fs::write(&path, "// disk contents\n").unwrap();
+        let mut config = Config::default();
+        config.lsp.enabled = false;
+        config.formatting.provider = FormattingProvider::External;
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size(
+            lsp,
+            80,
+            24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(
+                Some(path.to_string_lossy().into_owned()),
+                "// disk contents\n".into(),
+            )],
+        )
+        .unwrap();
+        editor.test_disable_terminal_output();
+        editor.current_buffer_mut().insert_str(0, 0, "const = ;\n");
+        let before = editor.current_buffer().contents();
+        editor
+            .test_execute_production_action(Action::FormatDocument)
+            .await
+            .unwrap();
+        assert!(editor
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("SyntaxError"));
+        assert_eq!(editor.current_buffer().contents(), before);
+        assert!(editor.current_buffer().is_dirty());
+        editor.config.languages.insert(
+            "typescript".into(),
+            crate::config::LanguageConfig {
+                formatter: Some(LanguageFormatterConfig {
+                    name: "Missing formatter".into(),
+                    command: root
+                        .path()
+                        .join("absent-formatter")
+                        .to_string_lossy()
+                        .into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        editor
+            .test_execute_production_action(Action::FormatDocument)
+            .await
+            .unwrap();
+        assert!(editor
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("not installed"));
+        assert_eq!(editor.current_buffer().contents(), before);
+        assert!(editor.current_buffer().is_dirty());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "// disk contents\n");
+    }
+
+    #[tokio::test]
+    async fn closed_lsp_transport_is_nonfatal_for_navigation_editing_and_save() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("document.rs");
+        std::fs::write(&path, "original\n").unwrap();
+        let (mut editor, _responses, requests) = lsp_channel_test_editor(Buffer::new(
+            Some(path.to_string_lossy().into_owned()),
+            "original\n".into(),
+        ));
+        drop(requests);
+        editor
+            .test_execute_production_action(Action::GoToDefinition)
+            .await
+            .unwrap();
+        assert!(editor
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("Channel error"));
+        assert!(editor.pending_definition_requests.is_empty());
+        editor
+            .test_execute_production_action(Action::InsertString("edit ".into()))
+            .await
+            .unwrap();
+        let edited = editor.current_buffer().contents();
+        assert!(editor.current_buffer().is_dirty());
+        editor
+            .test_execute_production_action(Action::Save)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        assert!(!editor.current_buffer().is_dirty());
+    }
+
+    #[test]
+    fn explicit_formatter_overrides_prettier_even_without_a_syntax_grammar() {
+        let mut editor = test_editor(80, 24);
+        editor.config.languages.insert(
+            "mjml".into(),
+            crate::config::LanguageConfig {
+                formatter: Some(LanguageFormatterConfig {
+                    name: "Custom".into(),
+                    command: "custom".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            editor.formatter_for_file("file.mjml").unwrap().command,
+            "custom"
+        );
+        assert_eq!(
+            editor.formatter_for_file("file.ts").unwrap().command,
+            "prettier"
+        );
+        assert!(editor.formatter_for_file("file.typ").is_none());
+    }
+
+    #[tokio::test]
+    async fn definition_request_errors_and_timeouts_release_pending_navigation() {
+        for timeout in [false, true] {
+            let (mut editor, responses, mut requests) = lsp_channel_test_editor(Buffer::new(
+                Some("/tmp/navigation.rs".into()),
+                "fn main() {}\n".into(),
+            ));
+            editor
+                .test_execute_production_action(Action::GoToDefinition)
+                .await
+                .unwrap();
+            let id = *editor.pending_definition_requests.iter().next().unwrap();
+            while requests.try_recv().is_ok() {}
+            responses
+                .send(if timeout {
+                    InboundMessage::RequestError {
+                        id,
+                        error: crate::lsp::LspError::RequestTimeout(Duration::from_secs(30)),
+                    }
+                } else {
+                    InboundMessage::Error(crate::lsp::ResponseError {
+                        id: Some(id),
+                        code: -32603,
+                        message: "definition unavailable".into(),
+                        data: None,
+                        request: None,
+                    })
+                })
+                .await
+                .unwrap();
+            editor.test_service_background().await.unwrap();
+            assert!(editor.pending_definition_requests.is_empty());
+            assert_eq!(editor.current_buffer().contents(), "fn main() {}\n");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires installed Prettier; run explicitly during qualification"]
+    async fn prettier_defaults_cover_builtin_families_through_editor_actions() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".prettierrc"),
+            r#"{"semi":false,"singleQuote":true}"#,
+        )
+        .unwrap();
+        let cases = [
+            ("ts", "const x:number=1", "const x: number = 1\n"),
+            ("mts", "const x:number=1", "const x: number = 1\n"),
+            ("cts", "const x:number=1", "const x: number = 1\n"),
+            ("tsx", "const x=<div/>", "const x = <div />\n"),
+            ("js", "const x=\"yes\"", "const x = 'yes'\n"),
+            ("jsx", "const x=<div/>", "const x = <div />\n"),
+            ("mjs", "const x=1", "const x = 1\n"),
+            ("cjs", "const x=1", "const x = 1\n"),
+            (
+                "js.flow",
+                "declare var x:number;",
+                "declare var x: number\n",
+            ),
+            ("json", "{\"x\":1}", "{ \"x\": 1 }\n"),
+            ("jsonc", "{\"x\":1}", "{ \"x\": 1 }\n"),
+            ("json5", "{x:1}", "{ x: 1 }\n"),
+            ("css", "a{color:red}", "a {\n  color: red;\n}\n"),
+            ("scss", "a{color:red}", "a {\n  color: red;\n}\n"),
+            ("less", "a{color:red}", "a {\n  color: red;\n}\n"),
+            ("html", "<div>hi</div>", "<div>hi</div>\n"),
+            ("component.html", "<div>{{x}}</div>", "<div>{{ x }}</div>\n"),
+            (
+                "vue",
+                "<template><div>hi</div></template>",
+                "<template><div>hi</div></template>\n",
+            ),
+            ("md", "# hi", "# hi\n"),
+            ("mdx", "# hi", "# hi\n"),
+            ("yaml", "x: [1,2]", "x: [1, 2]\n"),
+            ("graphql", "query{x}", "query {\n  x\n}\n"),
+            (
+                "hbs",
+                "<div  class=\"x\">{{x}}</div>",
+                "<div class='x'>{{x}}</div>",
+            ),
+            ("mjml", "<mjml></mjml>", "<mjml></mjml>\n"),
+        ];
+        for (extension, input, expected) in cases {
+            let path = root.path().join(format!("file with spaces.{extension}"));
+            std::fs::write(&path, "").unwrap();
+            let mut config = Config::default();
+            config.lsp.enabled = false;
+            let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+            let mut editor = Editor::with_size(
+                lsp,
+                80,
+                24,
+                config,
+                Theme::default(),
+                vec![Buffer::new(
+                    Some(path.to_string_lossy().into_owned()),
+                    String::new(),
+                )],
+            )
+            .unwrap();
+            editor.test_disable_terminal_output();
+            editor.current_buffer_mut().insert_str(0, 0, input);
+            for _ in 0..2 {
+                editor
+                    .test_execute_production_action(Action::FormatDocument)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    editor.current_buffer().contents(),
+                    expected,
+                    "{extension}: {:?}",
+                    editor.last_error
+                );
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+            editor
+                .test_execute_production_action(Action::Undo)
+                .await
+                .unwrap();
+            assert_eq!(editor.current_buffer().contents(), input, "{extension}");
+            editor
+                .test_execute_production_action(Action::Save)
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                expected,
+                "{extension}"
+            );
         }
     }
 
