@@ -5186,7 +5186,7 @@ impl Editor {
         let session_manager = session_manager::SessionManager::new();
         let agent_manager = agent_manager::AgentManager::new();
         let whats_new_startup_pending = preferences.is_persistent()
-            && config.show_whats_new.unwrap_or(true)
+            && config.show_whats_new.unwrap_or(false)
             && preferences.last_seen_version() != Some(env!("CARGO_PKG_VERSION"));
 
         Ok(Editor {
@@ -35616,6 +35616,7 @@ builtin = "rust"
         let path = directory.join("preferences.json");
         let preferences = PreferencesStore::load(&path);
         let config = Config {
+            show_whats_new: Some(true),
             fetch_release_notes: Some(false),
             ..Config::default()
         };
@@ -35645,6 +35646,7 @@ builtin = "rust"
         );
 
         let config = Config {
+            show_whats_new: Some(true),
             fetch_release_notes: Some(false),
             ..Config::default()
         };
@@ -35670,6 +35672,7 @@ builtin = "rust"
         let path = directory.join("preferences.json");
         let preferences = PreferencesStore::load(&path);
         let config = Config {
+            show_whats_new: Some(true),
             fetch_release_notes: Some(false),
             ..Config::default()
         };
@@ -35716,6 +35719,7 @@ builtin = "rust"
         let path = directory.join("preferences.json");
         let preferences = PreferencesStore::load(&path);
         let config = Config {
+            show_whats_new: Some(true),
             fetch_release_notes: Some(false),
             ..Config::default()
         };
@@ -35763,6 +35767,52 @@ builtin = "rust"
 
         assert!(!editor.prepare_startup_whats_new());
         assert!(editor.open_whats_new_panel());
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn shipped_default_keeps_the_release_panel_closed() {
+        let directory = std::env::temp_dir().join(format!(
+            "red-whats-new-default-off-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = directory.join("preferences.json");
+        let preferences = PreferencesStore::load(&path);
+        let mut config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        assert_eq!(config.show_whats_new, Some(false));
+        config.fetch_release_notes = Some(false);
+        let lsp = Box::new(crate::lsp::LspManager::new(config.lsp.clone()));
+        let mut editor = Editor::with_size_and_preferences(
+            lsp,
+            90,
+            24,
+            config,
+            Theme::default(),
+            vec![Buffer::new(None, String::new())],
+            preferences,
+        )
+        .unwrap();
+
+        assert!(!editor.prepare_startup_whats_new());
+
+        let enabled_preferences =
+            PreferencesStore::load(directory.join("enabled-preferences.json"));
+        let mut enabled: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
+        enabled.show_whats_new = Some(true);
+        enabled.fetch_release_notes = Some(false);
+        let lsp = Box::new(crate::lsp::LspManager::new(enabled.lsp.clone()));
+        let mut enabled_editor = Editor::with_size_and_preferences(
+            lsp,
+            90,
+            24,
+            enabled,
+            Theme::default(),
+            vec![Buffer::new(None, String::new())],
+            enabled_preferences,
+        )
+        .unwrap();
+
+        assert!(enabled_editor.prepare_startup_whats_new());
         fs::remove_dir_all(directory).ok();
     }
 

@@ -1,13 +1,13 @@
 {
-  "version": "0.7.12",
+  "version": "0.7.13",
   "fork": {
     "name": "red",
     "checkout": "forks/red",
     "upstream": "https://github.com/codersauce/red.git",
     "base": "9e0952767d35d5b8dddd3fa3bb90087938692c52",
-    "branch": "issue-26093012262975-exp1-rescan-when-the-tree-opens",
-    "expected_head": "8a485efa37a258fba39b5ea9cbfa8f44767d5afc",
-    "expected_tree": "98f0f14871af1eb1c7ae7301b466da25f02eeb9f",
+    "branch": "issue-26093013295774-exp1-default-the-release-panel-off",
+    "expected_head": "aec754fffe5f13b8f83812369b54967fa6d0ef6c",
+    "expected_tree": "ce49f13cdb843cd298b995e2ececcc1d779a759e",
     "patch_directories": [
       "patches/red/patches/issue-26091823140848",
       "patches/red/patches/issue-26091914238740",
@@ -17,13 +17,14 @@
       "patches/red/patches/issue-26092609387958",
       "patches/red/patches/issue-26092711590255",
       "patches/red/patches/issue-26092809575864",
-      "patches/red/patches/issue-26093012262975"
+      "patches/red/patches/issue-26093012262975",
+      "patches/red/patches/issue-26093013295774"
     ],
-    "patch_count": 44,
-    "archive_sha256": "f8657a5ea01f8f54623543bb69aef691b701158c2e558593b89a09e86099db55",
+    "patch_count": 46,
+    "archive_sha256": "f0ac77fc42d6fd5bbb8a870e4edd5169d166502cee6f7ce9a3623e480ec17254",
     "allowed_untracked": []
   },
-  "monorepo_commit": "cd128689a66ee50f587258b36b50b27e43cfb8b8",
+  "monorepo_commit": "76188ac7a2bde280cf82e268a9ba16cbad809f9d",
   "grammar_revision": "bb3f533e5792260291945e1f329e1f0a779def6e",
   "query_revision": "4d9466677a5ceadef104eaa0fe08d60d91c4e9a7",
   "deployment_target": "26.0"

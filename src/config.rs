@@ -247,7 +247,7 @@ pub struct Config {
     /// Defaults to on.
     pub splash: Option<bool>,
     /// Announce each newly installed Red release once after interactive startup.
-    /// Defaults to on.
+    /// Defaults to off.
     #[serde(default)]
     pub show_whats_new: Option<bool>,
     /// Refresh bundled release notes from the matching published GitHub release.
@@ -4650,7 +4650,7 @@ groups = [["\\bif\\b", "\\belse\\b", "\\bendif\\b"]]
     fn default_config_maps_command_palette_entrypoints_and_enables_key_hints() {
         let config: Config = toml::from_str(include_str!("../default_config.toml")).unwrap();
 
-        assert_eq!(config.show_whats_new, Some(true));
+        assert_eq!(config.show_whats_new, Some(false));
         assert_eq!(config.fetch_release_notes, Some(true));
         assert_eq!(config.persist_inline_history, Some(true));
         assert_eq!(config.wrap_window_navigation, Some(true));

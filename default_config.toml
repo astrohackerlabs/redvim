@@ -45,8 +45,9 @@ sidescrolloff = 0
 # disappears on the first edit, file open, or window split.
 splash = true
 
-# Present a themed release announcement once after installing a new version.
-show_whats_new = true
+# Startup leaves the What’s new panel closed. Set this to true to show it
+# once for a version that has not been seen.
+show_whats_new = false
 
 # Refresh bundled release notes from GitHub without delaying editor startup.
 fetch_release_notes = true
