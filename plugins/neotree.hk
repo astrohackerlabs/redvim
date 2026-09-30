@@ -322,8 +322,7 @@ fn show_panel(focus: bool) {
 
     red::state_patch(NeoTreeState { cwd_request: red::request("GetConfig", cwd_loaded, "cwd") });
     red::state_patch(NeoTreeState { windows_request: red::request("GetWindows", windows_loaded) });
-    request_directory(".");
-    request_git_status();
+    reload_visible_tree();
 }
 
 #[red::on("editor:panes_restore")]

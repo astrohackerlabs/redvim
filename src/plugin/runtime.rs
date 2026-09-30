@@ -16877,6 +16877,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn neotree_reloads_expanded_directories_when_reopened() {
+        drain_requests();
+        let mut runtime = Runtime::new();
+        runtime
+            .load_plugin("neotree", include_str!("../../plugins/neotree.hk"))
+            .await
+            .unwrap();
+        runtime.execute_command("NeoTree").await.unwrap();
+
+        let root_directory_request_id = loop {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::ListDirectory { path, request_id } if path == "." => {
+                    break request_id
+                }
+                PluginRequest::GetGitStatus { .. }
+                | PluginRequest::GetConfig { .. }
+                | PluginRequest::GetWindows { .. }
+                | PluginRequest::CreatePanel { .. }
+                | PluginRequest::UpdatePanel { .. }
+                | PluginRequest::FocusPanel { .. } => {}
+                _ => panic!("unexpected plugin request before the root listing"),
+            }
+        };
+        match ACTION_DISPATCHER.recv_request() {
+            PluginRequest::GetGitStatus { path, .. } => assert_eq!(path, "."),
+            _ => panic!("open should request git status once"),
+        }
+        runtime
+            .resolve_request(
+                root_directory_request_id,
+                json!({
+                    "path": ".",
+                    "entries": [
+                        { "name": "src", "path": "./src", "kind": "directory" }
+                    ],
+                    "error": null
+                }),
+            )
+            .await
+            .unwrap();
+        let root_rows = loop {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::UpdatePanel { rows, .. } => break rows,
+                PluginRequest::WatchDirectory { path, .. } => assert_eq!(path, "."),
+                _ => panic!("unexpected plugin request after the root listing"),
+            }
+        };
+        let directory_row = serde_json::to_value(
+            root_rows
+                .iter()
+                .find(|row| row.id == "./src")
+                .expect("src row"),
+        )
+        .unwrap();
+        runtime
+            .notify(
+                "panel:event:neotree",
+                json!({"action": "activate", "row": directory_row}),
+            )
+            .await
+            .unwrap();
+        let src_directory_request_id = loop {
+            match ACTION_DISPATCHER.recv_request() {
+                PluginRequest::ListDirectory { path, request_id } if path == "./src" => {
+                    break request_id
+                }
+                PluginRequest::UpdatePanel { .. } => {}
+                _ => panic!("unexpected plugin request while expanding src"),
+            }
+        };
+        runtime
+            .resolve_request(
+                src_directory_request_id,
+                json!({
+                    "path": "./src",
+                    "entries": [
+                        { "name": "main.rs", "path": "./src/main.rs", "kind": "file" }
+                    ],
+                    "error": null
+                }),
+            )
+            .await
+            .unwrap();
+        drain_requests();
+
+        runtime.execute_command("NeoTree").await.unwrap();
+        drain_requests();
+        runtime.execute_command("NeoTree").await.unwrap();
+
+        let mut directories = Vec::new();
+        let mut git_status = 0;
+        while let Some(request) = ACTION_DISPATCHER.try_recv_request() {
+            match request {
+                PluginRequest::ListDirectory { path, .. } => directories.push(path),
+                PluginRequest::GetGitStatus { .. } => git_status += 1,
+                _ => {}
+            }
+        }
+        directories.sort();
+        assert_eq!(directories, vec![".".to_string(), "./src".to_string()]);
+        assert_eq!(git_status, 1);
+    }
+
+    #[tokio::test]
     async fn neotree_discards_late_results_after_close_and_reopen() {
         let mut runtime = Runtime::new();
         runtime

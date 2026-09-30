@@ -1,13 +1,13 @@
 {
-  "version": "0.7.11",
+  "version": "0.7.12",
   "fork": {
     "name": "red",
     "checkout": "forks/red",
     "upstream": "https://github.com/codersauce/red.git",
     "base": "9e0952767d35d5b8dddd3fa3bb90087938692c52",
-    "branch": "issue-26092809575864-exp1-resilient-tooling",
-    "expected_head": "43c80303624df114978c042d6ee50c67f83a99ee",
-    "expected_tree": "53593a03e7cfb57744406f82fa6d159613902629",
+    "branch": "issue-26093012262975-exp1-rescan-when-the-tree-opens",
+    "expected_head": "8a485efa37a258fba39b5ea9cbfa8f44767d5afc",
+    "expected_tree": "98f0f14871af1eb1c7ae7301b466da25f02eeb9f",
     "patch_directories": [
       "patches/red/patches/issue-26091823140848",
       "patches/red/patches/issue-26091914238740",
@@ -16,13 +16,14 @@
       "patches/red/patches/issue-26092311060249",
       "patches/red/patches/issue-26092609387958",
       "patches/red/patches/issue-26092711590255",
-      "patches/red/patches/issue-26092809575864"
+      "patches/red/patches/issue-26092809575864",
+      "patches/red/patches/issue-26093012262975"
     ],
-    "patch_count": 42,
-    "archive_sha256": "1baf706f826d32cd86e9b94b76684523d1a5299022d2c739c1263aa1393c069a",
+    "patch_count": 44,
+    "archive_sha256": "f8657a5ea01f8f54623543bb69aef691b701158c2e558593b89a09e86099db55",
     "allowed_untracked": []
   },
-  "monorepo_commit": "0d80f3aee4f0a9df031befaa65a3b37eb56e1bd3",
+  "monorepo_commit": "cd128689a66ee50f587258b36b50b27e43cfb8b8",
   "grammar_revision": "bb3f533e5792260291945e1f329e1f0a779def6e",
   "query_revision": "4d9466677a5ceadef104eaa0fe08d60d91c4e9a7",
   "deployment_target": "26.0"
